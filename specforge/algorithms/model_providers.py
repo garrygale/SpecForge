@@ -88,6 +88,47 @@ def _load_vocab_mapping(cfg: Config, draft_model: Any) -> None:
         draft_model.load_vocab_mapping(cfg.model.vocab_mapping_path)
 
 
+def _apply_draft_qat(draft_model: Any) -> None:
+    """Apply the verifiedBase two-pass QAT replacement before FSDP wrapping."""
+    from specforge.layers.wxay import replace_linear_with_quantized
+
+    method_config = getattr(draft_model.config, "dflash_config", None) or {}
+    qat_w_bit = method_config.get("qat_w_bit")
+    if qat_w_bit is None:
+        return
+    qat_a_bit = method_config.get("qat_a_bit")
+    qat_exclude = list(method_config.get("qat_exclude", []) or [])
+    channel_balanced = bool(method_config.get("channel_balanced", False))
+    channel_balanced_w4a4_only = bool(
+        method_config.get("channel_balanced_w4a4_only", False)
+    )
+    w4a4_layers = set(method_config.get("qat_w4a4_layers", []) or [])
+    stochastic_weight = bool(method_config.get("stochastic_weight", False))
+
+    replace_linear_with_quantized(
+        draft_model,
+        w_bit=int(qat_w_bit),
+        a_bit=int(qat_a_bit) if qat_a_bit is not None else None,
+        channel_balanced=channel_balanced and not channel_balanced_w4a4_only,
+        exclude_names=qat_exclude + list(w4a4_layers),
+        stochastic_weight=stochastic_weight,
+    )
+    if w4a4_layers:
+        replace_linear_with_quantized(
+            draft_model,
+            w_bit=4,
+            a_bit=4,
+            channel_balanced=channel_balanced,
+            include_only=w4a4_layers,
+            stochastic_weight=stochastic_weight,
+        )
+    print(
+        f"[QAT] enabled: w_bit={qat_w_bit}, a_bit={qat_a_bit}, "
+        f"exclude={qat_exclude}, w4a4_layers={sorted(w4a4_layers)}, "
+        f"channel_balanced={channel_balanced}"
+    )
+
+
 def build_eagle3_draft(cfg: Config, draft_config: PretrainedConfig):
     from specforge.modeling.auto import AutoDraftModel
 
@@ -166,6 +207,7 @@ def build_registered_draft(cfg: Config, draft_config: PretrainedConfig):
         draft_config,
         torch_dtype=_torch_dtype(cfg),
     )
+    _apply_draft_qat(draft_model)
     return _finish_registered_draft(cfg, draft_config, draft_model)
 
 
@@ -182,6 +224,7 @@ def build_dflash_draft(
         torch_dtype=_torch_dtype(cfg),
         dflash_kernels=kernels,
     )
+    _apply_draft_qat(draft_model)
     return _finish_registered_draft(cfg, draft_config, draft_model)
 
 

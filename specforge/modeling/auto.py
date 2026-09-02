@@ -59,7 +59,16 @@ class AutoDraftModel(AutoModelForCausalLMBase):
         try:
             config = kwargs.get("config")
             if config is None:
-                config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+                if os.path.isdir(pretrained_model_name_or_path):
+                    config_path = os.path.join(
+                        pretrained_model_name_or_path, "config.json"
+                    )
+                    if os.path.exists(config_path):
+                        config = AutoDraftModelConfig.from_file(config_path)
+                if config is None:
+                    config = AutoConfig.from_pretrained(
+                        pretrained_model_name_or_path
+                    )
             model_cls = cls._model_cls_from_config(config)
             kwargs = {**kwargs, "config": config}
             model = model_cls.from_pretrained(
@@ -86,6 +95,15 @@ class AutoDraftModelConfig:
         """
         with open(config_path, "r") as f:
             config = json.load(f)
+
+        # Transformers' strict Qwen3Config rejects per-layer sliding-window
+        # lists at the top level. Keep the legacy top-level representation
+        # portable by relocating it into dflash_config before construction.
+        if isinstance(config.get("sliding_window"), list):
+            config.setdefault("dflash_config", {})["sliding_window"] = config[
+                "sliding_window"
+            ]
+            config["sliding_window"] = None
 
         if "tie_word_embeddings" in config:
             print("Set draft model tie_word_embeddings to False")

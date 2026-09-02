@@ -2,7 +2,10 @@ from .base import Eagle3DraftModel
 from .dflash import (
     DFlashDraftModel,
     build_target_layer_ids,
+    compute_acceptance_stats,
     extract_context_feature,
+    get_layer_sliding_window,
+    is_complete_block,
     sample,
 )
 from .dflash2 import DFlash2DraftModel
@@ -23,7 +26,10 @@ __all__ = [
     "PEagleDraftModel",
     "Qwen3_5MTPDraftModel",
     "build_target_layer_ids",
+    "compute_acceptance_stats",
     "extract_context_feature",
+    "get_layer_sliding_window",
+    "is_complete_block",
     "sample",
     "DRAFT_REGISTRY",
     "register_draft",

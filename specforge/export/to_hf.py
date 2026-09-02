@@ -20,6 +20,7 @@ import argparse
 import glob
 import json
 import os
+import shutil
 from typing import Optional
 
 import torch
@@ -31,6 +32,24 @@ from specforge.export.checkpoint_io import (
     materialize_draft,
     resolve_training_state,
 )
+
+
+def _copy_draft_code(output_dir: str) -> None:
+    """Copy the Domino/DFlash source modules beside the exported checkpoint."""
+    source_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "modeling",
+        "draft",
+    )
+    for filename in (
+        "dflash.py",
+        "domino.py",
+        "dflash_kernels.py",
+        "registry.py",
+    ):
+        source = os.path.join(source_dir, filename)
+        if os.path.exists(source):
+            shutil.copy(source, os.path.join(output_dir, filename))
 
 
 def _load_embedding_tensor(source: str, key: str) -> torch.Tensor:
@@ -65,6 +84,30 @@ def _load_embedding_tensor(source: str, key: str) -> torch.Tensor:
     return state[key]
 
 
+def _discover_embedding_key(source: str) -> str:
+    """Resolve the target embedding weight key for Qwen3.5-style checkpoints."""
+    root = (
+        source
+        if os.path.exists(source)
+        else snapshot_download(repo_id=source, allow_patterns=["*.json"])
+    )
+    index_paths = glob.glob(os.path.join(root, "*.index.json"))
+    if index_paths:
+        with open(index_paths[0], encoding="utf-8") as handle:
+            keys = list(json.load(handle).get("weight_map", {}).keys())
+        embedding_keys = [key for key in keys if key.endswith(".embed_tokens.weight")]
+        if len(embedding_keys) == 1:
+            return embedding_keys[0]
+        multimodal = [key for key in embedding_keys if ".language_model." in key]
+        if multimodal:
+            return multimodal[0]
+        if embedding_keys:
+            return embedding_keys[0]
+    raise ValueError(
+        "could not discover embedding weight key; pass --embedding-key explicitly"
+    )
+
+
 def export_to_hf(
     checkpoint_path: str,
     draft_config_path: str,
@@ -72,7 +115,7 @@ def export_to_hf(
     *,
     vocab_mapping_path: Optional[str] = None,
     embedding_source: Optional[str] = None,
-    embedding_key: str = "model.embed_tokens.weight",
+    embedding_key: Optional[str] = None,
 ) -> str:
     """Write the checkpoint's draft as an HF directory; returns ``output_dir``.
 
@@ -83,6 +126,10 @@ def export_to_hf(
     the checkpoint itself carries ``embed_tokens.weight``. A randomly
     initialized embedding would silently break serving, so its absence raises.
     """
+    if embedding_key is None and embedding_source is not None:
+        embedding_key = _discover_embedding_key(embedding_source)
+    if embedding_key is None:
+        embedding_key = "model.embed_tokens.weight"
     state = resolve_training_state(checkpoint_path)
     model = materialize_draft(
         state, draft_config_path, vocab_mapping_path=vocab_mapping_path
@@ -114,6 +161,7 @@ def export_to_hf(
         )
     full_state.update(state["draft_state_dict"])  # trained keys win
     model.save_pretrained(output_dir, state_dict=full_state)
+    _copy_draft_code(output_dir)
     apply_legacy_rope_scaling(output_dir)
     return output_dir
 
@@ -130,7 +178,11 @@ def main(argv=None) -> int:
         help="target model path/dir supplying the frozen embedding "
         "(required unless the checkpoint carries embed_tokens.weight)",
     )
-    parser.add_argument("--embedding-key", default="model.embed_tokens.weight")
+    parser.add_argument(
+        "--embedding-key",
+        default=None,
+        help="target embedding weight key; auto-discovered when omitted",
+    )
     args = parser.parse_args(argv)
     out = export_to_hf(
         args.checkpoint,

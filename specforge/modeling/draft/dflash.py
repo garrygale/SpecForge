@@ -20,13 +20,163 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
-from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
-from .flex_attention_backend import flex_attention_backend
-from .registry import register_draft
+try:
+    from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
+except ImportError:  # exported top-level remote-code layout
+    from dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
+
+try:
+    from .registry import register_draft
+except ImportError:  # exported top-level remote-code layout
+    from registry import register_draft
+
+try:
+    from specforge.utils import get_device_type
+except ImportError:  # exported remote-code fallback
+    def get_device_type() -> str:
+        return "cpu"
+
+try:
+    from .flex_attention_backend import flex_attention_backend
+except ImportError:  # exported remote-code fallback
+    def flex_attention_backend() -> Optional[str]:
+        return None
 
 FULL_ATTENTION = "full_attention"
 SLIDING_ATTENTION = "sliding_attention"
 _VALID_DFLASH_LAYER_TYPES = {FULL_ATTENTION, SLIDING_ATTENTION}
+
+
+def _dflash_method_config(config) -> dict:
+    return dict(getattr(config, "dflash_config", None) or {})
+
+
+def get_layer_sliding_window(config, layer_idx: int) -> Optional[int]:
+    """Return the sliding-window length for one DFlash layer, if any.
+
+    ``dflash_config.sliding_window`` is preferred because transformers'
+    strict ``Qwen3Config`` validation rejects per-layer lists at the top
+    level; the top-level scalar remains supported for legacy configs.
+    """
+    layer_types = getattr(config, "layer_types", None)
+    if not layer_types or layer_idx >= len(layer_types):
+        return None
+    if layer_types[layer_idx] != SLIDING_ATTENTION:
+        return None
+
+    method_config = _dflash_method_config(config)
+    sliding_window = method_config.get("sliding_window")
+    if sliding_window is None:
+        sliding_window = getattr(config, "sliding_window", None)
+    if sliding_window is None:
+        return None
+    if isinstance(sliding_window, (list, tuple)):
+        if layer_idx >= len(sliding_window):
+            return None
+        value = sliding_window[layer_idx]
+    else:
+        value = sliding_window
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def has_sliding_window_attention(config) -> bool:
+    """Return whether any instantiated DFlash layer uses SWA."""
+    layer_types = getattr(config, "layer_types", None)
+    num_layers = getattr(
+        config, "num_hidden_layers", len(layer_types) if layer_types else 0
+    )
+    return any(
+        get_layer_sliding_window(config, layer_idx) is not None
+        for layer_idx in range(num_layers)
+    )
+
+
+def validate_dflash_sliding_window_config(config) -> None:
+    """Validate scalar or per-layer sliding-window settings."""
+
+    layer_types = getattr(config, "layer_types", None)
+    num_layers = getattr(
+        config, "num_hidden_layers", len(layer_types) if layer_types else 0
+    )
+    if num_layers is None:
+        raise ValueError("DFlash draft config requires num_hidden_layers.")
+    if not layer_types or len(layer_types) < num_layers:
+        raise ValueError(
+            "config.layer_types must describe at least the first "
+            f"{num_layers} draft layers."
+        )
+
+    method_config = _dflash_method_config(config)
+    raw_window = method_config.get("sliding_window")
+    if raw_window is None:
+        raw_window = getattr(config, "sliding_window", None)
+
+    if isinstance(raw_window, (list, tuple)):
+        if len(raw_window) != num_layers:
+            raise ValueError(
+                "sliding_window must have exactly one entry per draft layer: "
+                f"expected {num_layers}, got {len(raw_window)}."
+            )
+        for layer_idx in range(num_layers):
+            layer_type = layer_types[layer_idx]
+            window = raw_window[layer_idx]
+            if layer_type == SLIDING_ATTENTION:
+                if (
+                    isinstance(window, bool)
+                    or not isinstance(window, int)
+                    or window <= 0
+                ):
+                    raise ValueError(
+                        f"Layer {layer_idx} is sliding_attention but "
+                        f"sliding_window[{layer_idx}]={window!r}; expected a "
+                        "positive integer."
+                    )
+            elif layer_type == FULL_ATTENTION:
+                if window not in (-1, None):
+                    raise ValueError(
+                        f"Layer {layer_idx} is full_attention but "
+                        f"sliding_window[{layer_idx}]={window!r}; expected -1."
+                    )
+            else:
+                raise ValueError(
+                    f"Unsupported layer type {layer_type!r} for layer "
+                    f"{layer_idx} in a list-valued sliding_window config."
+                )
+        return
+
+    for layer_idx in range(num_layers):
+        if (
+            layer_types[layer_idx] == SLIDING_ATTENTION
+            and get_layer_sliding_window(config, layer_idx) is None
+        ):
+            raise ValueError(
+                f"Layer {layer_idx} is marked sliding_attention but no "
+                "positive sliding_window is configured. Set sliding_window "
+                "to a positive integer or a per-layer list, or change "
+                f"layer_types[{layer_idx}] to 'full_attention'."
+            )
+
+
+def validate_dflash_attention_backend(config, backend: Optional[str]) -> None:
+    """Reject flex attention when sliding-window layers are configured."""
+    validate_dflash_sliding_window_config(config)
+    if backend == "flex_attention" and has_sliding_window_attention(config):
+        raise ValueError(
+            "DFlash sliding-window attention cannot be used with "
+            "attention_backend='flex_attention'. Use sdpa/eager."
+        )
+
+
+def initialize_fusion_weights(weights: torch.Tensor) -> None:
+    """Initialize flare fusion weights with a near-one-hot layer schedule."""
+    nn.init.constant_(weights, 0.0)
+    D = weights.shape[0]
+    T = weights.shape[1]
+    for d in range(D):
+        t = min(T - 1, int((d / D) * T))
+        weights.data[d, t] = 2.0
 
 
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
@@ -41,7 +191,7 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
 
 def resolve_dflash_attention_layout(
     config: Qwen3Config,
-) -> tuple[tuple[str, ...], Optional[int]]:
+) -> tuple[tuple[str, ...], object]:
     """Validate and return the configured per-layer DFlash attention layout."""
 
     num_hidden_layers = config.num_hidden_layers
@@ -60,14 +210,30 @@ def resolve_dflash_attention_layout(
             f"sliding_attention, got {sorted(invalid)}"
         )
 
+    method_config = _dflash_method_config(config)
+    sliding_window = method_config.get("sliding_window")
+    if sliding_window is None:
+        sliding_window = getattr(config, "sliding_window", None)
+
     if SLIDING_ATTENTION not in layer_types:
+        validate_dflash_sliding_window_config(config)
         return layer_types, None
 
-    sliding_window = config.sliding_window
-    if sliding_window is None or sliding_window <= 0:
+    if sliding_window is None:
         raise ValueError(
             "DFlash sliding_attention layers require use_sliding_window=true "
             "and a positive config.sliding_window"
+        )
+    if isinstance(sliding_window, (list, tuple)):
+        validate_dflash_sliding_window_config(config)
+        return layer_types, tuple(sliding_window)
+    if isinstance(sliding_window, bool) or not isinstance(sliding_window, int):
+        raise ValueError(
+            "DFlash sliding_window must be a positive integer or per-layer list"
+        )
+    if sliding_window <= 0:
+        raise ValueError(
+            "DFlash sliding_attention layers require a positive sliding_window"
         )
     return layer_types, sliding_window
 
@@ -238,16 +404,12 @@ class Qwen3DFlashAttentionBase(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.attention_dropout = config.attention_dropout
-        if config._attn_implementation == "flex_attention":
+        if getattr(config, "_attn_implementation", None) == "flex_attention":
             assert (
                 config.attention_dropout == 0.0
             ), "DFlash FlexAttention requires attention_dropout=0.0"
         self.is_causal = False
-        self.sliding_window = (
-            config.sliding_window
-            if config.layer_types[layer_idx] == SLIDING_ATTENTION
-            else None
-        )
+        self.sliding_window = get_layer_sliding_window(config, layer_idx)
         self._init_projections(config, kernels)
         for attribute in ("scaling", "num_key_value_groups", "o_proj"):
             assert hasattr(
@@ -282,7 +444,10 @@ class Qwen3DFlashAttentionBase(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
         valid_queries = None
-        if self.config._attn_implementation == "flex_attention":
+        attn_implementation = getattr(
+            self.config, "_attn_implementation", None
+        ) or "sdpa"
+        if attn_implementation == "flex_attention":
             kernel_options = dict(kwargs.pop("kernel_options", None) or {})
             backend = flex_attention_backend()
             if backend is not None:
@@ -300,13 +465,13 @@ class Qwen3DFlashAttentionBase(nn.Module):
             attn_weights = None
         else:
             attn_fn: Callable = eager_attention_forward
-            if self.config._attn_implementation == "eager":
+            if attn_implementation == "eager":
                 attention_mask, valid_queries = _prepare_dflash_eager_mask(
                     attention_mask,
                     q.dtype,
                 )
             else:
-                attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+                attn_fn = ALL_ATTENTION_FUNCTIONS[attn_implementation]
             attn_output, attn_weights = attn_fn(
                 self,
                 q,
@@ -334,6 +499,7 @@ class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
     """GQA/MHA projections over the family's context-then-draft KV layout."""
 
     def _init_projections(self, config: Qwen3Config, kernels: DFlashKernels) -> None:
+        method_config = _dflash_method_config(config)
         self.head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
@@ -361,6 +527,21 @@ class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
             config.hidden_size,
             bias=config.attention_bias,
         )
+        self.heterogeneous_kv = bool(method_config.get("heterogeneous_kv", False))
+        self.target_hidden_size = int(
+            method_config.get("target_hidden_size", config.hidden_size)
+        )
+        if self.heterogeneous_kv:
+            self.k_proj_target = nn.Linear(
+                self.target_hidden_size,
+                config.num_key_value_heads * self.head_dim,
+                bias=config.attention_bias,
+            )
+            self.v_proj_target = nn.Linear(
+                self.target_hidden_size,
+                config.num_key_value_heads * self.head_dim,
+                bias=config.attention_bias,
+            )
         self.q_norm = kernels.make_rms_norm(self.head_dim, config.rms_norm_eps)
         self.k_norm = kernels.make_rms_norm(self.head_dim, config.rms_norm_eps)
 
@@ -375,9 +556,13 @@ class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
-        k_ctx = self.k_proj(target_hidden)
+        if self.heterogeneous_kv:
+            k_ctx = self.k_proj_target(target_hidden)
+            v_ctx = self.v_proj_target(target_hidden)
+        else:
+            k_ctx = self.k_proj(target_hidden)
+            v_ctx = self.v_proj(target_hidden)
         k_noise = self.k_proj(hidden_states)
-        v_ctx = self.v_proj(target_hidden)
         v_noise = self.v_proj(hidden_states)
         k = torch.cat([k_ctx, k_noise], dim=1).view(
             bsz, ctx_len + q_len, -1, self.head_dim
@@ -628,6 +813,79 @@ def extract_context_feature(
     return target_hidden
 
 
+def is_complete_block(start: int, block_size: int, max_length: int) -> bool:
+    """Return whether all draft positions in this block fit in max_length."""
+    return start + block_size <= max_length
+
+
+def compute_acceptance_stats(
+    acceptance_lengths: list[int],
+    block_complete_flags: list[bool],
+    block_size: int,
+) -> dict:
+    """Compute mean acceptance over complete blocks, preserving all lengths."""
+    complete_lengths = [
+        al
+        for al, ok in zip(acceptance_lengths, block_complete_flags)
+        if ok
+    ]
+    num_incomplete = len(block_complete_flags) - len(complete_lengths)
+    mean_accept = (
+        float(sum(complete_lengths) / len(complete_lengths))
+        if complete_lengths
+        else None
+    )
+    return {
+        "acceptance_lengths": acceptance_lengths,
+        "mean_acceptance_length": mean_accept,
+        "num_complete_blocks": len(complete_lengths),
+        "num_incomplete_blocks": num_incomplete,
+        "block_size": block_size,
+    }
+
+
+def _target_text_model(target: nn.Module) -> nn.Module:
+    """Resolve the text-only causal model from a conditional-generation target."""
+    get_language_model = getattr(target, "get_language_model", None)
+    if callable(get_language_model):
+        language_model = get_language_model()
+        if language_model is not None:
+            return language_model
+    language_model = getattr(target, "language_model", None)
+    if language_model is not None:
+        return language_model
+    candidate = getattr(target, "model", None)
+    if candidate is not None and getattr(candidate, "language_model", None) is not None:
+        return candidate.language_model
+    if (
+        candidate is not None
+        and getattr(candidate, "embed_tokens", None) is not None
+        and getattr(candidate, "lm_head", None) is not None
+    ):
+        return candidate
+    return target
+
+
+def _target_embed_tokens(target: nn.Module) -> nn.Module:
+    text_model = _target_text_model(target)
+    embed_tokens = getattr(text_model, "embed_tokens", None)
+    if embed_tokens is not None:
+        return embed_tokens
+    return getattr(text_model.model, "embed_tokens")
+
+
+def _target_lm_head(target: nn.Module) -> nn.Module:
+    text_model = _target_text_model(target)
+    lm_head = getattr(text_model, "lm_head", None)
+    if lm_head is not None:
+        return lm_head
+    return getattr(target, "lm_head")
+
+
+def _target_device(target: nn.Module) -> torch.device:
+    return next(target.parameters()).device
+
+
 def normalize_draft_head_checkpoint_keys(
     module,
     state_dict,
@@ -681,6 +939,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         super().__init__(config)
         self.config = config
         self.layer_types, self.sliding_window = resolve_dflash_attention_layout(config)
+        if getattr(config, "_attn_implementation", None) is None:
+            config._attn_implementation = "sdpa"
         self.attention_mode = validate_dflash_attention_config(config)
         kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
         dflash_config = getattr(config, "dflash_config", {}) or {}
@@ -703,17 +963,118 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             "target_layer_ids",
             build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
         )
-        self.norm = kernels.make_rms_norm(config.hidden_size, config.rms_norm_eps)
+        self.target_hidden_size = int(
+            dflash_config.get("target_hidden_size", config.hidden_size)
+        )
+        self.norm = kernels.make_rms_norm(
+            self.target_hidden_size, config.rms_norm_eps
+        )
         self.rotary_emb = Qwen3RotaryEmbedding(
             _rope_config(config, self.attention_mode)
         )
-        self.fc = nn.Linear(
-            len(self.target_layer_ids) * config.hidden_size,
-            config.hidden_size,
-            bias=False,
+        self._flare = dflash_config.get("fusion_mode") == "flare"
+        if self._flare and isinstance(self.target_layer_ids[0], list):
+            raise ValueError(
+                "fusion_mode='flare' is not compatible with per-layer "
+                "target_layer_ids; use a flat list."
+            )
+        self._heterogeneous_kv = bool(dflash_config.get("heterogeneous_kv", False))
+        if (
+            self._flare
+            and self.target_hidden_size != config.hidden_size
+            and not self._heterogeneous_kv
+        ):
+            raise ValueError(
+                "flare with target_hidden_size != hidden_size requires "
+                "dflash_config.heterogeneous_kv=true"
+            )
+        self._per_layer = (
+            not self._flare
+            and bool(self.target_layer_ids)
+            and isinstance(self.target_layer_ids, list)
+            and isinstance(self.target_layer_ids[0], list)
         )
-        self.hidden_norm = kernels.make_rms_norm(
-            config.hidden_size, config.rms_norm_eps
+
+        if self._flare:
+            self.num_target_layers = len(self.target_layer_ids)
+            self.layer_fusion_weights = nn.Parameter(
+                torch.empty(
+                    config.num_hidden_layers,
+                    self.num_target_layers,
+                )
+            )
+            self._init_fusion_weights()
+            self.hidden_norm = kernels.make_rms_norm(
+                self.target_hidden_size, config.rms_norm_eps
+            )
+            self.fc = None
+            self.fcs = None
+            self.hidden_norms = None
+        elif self._per_layer:
+            if len(self.target_layer_ids) != config.num_hidden_layers:
+                raise ValueError(
+                    "per-layer target_layer_ids must have one sub-list per "
+                    "draft layer"
+                )
+            unique_ids = sorted(
+                {lid for sublist in self.target_layer_ids for lid in sublist}
+            )
+            id_to_pos = {lid: i for i, lid in enumerate(unique_ids)}
+            H = self.target_hidden_size
+            self.fcs = nn.ModuleList()
+            self.hidden_norms = nn.ModuleList()
+            self._per_layer_gather = []
+            for sublist in self.target_layer_ids:
+                sub_unique = sorted(set(sublist))
+                if not sub_unique:
+                    raise ValueError(
+                        "each per-layer target_layer_ids sub-list must be non-empty"
+                    )
+                self._per_layer_gather.append(
+                    [id_to_pos[lid] for lid in sub_unique]
+                )
+                self.fcs.append(
+                    nn.Linear(
+                        len(sub_unique) * H,
+                        config.hidden_size,
+                        bias=False,
+                    )
+                )
+                self.hidden_norms.append(
+                    kernels.make_rms_norm(
+                        config.hidden_size, config.rms_norm_eps
+                    )
+                )
+            self.fc = None
+            self.hidden_norm = None
+        else:
+            self.fc = nn.Linear(
+                len(self.target_layer_ids) * self.target_hidden_size,
+                config.hidden_size,
+                bias=False,
+            )
+            self.hidden_norm = kernels.make_rms_norm(
+                config.hidden_size, config.rms_norm_eps
+            )
+            self.fcs = None
+            self.hidden_norms = None
+
+        if self.target_hidden_size != config.hidden_size:
+            self.input_proj = nn.Linear(
+                self.target_hidden_size, config.hidden_size, bias=False
+            )
+            self.output_proj = nn.Linear(
+                config.hidden_size, self.target_hidden_size, bias=False
+            )
+        else:
+            self.input_proj = None
+            self.output_proj = None
+        self.layer_sliding_windows = tuple(
+            get_layer_sliding_window(config, layer_idx)
+            for layer_idx in range(config.num_hidden_layers)
+        )
+        validate_dflash_attention_backend(
+            config, getattr(config, "_attn_implementation", None)
         )
         self.mask_token_id = dflash_config.get("mask_token_id", None)
         self.projector_type = dflash_config.get("projector_type", None)
@@ -735,6 +1096,17 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         del config, dflash_config
+
+    def _init_fusion_weights(self) -> None:
+        initialize_fusion_weights(self.layer_fusion_weights)
+
+    @property
+    def capture_layer_ids(self):
+        if self._per_layer:
+            return sorted(
+                {lid for sublist in self.target_layer_ids for lid in sublist}
+            )
+        return self.target_layer_ids
 
     def apply_logits_head(
         self,
@@ -769,6 +1141,137 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         del hidden_states, prev_token_ids
         return None
 
+    def _get_inference_gru(self):
+        """Lazily create an ``nn.GRU`` mirroring the Domino prefix GRU."""
+        if not hasattr(self, "_inference_gru") or self._inference_gru is None:
+            device = next(self.prefix_gru.parameters()).device
+            dtype = next(self.prefix_gru.parameters()).dtype
+            self._inference_gru = nn.GRU(
+                input_size=self.target_hidden_size,
+                hidden_size=self.gru_hidden_dim,
+                num_layers=1,
+                batch_first=True,
+                bias=False,
+            ).to(device=device, dtype=dtype)
+            self._inference_gru.load_state_dict(
+                self.prefix_gru.state_dict(),
+                strict=True,
+            )
+        return self._inference_gru
+
+    def _run_inference_gru(self, input: torch.Tensor, h0: Optional[torch.Tensor] = None):
+        """Run the inference GRU, with the existing NPU bf16 workaround."""
+        gru = self._get_inference_gru()
+        if get_device_type() == "npu" and input.dtype == torch.bfloat16:
+            from torch.func import functional_call
+
+            fp16_parameters = {
+                name: parameter.to(dtype=torch.float16)
+                for name, parameter in gru.named_parameters()
+            }
+            args = (input.to(dtype=torch.float16),)
+            if h0 is not None:
+                args = args + (h0.to(dtype=torch.float16),)
+            output, h_n = functional_call(
+                gru,
+                fp16_parameters,
+                args,
+                strict=True,
+            )
+            return output.to(dtype=input.dtype), h_n.to(dtype=input.dtype)
+        return gru(input, h0)
+
+    def _domino_generate_step(
+        self,
+        start: int,
+        block_size: int,
+        target: nn.Module,
+        output_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_values_target,
+        past_key_values_draft,
+        target_hidden: torch.Tensor,
+        temperature: float,
+    ):
+        """One Domino decode step matching vLLM's anchor-as-first draft path."""
+        text_target = _target_text_model(target)
+        target_embed = _target_embed_tokens(target)
+        target_lm_head = _target_lm_head(target)
+        block_output_ids = output_ids[:, start : start + block_size].clone()
+        noise_embedding = target_embed(block_output_ids)
+        anchor_positions = torch.full(
+            (target_hidden.shape[0], 1),
+            target_hidden.shape[1] - 1,
+            dtype=torch.long,
+            device=target_hidden.device,
+        )
+        full_hidden = self(
+            target_hidden=target_hidden,
+            noise_embedding=noise_embedding,
+            anchor_positions=anchor_positions,
+            position_ids=position_ids[
+                :,
+                past_key_values_draft.get_seq_length() : start + block_size,
+            ],
+            past_key_values=past_key_values_draft,
+            use_cache=True,
+            is_causal=False,
+        )
+        past_key_values_draft.crop(start)
+
+        k_draft = block_size
+        prefix_len = int(getattr(self, "pure_draft_prefix_len", 0))
+        base_logits = target_lm_head(full_hidden)
+
+        verify_ids = torch.full(
+            (1, k_draft + 1),
+            self.mask_token_id,
+            dtype=torch.long,
+            device=_target_device(target),
+        )
+        verify_ids[:, 0] = block_output_ids[:, 0]
+        if prefix_len > 0:
+            verify_ids[:, 1 : 1 + prefix_len] = sample(
+                base_logits[:, :prefix_len],
+                temperature,
+            )
+        realized_prefix_ids = verify_ids[:, : 1 + prefix_len]
+        realized_prefix_embeds = target_embed(realized_prefix_ids)
+        _, gru_hidden = self._run_inference_gru(realized_prefix_embeds)
+
+        for i in range(prefix_len, k_draft):
+            z_i = full_hidden[:, i : i + 1]
+            s_i = gru_hidden.transpose(0, 1)
+            concat = torch.cat([z_i, s_i], dim=-1)
+            logits_i = base_logits[:, i : i + 1]
+            if self.embed_proj is not None:
+                logits_i = logits_i + self.embed_proj(concat)
+            if self.hidden_proj is not None:
+                logits_i = logits_i + target_lm_head(self.hidden_proj(concat))
+            current_token_id = sample(logits_i, temperature)
+            verify_ids[:, i + 1 : i + 2] = current_token_id
+            if i + 1 < k_draft:
+                new_embed = target_embed(current_token_id)
+                _, gru_hidden = self._run_inference_gru(new_embed, gru_hidden)
+
+        verify_position_ids = position_ids[:, start : start + k_draft + 1]
+        output = text_target(
+            verify_ids,
+            position_ids=verify_position_ids,
+            past_key_values=past_key_values_target,
+            use_cache=True,
+            output_hidden_states=True,
+        )
+        posterior = sample(output.logits, temperature)
+        acceptance_length = (
+            (verify_ids[:, 1:] == posterior[:, :-1])
+            .long()
+            .cumprod(dim=1)
+            .sum(dim=1)[0]
+            .item()
+        )
+        return output, posterior, acceptance_length, verify_ids, k_draft
+
     def _sample_draft_tokens(
         self,
         target: nn.Module,
@@ -782,7 +1285,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         duplicating the target-cache and acceptance logic in ``spec_generate``.
         """
         del block_output_ids
-        draft_logits = target.lm_head(draft_hidden[:, -self.block_size + 1 :, :])
+        draft_logits = _target_lm_head(target)(
+            draft_hidden[:, -self.block_size + 1 :, :]
+        )
         return sample(draft_logits)
 
     def forward(
@@ -796,17 +1301,61 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
-        target_hidden = self.hidden_norm(self.fc(target_hidden))
+        if self.input_proj is not None:
+            hidden_states = self.input_proj(hidden_states)
+
+        if self._flare:
+            B, S, _ = target_hidden.shape
+            H = self.target_hidden_size
+            T = self.num_target_layers
+            target_reshaped = target_hidden.view(B, S, T, H)
+            flare_weights = torch.softmax(self.layer_fusion_weights, dim=1)
+            per_layer_targets = [
+                self.hidden_norm(
+                    (target_reshaped * flare_weights[i].view(1, 1, -1, 1)).sum(
+                        dim=2
+                    )
+                )
+                for i in range(len(self.layers))
+            ]
+        elif self._per_layer:
+            H = self.target_hidden_size
+            per_layer_targets = [
+                self.hidden_norms[i](
+                    self.fcs[i](
+                        torch.cat(
+                            [
+                                target_hidden[
+                                    :, :, idx * H : (idx + 1) * H
+                                ]
+                                for idx in self._per_layer_gather[i]
+                            ],
+                            dim=-1,
+                        )
+                    )
+                )
+                for i in range(len(self.layers))
+            ]
+        else:
+            target_hidden = self.hidden_norm(self.fc(target_hidden))
+            per_layer_targets = None
+
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        for layer_type, layer in zip(self.layer_types, self.layers):
-            layer_attention_mask = (
-                attention_mask[layer_type]
-                if isinstance(attention_mask, dict)
-                else attention_mask
-            )
+        for layer_idx, layer in enumerate(self.layers):
+            if isinstance(attention_mask, dict):
+                layer_type = self.layer_types[layer_idx]
+                layer_attention_mask = attention_mask.get(layer_type)
+            elif isinstance(attention_mask, list):
+                layer_attention_mask = attention_mask[layer_idx]
+            else:
+                layer_attention_mask = attention_mask
+            if self._flare or self._per_layer:
+                layer_target = per_layer_targets[layer_idx]
+            else:
+                layer_target = target_hidden
             hidden_states = layer(
                 hidden_states=hidden_states,
-                target_hidden=target_hidden,
+                target_hidden=layer_target,
                 attention_mask=layer_attention_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_values,
@@ -814,6 +1363,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+        if self.output_proj is not None:
+            hidden_states = self.output_proj(hidden_states)
         return self.norm(hidden_states)
 
     @torch.inference_mode()
@@ -824,8 +1375,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         max_new_tokens: int,
         stop_token_ids: list[int],
         temperature: float,
+        return_acceptance_stats: bool = False,
     ):
         self.eval()
+        text_target = _target_text_model(target)
+        target_embed = _target_embed_tokens(target)
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
 
@@ -834,17 +1388,17 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             (1, max_length + block_size),
             self.mask_token_id,
             dtype=torch.long,
-            device=target.device,
+            device=_target_device(target),
         )
         position_ids = torch.arange(
-            output_ids.shape[1], device=target.device
+            output_ids.shape[1], device=_target_device(target)
         ).unsqueeze(0)
 
         past_key_values_target = DynamicCache()
         past_key_values_draft = DynamicCache()
 
         # Prefill stage
-        output = target(
+        output = text_target(
             input_ids,
             position_ids=position_ids[:, :num_input_tokens],
             past_key_values=past_key_values_target,
@@ -863,55 +1417,106 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
         # Decode stage
         acceptance_lengths = []
+        block_complete_flags = []
+        per_pos_correct = torch.zeros(block_size, device=_target_device(target))
+        per_pos_total = torch.zeros(block_size, device=_target_device(target))
         start = input_ids.shape[1]
         while start < max_length:
-            block_output_ids = output_ids[:, start : start + block_size].clone()
-            block_position_ids = position_ids[:, start : start + block_size]
-            noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_hidden = self(
-                target_hidden=target_hidden,
-                noise_embedding=noise_embedding,
-                position_ids=position_ids[
-                    :, past_key_values_draft.get_seq_length() : start + block_size
-                ],
-                past_key_values=past_key_values_draft,
-                use_cache=True,
-                is_causal=False,
-            )
-            past_key_values_draft.crop(start)
-            block_output_ids[:, 1:] = self._sample_draft_tokens(
-                target,
-                draft_hidden,
-                block_output_ids,
-            )
+            if getattr(self, "projector_type", None) == "domino":
+                block_is_complete = is_complete_block(
+                    start, block_size + 1, max_length
+                )
+                output, posterior, acceptance_length, verify_ids, _ = (
+                    self._domino_generate_step(
+                        start,
+                        block_size,
+                        text_target,
+                        output_ids,
+                        position_ids,
+                        past_key_values_target,
+                        past_key_values_draft,
+                        target_hidden,
+                        temperature,
+                    )
+                )
+                pos_match = (verify_ids[:, 1:] == posterior[:, :-1]).float()
+                per_pos_correct += pos_match[0]
+                per_pos_total += 1
+                output_ids[:, start : start + acceptance_length + 1] = (
+                    verify_ids[:, : acceptance_length + 1]
+                )
+                if start + acceptance_length + 1 < output_ids.shape[1]:
+                    output_ids[:, start + acceptance_length + 1] = posterior[
+                        :, acceptance_length
+                    ]
+                start += acceptance_length + 1
+                past_key_values_target.crop(start)
+                target_hidden = extract_context_feature(
+                    output.hidden_states, self.target_layer_ids
+                )[:, : acceptance_length + 1, :]
+            else:
+                block_is_complete = is_complete_block(
+                    start, block_size, max_length
+                )
+                block_output_ids = output_ids[
+                    :, start : start + block_size
+                ].clone()
+                block_position_ids = position_ids[:, start : start + block_size]
+                noise_embedding = target_embed(block_output_ids)
+                draft_hidden = self(
+                    target_hidden=target_hidden,
+                    noise_embedding=noise_embedding,
+                    position_ids=position_ids[
+                        :,
+                        past_key_values_draft.get_seq_length() : start
+                        + block_size,
+                    ],
+                    past_key_values=past_key_values_draft,
+                    use_cache=True,
+                    is_causal=False,
+                )
+                past_key_values_draft.crop(start)
+                block_output_ids[:, 1:] = self._sample_draft_tokens(
+                    text_target,
+                    draft_hidden,
+                    block_output_ids,
+                )
 
-            output = target(
-                block_output_ids,
-                position_ids=block_position_ids,
-                past_key_values=past_key_values_target,
-                use_cache=True,
-                output_hidden_states=True,
-            )
+                output = text_target(
+                    block_output_ids,
+                    position_ids=block_position_ids,
+                    past_key_values=past_key_values_target,
+                    use_cache=True,
+                    output_hidden_states=True,
+                )
 
-            posterior = sample(output.logits, temperature)
-            acceptance_length = (
-                (block_output_ids[:, 1:] == posterior[:, :-1])
-                .cumprod(dim=1)
-                .sum(dim=1)[0]
-                .item()
-            )
-            output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
-                :, : acceptance_length + 1
-            ]
-            output_ids[:, start + acceptance_length + 1] = posterior[
-                :, acceptance_length
-            ]
-            start += acceptance_length + 1
-            past_key_values_target.crop(start)
-            target_hidden = extract_context_feature(
-                output.hidden_states, self.target_layer_ids
-            )[:, : acceptance_length + 1, :]
+                posterior = sample(output.logits, temperature)
+                acceptance_length = (
+                    (block_output_ids[:, 1:] == posterior[:, :-1])
+                    .long()
+                    .cumprod(dim=1)
+                    .sum(dim=1)[0]
+                    .item()
+                )
+                pos_match = (
+                    block_output_ids[:, 1:] == posterior[:, :-1]
+                ).float()
+                per_pos_correct[: block_size - 1] += pos_match[0]
+                per_pos_total[: block_size - 1] += 1
+                output_ids[
+                    :, start : start + acceptance_length + 1
+                ] = block_output_ids[:, : acceptance_length + 1]
+                if start + acceptance_length + 1 < output_ids.shape[1]:
+                    output_ids[:, start + acceptance_length + 1] = posterior[
+                        :, acceptance_length
+                    ]
+                start += acceptance_length + 1
+                past_key_values_target.crop(start)
+                target_hidden = extract_context_feature(
+                    output.hidden_states, self.target_layer_ids
+                )[:, : acceptance_length + 1, :]
             acceptance_lengths.append(acceptance_length + 1)
+            block_complete_flags.append(block_is_complete)
             if stop_token_ids is not None and any(
                 stop_token_id in output_ids[:, num_input_tokens:]
                 for stop_token_id in stop_token_ids
@@ -929,4 +1534,20 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                     :, : num_input_tokens + stop_token_indices[0] + 1
                 ]
 
+        if return_acceptance_stats:
+            stats = compute_acceptance_stats(
+                acceptance_lengths,
+                block_complete_flags,
+                block_size,
+            )
+            mask = per_pos_total > 0
+            if mask.any():
+                stats["per_position_accuracy"] = (
+                    (per_pos_correct[mask] / per_pos_total[mask])
+                    .cpu()
+                    .tolist()
+                )
+            else:
+                stats["per_position_accuracy"] = []
+            return output_ids, stats
         return output_ids

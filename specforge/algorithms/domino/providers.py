@@ -74,6 +74,15 @@ def resume_contract(config, draft_model, training_model):
         "domino_loss_decay_gamma": training_model.loss_decay_gamma,
         "domino_shift_label": bool(training_model.shift_label),
         "domino_pure_draft_prefix_len": int(draft_model.pure_draft_prefix_len),
+        "domino_target_hidden_size": int(draft_model.target_hidden_size),
+        "domino_fusion_mode": str(
+            getattr(draft_model.config, "dflash_config", {}).get("fusion_mode", "")
+        ),
+        "domino_heterogeneous_kv": bool(
+            getattr(draft_model.config, "dflash_config", {}).get(
+                "heterogeneous_kv", False
+            )
+        ),
         "domino_lambda_base_start": float(config.training.lambda_base_start),
         "domino_lambda_base_decay_ratio": float(
             config.training.lambda_base_decay_ratio

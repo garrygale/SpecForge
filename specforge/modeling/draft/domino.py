@@ -9,10 +9,28 @@ import torch
 from torch import nn
 from torch.func import functional_call
 
-from specforge.utils import get_device_type
+try:
+    from .dflash import (
+        DFlashDraftModel,
+        _target_embed_tokens,
+        _target_lm_head,
+        sample,
+    )
+    from .registry import register_draft
+except ImportError:  # exported top-level remote-code layout
+    from dflash import (
+        DFlashDraftModel,
+        _target_embed_tokens,
+        _target_lm_head,
+        sample,
+    )
+    from registry import register_draft
 
-from .dflash import DFlashDraftModel, sample
-from .registry import register_draft
+try:
+    from specforge.utils import get_device_type
+except ImportError:  # exported remote-code fallback
+    def get_device_type() -> str:
+        return "cpu"
 
 
 @register_draft
@@ -40,18 +58,42 @@ class DominoDraftModel(DFlashDraftModel):
         self.shift_label = bool(dflash_config.get("shift_label", False))
 
         self.prefix_gru = nn.GRU(
-            input_size=config.hidden_size,
+            input_size=self.target_hidden_size,
             hidden_size=self.gru_hidden_dim,
             num_layers=1,
             batch_first=True,
             bias=False,
         )
-        in_dim = config.hidden_size + self.gru_hidden_dim
-        self.embed_proj = nn.Sequential(
-            nn.Linear(in_dim, self.emb_dim, bias=False),
-            nn.SiLU(),
-            nn.Linear(self.emb_dim, config.vocab_size, bias=False),
-        )
+        in_dim = self.target_hidden_size + self.gru_hidden_dim
+        use_embed = dflash_config.get("use_embed_proj", True)
+        use_hidden = bool(dflash_config.get("use_hidden_proj", False))
+        if use_embed:
+            self.embed_proj = nn.Sequential(
+                nn.Linear(in_dim, self.emb_dim, bias=False),
+                nn.SiLU(),
+                nn.Linear(self.emb_dim, config.vocab_size, bias=False),
+            )
+            self.hidden_proj = None
+            self.emb_dim = int(self.emb_dim)
+        else:
+            self.embed_proj = None
+            self.emb_dim = None
+
+        if use_hidden:
+            hidden_proj_dim = int(
+                dflash_config.get("hidden_proj_dim", self.emb_dim or 256)
+            )
+            self.hidden_proj = nn.Sequential(
+                nn.Linear(in_dim, hidden_proj_dim, bias=False),
+                nn.SiLU(),
+                nn.Linear(hidden_proj_dim, self.target_hidden_size, bias=False),
+            )
+        else:
+            self.hidden_proj = None
+        if self.embed_proj is None and self.hidden_proj is None:
+            raise ValueError(
+                "domino requires use_embed_proj or use_hidden_proj"
+            )
 
     @property
     def suffix_start(self) -> int:
@@ -86,13 +128,15 @@ class DominoDraftModel(DFlashDraftModel):
         block_output_ids: torch.LongTensor,
     ) -> torch.LongTensor:
         """Sample a block while causally applying Domino's GRU correction."""
-        base_logits = target.lm_head(draft_hidden)
+        target_embed = _target_embed_tokens(target)
+        target_lm_head = _target_lm_head(target)
+        base_logits = target_lm_head(draft_hidden)
         completed_ids = block_output_ids.clone()
         base_logits4d = base_logits.unsqueeze(1)
         hidden_states4d = draft_hidden.unsqueeze(1)
 
         for token_position in range(1, completed_ids.shape[1]):
-            previous_embeddings = target.model.embed_tokens(completed_ids).unsqueeze(1)
+            previous_embeddings = target_embed(completed_ids).unsqueeze(1)
             final_logits = self.apply_logits_head(
                 base_logits4d,
                 prev_token_embeddings=previous_embeddings,

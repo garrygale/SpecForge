@@ -427,16 +427,29 @@ class OnlineDFlashModel(nn.Module):
             # FLASH requires a minimum of this block size.
             mask_args["flex_block_size"] = (256, 128)
         full_attn_mask = mask_builder(**mask_args)
-        sliding_window = self.draft_model.sliding_window
-        dflash_attn_mask = full_attn_mask
-        if sliding_window is not None:
-            dflash_attn_mask = {
-                "full_attention": full_attn_mask,
-                "sliding_attention": mask_builder(
-                    **mask_args,
-                    sliding_window=sliding_window,
-                ),
-            }
+        layer_sliding_windows = getattr(
+            self.draft_model, "layer_sliding_windows", None
+        )
+        if layer_sliding_windows is not None:
+            dflash_attn_mask = [
+                (
+                    full_attn_mask
+                    if window is None
+                    else mask_builder(**mask_args, sliding_window=window)
+                )
+                for window in layer_sliding_windows
+            ]
+        else:
+            sliding_window = self.draft_model.sliding_window
+            dflash_attn_mask = full_attn_mask
+            if sliding_window is not None:
+                dflash_attn_mask = {
+                    "full_attention": full_attn_mask,
+                    "sliding_attention": mask_builder(
+                        **mask_args,
+                        sliding_window=sliding_window,
+                    ),
+                }
 
         draft_kwargs = {}
         if self.attention_backend == "flex_attention":
