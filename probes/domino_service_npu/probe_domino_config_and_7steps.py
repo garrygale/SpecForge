@@ -39,9 +39,18 @@ def main() -> None:
         assert cfg["heterogeneous_kv"] is True
         assert cfg["target_hidden_size"] in (2048, 5120)
         assert len(cfg["target_layer_ids"]) == 7
-        assert getattr(config, "block_size", None) == 16
+        block_size = getattr(config, "block_size", None)
+        assert block_size in (16, 7)
         assert len(config.layer_types) == config.num_hidden_layers == 7
-        print(f"{filename}: ok (block_size=16, target_hidden={cfg['target_hidden_size']})")
+        note = (
+            ""
+            if block_size == 7
+            else " (strict service launch needs block_size=7 after retraining)"
+        )
+        print(
+            f"{filename}: ok (block_size={block_size}, "
+            f"target_hidden={cfg['target_hidden_size']}){note}"
+        )
 
     # Seven-step GRU correction loop against eagerGRU / torch.nn.GRU.
     input_size = 12

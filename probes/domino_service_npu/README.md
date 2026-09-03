@@ -16,7 +16,8 @@ machine, not on this CPU-only workstation.
 * `probe_gdn_accepted_boundary.py`
   CPU/device simulation of the accepted-token / `spec_query_start_loc`
   boundary that is reported as issue #9956.  It shows whether the failure is
-  limited to all-accepted tokens or also appears for partial final rounds.
+  limited to all-accepted tokens or also appears for partial final rounds, and
+  prints the per-row clamp that `vllm-ascend` now applies in the service.
 * `probe_domino_config_and_7steps.py`
   Validates the migrated draft configs and exercises a 7-step GRU correction
   loop against the SpecForge `eagerGRU` path.

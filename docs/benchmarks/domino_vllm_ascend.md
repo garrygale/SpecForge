@@ -6,9 +6,11 @@ It assumes the branches:
 * `vllm` `codex/DRAFT_qwen36_35B`
 * `vllm-ascend` `codex/DRAFT_qwen36_35B`
 
-The draft config keeps `block_size=16`, while the service is launched with
-seven speculative tokens (Domino is DSpark-shaped, so
-`num_query_per_req == num_speculative_tokens`).
+The service validation is strict: the draft config's `block_size` must equal
+the launched `num_speculative_tokens`.  For the intended seven-token service,
+the retrained draft config must therefore use `block_size: 7`.  The checked-in
+migration configs still use `block_size: 16` for the original training recipe;
+do not launch those with `--spec-tokens 7` without retraining at 7.
 
 ## Qwen3.6-35B-A3B
 
@@ -65,7 +67,7 @@ vllm serve /path/to/Qwen3.8-27B \
 The exported draft `config.json` must use:
 
 * `architectures: ["Qwen3DominoModel"]` (or the vllm-ascend registry alias)
-* `block_size: 16`
+* `block_size: 7` (must match `num_speculative_tokens`)
 * `dflash_config.fusion_mode: "flare"`
 * `dflash_config.heterogeneous_kv: true`
 * `dflash_config.target_layer_ids`: `[1, 7, 13, 19, 25, 31, 37]` for

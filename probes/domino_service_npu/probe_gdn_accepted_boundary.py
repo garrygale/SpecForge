@@ -53,11 +53,11 @@ def main() -> None:
     else:
         print("diagnosis: no accepted > segment length row found in this case.")
 
-    # Candidate defensive clamp used in the proposed investigation patch.
+    # Clamp now applied by the service before the custom conv/recurrent ops.
     lengths = torch.diff(qsl_eos)
     clamped = accepted_eos.clamp(max=lengths)
     print(
-        "proposed clamp output:",
+        "service clamp output:",
         clamped.tolist(),
         " (active rows are still at least 1; padded rows are filled later)",
     )
