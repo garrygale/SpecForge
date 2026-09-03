@@ -8,8 +8,9 @@ machine, not on this CPU-only workstation.
 ## Files
 
 * `probe_quant_paths.py`
-  W4A8 / W4A4 / W8A8 and mixed per-layer / fused Domino projections,
-  including eager and ACL graph replay when the NPU environment supports it.
+  W4A8 / W4A4 / W8A8 and mixed Domino QKV projections, comparing the fused
+  single-pack path against the per-layer path (the service invariant), plus
+  eager and ACL graph replay.
 * `probe_grouped_fused_kv.py`
   One grouped `npu_grouped_matmul` W4A8 context-K/V projection versus the
   seven per-layer baseline, with ACL graph replay.
@@ -23,7 +24,8 @@ machine, not on this CPU-only workstation.
   loop against the SpecForge `eagerGRU` path.
 * `probe_non_causal_band.py`
   Non-causal sliding-window FIA band-mode smoke test (`sparse_mode=4`,
-  `pre_tokens == next_tokens == window`).
+  `pre_tokens == next_tokens == window`), using the prefill-no-cache service
+  shape (`block_table=None`, contiguous TND K/V).
 
 ## Example
 

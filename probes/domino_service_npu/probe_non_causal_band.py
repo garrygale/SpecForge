@@ -30,14 +30,17 @@ def main() -> None:
     if not torch.npu.is_available():
         raise SystemExit("SKIP: NPU is not available")
 
+    torch.npu.config.allow_internal_format = True
     q = torch.randn(
         args.batch * args.tokens, args.heads, args.head_dim, dtype=torch.bfloat16
     ).npu()
-    k = q.clone()
-    v = q.clone()
+    k = q.clone().contiguous()
+    v = q.clone().contiguous()
     attn_mask = torch.zeros((2048, 2048), dtype=torch.int8).npu()
-    block_table = torch.zeros((args.batch, 1), dtype=torch.int64).npu()
-    actual_q = torch.tensor([args.tokens] * args.batch, dtype=torch.int64).npu()
+    # PrefillNoCache service path uses contiguous TND K/V and no block table;
+    # this is the minimal shape that exercises the sparse-mode=4 band setting.
+    block_table = None
+    actual_q = torch.tensor([args.tokens] * args.batch, dtype=torch.int32).npu()
     actual_kv = actual_q.clone()
 
     try:
@@ -46,7 +49,6 @@ def main() -> None:
             key=k,
             value=v,
             atten_mask=attn_mask,
-            block_table=block_table,
             input_layout="TND",
             block_size=128,
             actual_seq_lengths=actual_q,

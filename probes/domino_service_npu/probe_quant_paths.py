@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""NPU probe for the Domino W4A8/W4A4/W8A8 and fused projection paths.
+"""NPU probe for the Domino W4A8/W4A4/W8A8 fused QKV path.
 
-This probe mirrors the layouts used by
-``vllm_ascend/quantization/domino.py`` at the operator level, without
-importing ``vllm_ascend``.  Run it on an NPU with ``torch_npu`` installed.
+This follows the validated ``vllm-ascend/benchmarks/probe_qkv_fusion.py``
+structure: it compares fused single-pack projections against the separate
+per-layer projections (the service invariant), rather than against an fp32
+reference that includes quantization rounding.  It also captures the fused
+path with ``torch.npu.NPUGraph`` and checks replay parity.
 
 Usage::
 
@@ -13,62 +15,93 @@ Usage::
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
+import torch_npu
+
+ACL_FORMAT_ND = 2
+TOLERANCE = 0.05
 
 
-@dataclass
-class SchemeCase:
-    name: str
-    w_bit: int
-    scheme: str  # "w4a8", "w4a4", or "w8a8"
+def _dims(real: bool) -> tuple[int, int, int, int, int]:
+    # (K, NQ, NKV, D, M)
+    if real:
+        return 2560, 4096, 1024, 7, 28
+    return 64, 64, 16, 3, 7
 
 
-def quantize_weight_per_channel(
-    weight: torch.Tensor, w_bit: int, stochastic: bool = False
-) -> tuple[torch.Tensor, torch.Tensor]:
-    qmax = 2 ** (w_bit - 1) - 1
-    w_fp32 = weight.float()
-    scale = w_fp32.abs().amax(dim=1, keepdim=True) / qmax
-    scale = scale.clamp(min=1e-6)
-    w_scaled = w_fp32 / scale
-    w_int = torch.floor(w_scaled + torch.rand_like(w_scaled)) if stochastic else torch.round(w_scaled)
-    w_int = w_int.clamp(-qmax, qmax)
-    return w_int, scale
-
-
-def pack_w4a8(w_int: torch.Tensor) -> torch.Tensor:
+def _pack_w4a8(w_int: torch.Tensor) -> torch.Tensor:
     """[N, K] int4 -> [K, N//8] int32 ND (Domino W4A8 layout)."""
-    import torch_npu
-
-    w_t = w_int.to(torch.int32).t().contiguous()
-    packed = torch_npu.npu_convert_weight_to_int4pack(w_t)
-    return torch_npu.npu_format_cast(packed, 2)
-
-
-def pack_w4a4(w_int: torch.Tensor) -> torch.Tensor:
-    """[N, K] int4 -> [K//8, N] int32 (Domino W4A4 layout)."""
-    import torch_npu
-
     packed = torch_npu.npu_convert_weight_to_int4pack(
+        w_int.to(torch.int32).t().contiguous()
+    )
+    return torch_npu.npu_format_cast(packed, ACL_FORMAT_ND)
+
+
+def _pack_w4a4(w_int: torch.Tensor) -> torch.Tensor:
+    """[N, K] int4 -> [K//8, N] int32 (Domino W4A4 layout)."""
+    return torch_npu.npu_convert_weight_to_int4pack(
         w_int.to(torch.int32).contiguous()
-    )
-    return packed.transpose(-1, -2)
+    ).transpose(-1, -2)
 
 
-def proj_w4a8(x: torch.Tensor, packed: torch.Tensor, scale: torch.Tensor):
-    import torch_npu
+def _build_case(scheme: str, k: int, nq: int, nkv: int, d: int):
+    sep = []
+    fused = None
+    if scheme == "bf16":
+        for _ in range(d):
+            w = torch.randn(nq + 2 * nkv, k, dtype=torch.bfloat16, device="npu")
+            sep.append({"q": w[:nq], "k": w[nq : nq + nkv], "v": w[nq + nkv :]})
+        return sep, None
 
+    fused = []
+    for _ in range(d):
+        w_int = torch.randint(-7, 8, (nq + 2 * nkv, k), dtype=torch.int32, device="npu")
+        scale = torch.rand(nq + 2 * nkv, device="npu") * 0.9 + 0.1
+        if scheme == "w4a8":
+            sep.append(
+                {
+                    "q": (_pack_w4a8(w_int[:nq]), scale[:nq].to(torch.bfloat16)),
+                    "k": (_pack_w4a8(w_int[nq : nq + nkv]), scale[nq : nq + nkv].to(torch.bfloat16)),
+                    "v": (_pack_w4a8(w_int[nq + nkv :]), scale[nq + nkv :].to(torch.bfloat16)),
+                }
+            )
+            fused.append((_pack_w4a8(w_int), scale.to(torch.bfloat16)))
+        elif scheme == "w4a4":
+            sep.append(
+                {
+                    "q": (_pack_w4a4(w_int[:nq]), scale[:nq]),
+                    "k": (_pack_w4a4(w_int[nq : nq + nkv]), scale[nq : nq + nkv]),
+                    "v": (_pack_w4a4(w_int[nq + nkv :]), scale[nq + nkv :]),
+                }
+            )
+            fused.append((_pack_w4a4(w_int), scale))
+        else:
+            sep.append(
+                {
+                    "q": (w_int[:nq].to(torch.int8).t().contiguous(), scale[:nq]),
+                    "k": (w_int[nq : nq + nkv].to(torch.int8).t().contiguous(), scale[nq : nq + nkv]),
+                    "v": (w_int[nq + nkv :].to(torch.int8).t().contiguous(), scale[nq + nkv :]),
+                }
+            )
+            fused.append((w_int.to(torch.int8).t().contiguous(), scale))
+    return sep, fused
+
+
+def _proj_bf16(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.linear(x, w)
+
+
+def _proj_w4a8(x: torch.Tensor, packed: torch.Tensor, scale: torch.Tensor):
     return torch_npu.npu_weight_quant_batchmatmul(
-        x, packed, antiquant_scale=scale.to(x.dtype), antiquant_group_size=0
+        x,
+        packed,
+        antiquant_scale=scale,
+        antiquant_group_size=0,
     )
 
 
-def proj_w4a4(x: torch.Tensor, packed: torch.Tensor, scale: torch.Tensor):
-    import torch_npu
-
+def _proj_w4a4(x: torch.Tensor, packed: torch.Tensor, scale: torch.Tensor):
     x4, x4s = torch_npu.npu_dynamic_quant(x, dst_type=torch.quint4x2)
     return torch_npu.npu_quant_matmul(
         x4,
@@ -80,15 +113,13 @@ def proj_w4a4(x: torch.Tensor, packed: torch.Tensor, scale: torch.Tensor):
     ).to(x.dtype)
 
 
-def proj_w8a8(x: torch.Tensor, packed: torch.Tensor, scale: torch.Tensor):
-    import torch_npu
-
+def _proj_w8a8(x: torch.Tensor, w8: torch.Tensor, scale: torch.Tensor):
     x8, x8s = torch_npu.npu_dynamic_quant(x)
     if x8s.dim() == 2:
         x8s = x8s.squeeze(1)
     return torch_npu.npu_quant_matmul(
         x8,
-        packed,
+        w8,
         scale,
         pertoken_scale=x8s,
         bias=None,
@@ -96,44 +127,79 @@ def proj_w8a8(x: torch.Tensor, packed: torch.Tensor, scale: torch.Tensor):
     )
 
 
-def pack_scheme(w_int: torch.Tensor, scheme: str) -> torch.Tensor:
-    if scheme == "w4a8":
-        return pack_w4a8(w_int)
-    if scheme == "w4a4":
-        return pack_w4a4(w_int)
-    return w_int.to(torch.int8).t().contiguous()
+def _run_sep(
+    scheme: str,
+    x: torch.Tensor,
+    sep,
+) -> torch.Tensor:
+    outs = []
+    for layer in sep:
+        if scheme == "bf16":
+            q = _proj_bf16(x, layer["q"])
+            k = _proj_bf16(x, layer["k"])
+            v = _proj_bf16(x, layer["v"])
+        elif scheme == "w4a8":
+            q = _proj_w4a8(x, *layer["q"])
+            k = _proj_w4a8(x, *layer["k"])
+            v = _proj_w4a8(x, *layer["v"])
+        elif scheme == "w4a4":
+            q = _proj_w4a4(x, *layer["q"])
+            k = _proj_w4a4(x, *layer["k"])
+            v = _proj_w4a4(x, *layer["v"])
+        else:
+            q = _proj_w8a8(x, *layer["q"])
+            k = _proj_w8a8(x, *layer["k"])
+            v = _proj_w8a8(x, *layer["v"])
+        outs.append(torch.cat([q, k, v], dim=-1))
+    return torch.stack(outs)
 
 
-def proj_scheme(x: torch.Tensor, packed: torch.Tensor, scale: torch.Tensor, scheme: str):
-    if scheme == "w4a8":
-        return proj_w4a8(x, packed, scale.to(x.dtype))
-    if scheme == "w4a4":
-        return proj_w4a4(x, packed, scale)
-    return proj_w8a8(x, packed, scale)
+def _run_fused(scheme: str, x: torch.Tensor, fused):
+    outs = []
+    for layer in fused:
+        if scheme == "bf16":
+            outs.append(_proj_bf16(x, layer))
+        elif scheme == "w4a8":
+            outs.append(_proj_w4a8(x, *layer))
+        elif scheme == "w4a4":
+            outs.append(_proj_w4a4(x, *layer))
+        else:
+            outs.append(_proj_w8a8(x, *layer))
+    return torch.stack(outs)
 
 
-def _real_dims() -> tuple[int, int, int, int]:
-    """(in_features, out_features, batch, query_len) for the draft shapes."""
-    return 2560, 4096, 4, 16
+def _run_mixed_sep(x: torch.Tensor, sep_w4a4, sep_w4a8):
+    outs = []
+    for i, (sep4, sep8) in enumerate(zip(sep_w4a4, sep_w4a8, strict=True)):
+        layer = sep4 if i == 0 else sep8
+        if i == 0:
+            q = _proj_w4a4(x, *layer["q"])
+            k = _proj_w4a4(x, *layer["k"])
+            v = _proj_w4a4(x, *layer["v"])
+        else:
+            q = _proj_w4a8(x, *layer["q"])
+            k = _proj_w4a8(x, *layer["k"])
+            v = _proj_w4a8(x, *layer["v"])
+        outs.append(torch.cat([q, k, v], dim=-1))
+    return torch.stack(outs)
 
 
-def _small_dims() -> tuple[int, int, int, int]:
-    return (64, 128, 2, 8)
+def _run_mixed_fused(x: torch.Tensor, fused_w4a4, fused_w4a8):
+    outs = []
+    for i, (f4, f8) in enumerate(zip(fused_w4a4, fused_w4a8, strict=True)):
+        layer = f4 if i == 0 else f8
+        if i == 0:
+            outs.append(_proj_w4a4(x, *layer))
+        else:
+            outs.append(_proj_w4a8(x, *layer))
+    return torch.stack(outs)
 
 
-def _check(
-    name: str,
-    got: torch.Tensor,
-    ref: torch.Tensor,
-    rtol: float = 1e-2,
-    atol: float = 1e-2,
-) -> None:
-    if got.shape != ref.shape:
-        raise AssertionError(f"{name}: shape {tuple(got.shape)} != {tuple(ref.shape)}")
-    diff = (got.float() - ref.float()).abs().max().item()
-    if diff > max(atol, rtol * ref.float().abs().max().item()):
-        raise AssertionError(f"{name}: max diff {diff:.6f}")
-    print(f"  {name}: ok (max diff {diff:.6f})")
+def _check(name: str, out_sep: torch.Tensor, out_fused: torch.Tensor) -> bool:
+    err = (out_sep.float() - out_fused.float()).abs().max().item()
+    ok = err <= TOLERANCE
+    print(f"{name:18s} max_err={err:.6f} {'OK' if ok else 'FAIL'}", flush=True)
+    return ok
 
 
 def main() -> None:
@@ -141,85 +207,74 @@ def main() -> None:
     parser.add_argument("--real-dims", action="store_true")
     args = parser.parse_args()
 
-    try:
-        import torch_npu  # noqa: F401
-    except ImportError as exc:
-        raise SystemExit("SKIP: torch_npu is not available") from exc
-    if not torch.npu.is_available():
-        raise SystemExit("SKIP: NPU is not available")
+    torch.npu.config.allow_internal_format = True
+    print("allow_internal_format=True (service-like)")
+    k, nq, nkv, d, m = _dims(args.real_dims)
+    nqkv = nq + 2 * nkv
+    print(f"K={k} NQ={nq} NKV={nkv} NQKV={nqkv} D={d} M={m}")
+    torch.manual_seed(0)
 
-    device = torch.device("npu:0")
-    in_features, out_features, batch, query_len = (
-        _real_dims() if args.real_dims else _small_dims()
-    )
-    torch.manual_seed(7)
-    x = torch.randn(batch * query_len, in_features, dtype=torch.bfloat16, device=device)
-    weight = torch.randn(out_features, in_features, dtype=torch.bfloat16, device=device)
-    ref = F.linear(x.float(), weight.float())
+    sep_bf16, fused_bf16_weights = _build_case("bf16", k, nq, nkv, d)
+    sep_w4a8, fused_w4a8 = _build_case("w4a8", k, nq, nkv, d)
+    sep_w4a4, fused_w4a4 = _build_case("w4a4", k, nq, nkv, d)
+    sep_w8a8, fused_w8a8 = _build_case("w8a8", k, nq, nkv, d)
 
-    cases = [
-        SchemeCase("W4A8", 4, "w4a8"),
-        SchemeCase("W4A4", 4, "w4a4"),
-        SchemeCase("W8A8", 8, "w8a8"),
-    ]
-    for case in cases:
-        w_int, scale = quantize_weight_per_channel(weight, case.w_bit)
-        packed = pack_scheme(w_int, case.scheme)
-        got = proj_scheme(x, packed, scale.reshape(-1).to(torch.float32), case.scheme)
-        _check(f"{case.name} per-layer", got, ref)
+    x = torch.randn(m, k, dtype=torch.bfloat16, device="npu")
+    all_ok = True
 
-    # Fused q/k/v single call vs three separate projections.
-    q_size = out_features // 2
-    k_size = out_features // 4
-    v_size = out_features // 4
-    q_w = torch.randn(q_size, in_features, dtype=torch.bfloat16, device=device)
-    k_w = torch.randn(k_size, in_features, dtype=torch.bfloat16, device=device)
-    v_w = torch.randn(v_size, in_features, dtype=torch.bfloat16, device=device)
-    fused_w = torch.cat([q_w, k_w, v_w], dim=0)
-
-    for case in cases:
-        q_int, q_scale = quantize_weight_per_channel(q_w, case.w_bit)
-        k_int, k_scale = quantize_weight_per_channel(k_w, case.w_bit)
-        v_int, v_scale = quantize_weight_per_channel(v_w, case.w_bit)
-        fused_int = torch.cat([q_int, k_int, v_int], dim=0)
-        fused_scale = torch.cat([q_scale, k_scale, v_scale]).reshape(-1).float()
-        packed_fused = pack_scheme(fused_int, case.scheme)
-        fused_got = proj_scheme(x, packed_fused, fused_scale, case.scheme)
-        refs = [
-            proj_scheme(x, pack_scheme(q_int, case.scheme), q_scale.reshape(-1).float(), case.scheme)
-            for q_int, q_scale in ((q_int, q_scale),)
-        ]
-        _check(
-            f"{case.name} fused qkv packing",
-            fused_got.view(batch, query_len, -1),
+    def _bf16_fused_weights():
+        return [
             torch.cat(
-                [
-                    refs[0].view(batch, query_len, q_size),
-                    proj_scheme(x, pack_scheme(k_int, case.scheme), k_scale.reshape(-1).float(), case.scheme).view(batch, query_len, k_size),
-                    proj_scheme(x, pack_scheme(v_int, case.scheme), v_scale.reshape(-1).float(), case.scheme).view(batch, query_len, v_size),
-                ],
-                dim=-1,
-            ),
-        )
-
-    # ACL graph replay smoke test.  This is intentionally a single captured op;
-    # if the installed CANN/torch_npu lacks the graph API, report SKIP for the
-    # graph section and keep the eager result above.
-    if hasattr(torch.npu, "graph"):
-        w_int, scale = quantize_weight_per_channel(weight, 8)
-        packed = pack_scheme(w_int, "w8a8")
-        graph = torch.npu.graph()
-        try:
-            graph.__enter__()
-            graph_out = proj_scheme(
-                x, packed, scale.reshape(-1).to(torch.float32), "w8a8"
+                [sep_bf16[i]["q"], sep_bf16[i]["k"], sep_bf16[i]["v"]],
+                dim=0,
             )
-            graph.__exit__(None, None, None)
-            _check("W8A8 graph replay", graph_out, ref)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  graph replay: SKIP ({type(exc).__name__}: {exc})")
+            for i in range(d)
+        ]
 
-    print("probe_quant_paths: PASS")
+    all_ok &= _check(
+        "bf16",
+        _run_sep("bf16", x, sep_bf16),
+        _run_fused("bf16", x, _bf16_fused_weights()),
+    )
+    all_ok &= _check("w4a8", _run_sep("w4a8", x, sep_w4a8), _run_fused("w4a8", x, fused_w4a8))
+    all_ok &= _check("w4a4", _run_sep("w4a4", x, sep_w4a4), _run_fused("w4a4", x, fused_w4a4))
+    all_ok &= _check("w8a8", _run_sep("w8a8", x, sep_w8a8), _run_fused("w8a8", x, fused_w8a8))
+    all_ok &= _check(
+        "mixed",
+        _run_mixed_sep(x, sep_w4a4, sep_w4a8),
+        _run_mixed_fused(x, fused_w4a4, fused_w4a8),
+    )
+
+    # ACL graph replay parity for each fused scheme.
+    for scheme, fused in (
+        ("bf16", _bf16_fused_weights()),
+        ("w4a8", fused_w4a8),
+        ("w4a4", fused_w4a4),
+        ("w8a8", fused_w8a8),
+    ):
+        try:
+            graph = torch.npu.NPUGraph()
+            stream = torch.npu.Stream()
+            with torch.npu.graph(graph, stream=stream, capture_error_mode="global"):
+                graph_out = _run_fused(scheme, x, fused)
+            graph.replay()
+            torch.npu.synchronize()
+            eager_out = _run_fused(scheme, x, fused)
+            replay_err = (graph_out.float() - eager_out.float()).abs().max().item()
+            ok = replay_err == 0.0
+            print(
+                f"{scheme} graph replay err={replay_err:.6f} "
+                f"{'OK' if ok else 'FAIL'}",
+                flush=True,
+            )
+            all_ok &= ok
+        except Exception as exc:  # noqa: BLE001
+            print(f"{scheme} graph replay FAIL {type(exc).__name__}: {exc}", flush=True)
+            all_ok = False
+
+    print("RESULT:", "PASS" if all_ok else "FAIL")
+    if not all_ok:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
