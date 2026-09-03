@@ -18,10 +18,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--window", type=int, default=256)
     parser.add_argument("--batch", type=int, default=1)
-    parser.add_argument("--tokens", type=int, default=16)
+    parser.add_argument("--tokens", type=int, default=2048)
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--head-dim", type=int, default=128)
     args = parser.parse_args()
+    if args.tokens <= args.window:
+        raise SystemExit(
+            f"FAIL: --tokens {args.tokens} must be greater than --window "
+            f"{args.window} so the FIA band has space on both sides"
+        )
 
     try:
         import torch_npu  # noqa: F401
