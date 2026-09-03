@@ -10,6 +10,9 @@ machine, not on this CPU-only workstation.
 * `probe_quant_paths.py`
   W4A8 / W4A4 / W8A8 and mixed per-layer / fused Domino projections,
   including eager and ACL graph replay when the NPU environment supports it.
+* `probe_grouped_fused_kv.py`
+  One grouped `npu_grouped_matmul` W4A8 context-K/V projection versus the
+  seven per-layer baseline, with ACL graph replay.
 * `probe_gdn_accepted_boundary.py`
   CPU/device simulation of the accepted-token / `spec_query_start_loc`
   boundary that is reported as issue #9956.  It shows whether the failure is
@@ -27,6 +30,7 @@ machine, not on this CPU-only workstation.
 cd /d C:\Users\g\Desktop\codeAgents\SpecForge
 set PYTHONPATH=C:\Users\g\Desktop\codeAgents\SpecForge
 C:\Users\g\Desktop\codeAgents\phi-GNNv2\.venv\Scripts\python.exe probes\domino_service_npu\probe_quant_paths.py --real-dims
+C:\Users\g\Desktop\codeAgents\phi-GNNv2\.venv\Scripts\python.exe probes\domino_service_npu\probe_grouped_fused_kv.py --real-dims
 C:\Users\g\Desktop\codeAgents\phi-GNNv2\.venv\Scripts\python.exe probes\domino_service_npu\probe_gdn_accepted_boundary.py
 C:\Users\g\Desktop\codeAgents\phi-GNNv2\.venv\Scripts\python.exe probes\domino_service_npu\probe_domino_config_and_7steps.py
 C:\Users\g\Desktop\codeAgents\phi-GNNv2\.venv\Scripts\python.exe probes\domino_service_npu\probe_non_causal_band.py --window 512
