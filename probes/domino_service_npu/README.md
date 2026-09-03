@@ -29,6 +29,20 @@ machine, not on this CPU-only workstation.
 
 ## Example
 
+Run every probe in order with one command:
+
+```bash
+bash probes/domino_service_npu/run_all_probes.sh
+```
+
+To use a specific Python environment:
+
+```bash
+PYTHON=/path/to/target/python bash probes/domino_service_npu/run_all_probes.sh
+```
+
+The individual equivalent commands are:
+
 ```bat
 cd /d C:\Users\g\Desktop\codeAgents\SpecForge
 set PYTHONPATH=C:\Users\g\Desktop\codeAgents\SpecForge
