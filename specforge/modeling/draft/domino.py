@@ -7,13 +7,13 @@ from typing import Optional
 
 import torch
 from torch import nn
-from torch.func import functional_call
 
 try:
     from .dflash import (
         DFlashDraftModel,
         _target_embed_tokens,
         _target_lm_head,
+        eagerGRU,
         sample,
     )
     from .registry import register_draft
@@ -22,15 +22,10 @@ except ImportError:  # exported top-level remote-code layout
         DFlashDraftModel,
         _target_embed_tokens,
         _target_lm_head,
+        eagerGRU,
         sample,
     )
     from registry import register_draft
-
-try:
-    from specforge.utils import get_device_type
-except ImportError:  # exported remote-code fallback
-    def get_device_type() -> str:
-        return "cpu"
 
 
 @register_draft
@@ -57,7 +52,7 @@ class DominoDraftModel(DFlashDraftModel):
         self.pure_draft_prefix_len = int(dflash_config.get("pure_draft_prefix_len", 0))
         self.shift_label = bool(dflash_config.get("shift_label", False))
 
-        self.prefix_gru = nn.GRU(
+        self.prefix_gru = eagerGRU(
             input_size=self.target_hidden_size,
             hidden_size=self.gru_hidden_dim,
             num_layers=1,
@@ -104,21 +99,6 @@ class DominoDraftModel(DFlashDraftModel):
         )
 
     def _run_gru(self, gru_inputs: torch.Tensor) -> torch.Tensor:
-        if get_device_type() == "npu" and gru_inputs.dtype == torch.bfloat16:
-            # Ascend DynamicGRU does not accept bf16. Functionally substitute
-            # fp16 views of the real parameters so autograd still reaches the
-            # registered bf16 weights and FSDP never sees a mixed-dtype module.
-            fp16_parameters = {
-                name: parameter.to(dtype=torch.float16)
-                for name, parameter in self.prefix_gru.named_parameters()
-            }
-            output, _ = functional_call(
-                self.prefix_gru,
-                fp16_parameters,
-                (gru_inputs.to(dtype=torch.float16),),
-                strict=True,
-            )
-            return output.to(dtype=gru_inputs.dtype)
         return self.prefix_gru(gru_inputs)[0]
 
     def _sample_draft_tokens(

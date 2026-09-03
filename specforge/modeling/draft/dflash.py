@@ -169,6 +169,113 @@ def validate_dflash_attention_backend(config, backend: Optional[str]) -> None:
         )
 
 
+class eagerGRU(nn.Module):
+    """From-scratch GRU matching ``torch.nn.GRU`` without NPU bf16 op limits.
+
+    Used during training so Ascend's DynamicGRU never sees bf16 activations.
+    The acceptance/export paths keep a lazy ``nn.GRU`` mirror for the optimized
+    NPU GRU implementation.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int = 1,
+        bias: bool = True,
+        batch_first: bool = True,
+    ):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bias = bias
+        self.batch_first = batch_first
+
+        for layer in range(num_layers):
+            in_size = input_size if layer == 0 else hidden_size
+            self.register_parameter(
+                f"weight_ih_l{layer}",
+                nn.Parameter(torch.empty(3 * hidden_size, in_size)),
+            )
+            self.register_parameter(
+                f"weight_hh_l{layer}",
+                nn.Parameter(torch.empty(3 * hidden_size, hidden_size)),
+            )
+            if bias:
+                self.register_parameter(
+                    f"bias_ih_l{layer}",
+                    nn.Parameter(torch.empty(3 * hidden_size)),
+                )
+                self.register_parameter(
+                    f"bias_hh_l{layer}",
+                    nn.Parameter(torch.empty(3 * hidden_size)),
+                )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        stdv = (
+            1.0 / math.sqrt(self.hidden_size)
+            if self.hidden_size > 0
+            else 0
+        )
+        for parameter in self.parameters():
+            nn.init.uniform_(parameter, -stdv, stdv)
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        h0: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.batch_first:
+            layer_input = input.transpose(0, 1)
+            batch = input.size(0)
+        else:
+            layer_input = input
+            batch = input.size(1)
+        if h0 is None:
+            h0 = torch.zeros(
+                self.num_layers,
+                batch,
+                self.hidden_size,
+                device=input.device,
+                dtype=input.dtype,
+            )
+
+        h_n = []
+        for layer in range(self.num_layers):
+            weight_ih = getattr(self, f"weight_ih_l{layer}")
+            weight_hh = getattr(self, f"weight_hh_l{layer}")
+            bias_ih = getattr(self, f"bias_ih_l{layer}") if self.bias else None
+            bias_hh = getattr(self, f"bias_hh_l{layer}") if self.bias else None
+            h = h0[layer]
+
+            seq_len = layer_input.size(0)
+            outputs = []
+            for step in range(seq_len):
+                x_t = layer_input[step]
+                gi = x_t @ weight_ih.t()
+                gh = h @ weight_hh.t()
+                if bias_ih is not None:
+                    gi = gi + bias_ih
+                if bias_hh is not None:
+                    gh = gh + bias_hh
+                ri, zi, ni = gi.chunk(3, 1)
+                rh, zh, nh = gh.chunk(3, 1)
+                r = torch.sigmoid(ri + rh)
+                z = torch.sigmoid(zi + zh)
+                n = torch.tanh(ni + r * nh)
+                h = (1 - z) * n + z * h
+                outputs.append(h)
+            layer_input = torch.stack(outputs, dim=0)
+            h_n.append(h)
+
+        output = layer_input
+        if self.batch_first:
+            output = output.transpose(0, 1)
+        return output, torch.stack(h_n, dim=0)
+
+
 def initialize_fusion_weights(weights: torch.Tensor) -> None:
     """Initialize flare fusion weights with a near-one-hot layer schedule."""
     nn.init.constant_(weights, 0.0)

@@ -20,6 +20,7 @@ from torch import nn
 from specforge.algorithms.common.dflash_family_model import OnlineDominoModel
 from specforge.layers.wxay import replace_linear_with_quantized
 from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+from specforge.modeling.draft.dflash import eagerGRU
 
 
 def tiny_config() -> dict:
@@ -101,6 +102,15 @@ def main() -> None:
         json.dump(payload, f)
     config = AutoDraftModelConfig.from_file(path)
     draft = AutoDraftModel.from_config(config, torch_dtype=torch.float32)
+    assert isinstance(draft.prefix_gru, eagerGRU)
+    reference_gru = nn.GRU(64, 16, num_layers=1, batch_first=True, bias=False)
+    reference_gru.load_state_dict(draft.prefix_gru.state_dict(), strict=True)
+    gru_input = torch.randn(1, 4, 64)
+    eager_output, eager_hidden = draft.prefix_gru(gru_input)
+    reference_output, reference_hidden = reference_gru(gru_input)
+    assert torch.allclose(eager_output, reference_output, atol=1e-5)
+    assert torch.allclose(eager_hidden, reference_hidden, atol=1e-5)
+    print("eagerGRU parity: ok", type(draft.prefix_gru).__name__)
 
     # Forward / backward through flare, heterogeneous K/V, and dimensions.
     noise = torch.randn(1, 4, 64)
