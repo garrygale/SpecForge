@@ -33,18 +33,17 @@ def main() -> None:
     # Full seven-token draft round: each row is exactly 7 query tokens.
     qsl_full = torch.tensor([0, 7, 14, 21], dtype=torch.long)
     accepted_full = torch.tensor([1, 7, 2], dtype=torch.long)
-    for _ in _rows(qsl_full, accepted_full):
-        pass
+    full_rows = _rows(qsl_full, accepted_full)
 
     # End-of-sequence round: the final row is truncated to 3 tokens while the
     # accepted count is still 4 (bonus + three accepted drafts).  This is the
     # shape that the upstream issue reports as 4 exceeds segment length 3.
     qsl_eos = torch.tensor([0, 7, 14, 17], dtype=torch.long)
     accepted_eos = torch.tensor([7, 4, 4], dtype=torch.long)
-    rows = _rows(qsl_eos, accepted_eos)
-    bad = [row for row in rows if not row[2]]
-    print("full round rows:", rows)
-    print("EOS/partial round rows:", rows)
+    eos_rows = _rows(qsl_eos, accepted_eos)
+    bad = [row for row in eos_rows if not row[2]]
+    print("full round rows:", full_rows)
+    print("EOS/partial round rows:", eos_rows)
     if bad:
         print(
             "diagnosis: accepted > spec_query_start_loc segment length only "
