@@ -209,7 +209,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=None,
         help="target model path supplying a frozen embedding for HF export",
     )
-    export.add_argument("--embedding-key", default="model.embed_tokens.weight")
+    export.add_argument(
+        "--embedding-key",
+        default=None,
+        help="target embedding weight key; auto-discovered when omitted",
+    )
     benchmark = sub.add_parser(
         "benchmark",
         help="benchmark a running SGLang server",
