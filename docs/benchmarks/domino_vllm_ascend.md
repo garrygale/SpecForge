@@ -66,7 +66,9 @@ vllm serve /path/to/Qwen3.8-27B \
 
 The exported draft `config.json` must use:
 
-* `architectures: ["Qwen3DominoModel"]` (or the vllm-ascend registry alias)
+* `architectures: ["Qwen3DominoModel"]` or `["DominoDraftModel"]` (the
+  service accepts the training-time `DominoDraftModel` alias and normalizes
+  it to `Qwen3DominoModel`)
 * `block_size: 7` (must match `num_speculative_tokens`)
 * `dflash_config.fusion_mode: "flare"`
 * `dflash_config.heterogeneous_kv: true`
