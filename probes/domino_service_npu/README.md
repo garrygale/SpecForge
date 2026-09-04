@@ -26,6 +26,11 @@ machine, not on this CPU-only workstation.
   Non-causal sliding-window FIA band-mode smoke test (`sparse_mode=4`,
   `pre_tokens == next_tokens == window`), using the prefill-no-cache service
   shape (`block_table=None`, contiguous TND K/V).
+* `probe_acceptance_over_generation.py`
+  Starts one long chat request and polls the server's spec-decode counters
+  while it runs, printing per-interval acceptance.  Use this to distinguish
+  acceptance decay caused by generation length/context from decay caused by
+  concurrent request churn.
 
 ## Example
 
