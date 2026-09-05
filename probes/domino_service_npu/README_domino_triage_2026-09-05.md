@@ -3,6 +3,26 @@
 These probes isolate the remaining acceptance-decay issue (dp=1/32 or
 dp=2/16) from the previously fixed DP hang and graph-mode problems.
 
+## Results so far (2026-09-05)
+
+| Experiment | Result |
+| --- | --- |
+| dp=1/16 | Healthy, no decay. |
+| dp=1/16, KV usage forced to ~80% | Healthy, no decay. |
+| dp=1/32, full eager | Decays; near-end per-position rates fall to ~0. |
+| dp=1/32 replacement delay 0 / 100 / 500 ms | All three still decay. This rules out finished-request cleanup speed; it is a steady-state batch/state bug. |
+| dp=2/16, graph mode | In between dp=1/16 and dp=1/32: decays, recovers partially, decays again. |
+| Worker-count boundary | Around 28 in the tested setup; may drift. |
+| Same humaneval/159 prompt, healthy vs degraded | Healthy output readable; degraded output random throughout (no repetitive pattern). |
+| Draft sliding-window layers replaced by full attention | Draft accuracy drops as expected, but worker-count instability largely disappears; 64 workers show less decay than 32 workers with sliding attention. |
+| Full-attention draft degraded sample | Prompt prefix is correct, but generated continuation can be random digit-like text (e.g. `2   2   19  2  2 2     2`). |
+| `[DOMINO_DEBUG]` hook | Hook-active marker prints with `VLLM_DOMINO_DEBUG=1`; per-request lines are still interleaved under the 32-worker background load and have not yet been isolated. |
+
+Conclusion from these results: the remaining problem is a steady-state,
+batch-count-dependent state corruption. The non-causal sliding-window draft
+attention path is strongly implicated because replacing sliding attention
+with full attention removes most of the worker-count dependence.
+
 ## Test 1: replacement-rate at fixed concurrency
 
 Run:
@@ -28,6 +48,8 @@ Interpretation:
   the bug is tied to finish/reuse rate.
 - All delays still decay: the bug is a steady-state batch-size/state bug, not
   the cleanup speed.
+
+Confirmed: all three delays still decay.
 
 The script writes a JSON summary under
 `results/domino_acceptance/replacement_delay_*.json`.
@@ -84,3 +106,15 @@ Send back:
 - the replacement-delay summaries;
 - the `[DOMINO_DEBUG]` lines for a degraded request;
 - the probe trace JSON showing whether that single request stayed degraded.
+
+## Next experiments (pending)
+
+1. Keep sliding attention but cap each draft layer window to `<=2048`
+   (replace the two `3072` windows with `2048`). If corruption disappears,
+   focus on the FIA non-causal band/mask boundary.
+2. Keep the 512/1024 sliding layers but make the two large-window layers full
+   attention, preserving more draft quality while isolating which layer(s)
+   trigger corruption.
+3. Make the debug hook request-scoped (wall-clock timestamped per-request JSON
+   files) so the degraded single request can be separated from the 32-worker
+   background.
