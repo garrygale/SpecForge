@@ -1,7 +1,9 @@
 # Domino acceptance triage scripts
 
-These probes isolate the remaining acceptance-decay issue (dp=1/32 or
-dp=2/16) from the previously fixed DP hang and graph-mode problems.
+These probes were used to isolate the acceptance-decay issue (dp=1/32 or
+dp=2/16) from the previously fixed DP hang. The issue is now resolved; the
+ad-hoc patch/note artifacts from the investigation have been removed and the
+final fixes live in the vllm/vllm-ascend branches.
 
 ## Results so far (2026-09-05)
 
@@ -16,12 +18,58 @@ dp=2/16) from the previously fixed DP hang and graph-mode problems.
 | Same humaneval/159 prompt, healthy vs degraded | Healthy output readable; degraded output random throughout (no repetitive pattern). |
 | Draft sliding-window layers replaced by full attention | Draft accuracy drops as expected, but worker-count instability largely disappears; 64 workers show less decay than 32 workers with sliding attention. |
 | Full-attention draft degraded sample | Prompt prefix is correct, but generated continuation can be random digit-like text (e.g. `2   2   19  2  2 2     2`). |
-| `[DOMINO_DEBUG]` hook | Hook-active marker prints with `VLLM_DOMINO_DEBUG=1`; per-request lines are still interleaved under the 32-worker background load and have not yet been isolated. |
+| Cap only the two 3072 windows to 2048 | No acceptance decay at 32 workers; stable in a larger 64-worker run as well. |
+| dp=2/48, graph vs eager | Eager stays healthy; the FULL-graph draft path still shows acceptance decay, so a second, graph-replay-specific issue exists. |
+| dp=2/48 graph with `8050f9801` | Decay still exists after keeping captured block tables and enabling max workspace for mixed Domino windows; those two suspects are ruled out. |
+| Fine-grained graph capture (user-forced every 7 from 7 to 224, every 8 from 8 to 256) | Decay still occurs: coarse capture-bucket padding is not required for the bug, because DP-wide dispatch can pad a rank even when fine sizes are available. |
+| Decay onset vs request churn | Decay starts after a few dozen prompts have finished; consistent with stale padded-row metadata being replayed and then interacting with freed KV/state-block reuse. |
+| Fallback fix `827ca25d7` | Domino draft kept off FULL graph (draft eager, target graph preserved) did **not** fix the decay: the corruption is in the target graph, not the draft graph. Reverted in `d39421346`. |
+| Config/mode matrix (user-confirmed) | The dp=2/48 graph runs used windows capped to 2048 or below. The 3072→2048 cap is stable at 32/48/64 workers only in eager; graph mode is not stable. `--max-num-seqs` was never set. Full-attention graph comparison was inconclusive because acceptance was too low. |
+| Degraded output over time (dp=2/48 graph) | Early in the decay a probe still returns readable text; near the end of the run it returns trash — first repeating “disabled”, then random patterns, then alternating single-word repetition and random text. |
+| `[DOMINO_DEBUG]` hook | Hook-active marker and per-step dumps were added during triage and removed in `28ea68dd0` / `13cc5214e` once the root cause was found. |
 
-Conclusion from these results: the remaining problem is a steady-state,
-batch-count-dependent state corruption. The non-causal sliding-window draft
-attention path is strongly implicated because replacing sliding attention
-with full attention removes most of the worker-count dependence.
+## Resolution (2026-09-07)
+
+There were two independent triggers:
+
+1. **Draft windows above the FIA band ceiling (eager and graph).** The
+   trained `[3072, 2048, 512, 512, 1024, 1024, 3072]` recipe corrupts the
+   non-causal FIA band path (`sparse_mode=4`, fixed `2048x2048` band mask).
+   Capping the two 3072-window layers to 2048 removes that corruption and is
+   stable through 64 workers in eager mode.
+
+2. **Target FULL-graph replay with stale padded GDN/Mamba rows (graph only).**
+   After the windows were capped, dp=2/48 graph still decayed. The remaining
+   bug was not the draft: forcing the Domino draft eager while keeping the
+   target graph intact did not help, attention-side graph fixes (captured
+   block tables, max workspace) did not help, and neither did fine-grained
+   capture sizes or `--no-async-scheduling`.
+
+Root cause of #2: `_pad_query_start_loc_for_fia` collapsed uniform FULL
+decode padding back to the live request count (`num_reqs_padded = num_reqs`).
+GDN graphs capture metadata at request granularity, so replaying a padded
+graph over fewer metadata rows left the padded slots' persistent
+conv/recurrent state rows stale; once requests finished and blocks were
+reused, the next replay advanced state through freed/reallocated blocks.
+
+Fix (vllm-ascend `aa66a707e`, porting vllm-ascend PR #15529 semantics):
+
+- preserve the captured request shape for uniform decode graphs in
+  `NPUModelRunner._pad_query_start_loc_for_fia`;
+- mark padded Mamba/GDN rows as speculative dummies
+  (`num_decode_draft_tokens = num_spec`) so replay stays on the same pure-spec
+  GDN metadata path as capture and refreshes/nullifies every padded row;
+- expose `embed_input_ids` through the ACL graph wrapper.
+
+After `aa66a707e`, the previously failing graph configurations run without
+the acceptance decay.
+
+## Script notes after resolution
+
+- `probe_non_causal_band.py` supports `--compare` for W=2048 vs W=3072 if the
+  FIA band behavior ever needs to be re-audited.
+- The old per-request `[DOMINO_DEBUG]` procedure no longer applies: the hook
+  was removed from the vllm-ascend worktree.
 
 ## Test 1: replacement-rate at fixed concurrency
 
@@ -54,67 +102,18 @@ Confirmed: all three delays still decay.
 The script writes a JSON summary under
 `results/domino_acceptance/replacement_delay_*.json`.
 
-## Test 2: per-step draft dump for a degraded request
+## Test 2 (historical): per-step draft dump for a degraded request
 
-### Server-side instrumentation
+The `[DOMINO_DEBUG]` hook used to isolate the degraded window printed
+`req_ids/num_sampled/num_rejected` plus `prev_drafts/new_drafts` rows from
+`AscendDominoSpeculator.propose`. It confirmed that degraded requests were
+rejecting every draft, but the lines were interleaved with the 32-worker
+background and did not identify the root cause. The hook was removed from
+vllm-ascend in `28ea68dd0` / `13cc5214e`; this procedure is kept only as a
+record and no longer applies to the current worktree.
 
-The current vllm-ascend worktree contains an env-gated debug hook in
-`vllm_ascend/worker/v2/spec_decode/domino/speculator.py`. It activates only
-with `VLLM_DOMINO_DEBUG=1`, and it prints when at least one request has
-`num_sampled <= 1`:
+## Experiment status (final)
 
-```text
-[DOMINO_DEBUG] req_ids=... num_sampled=... num_rejected=...
-[DOMINO_DEBUG] req=<id> prev_drafts=[...] new_drafts=[...]
-```
-
-`prev_drafts` are the drafts that were just verified (usually rejected in the
-collapse); `new_drafts` are the proposals for the next round.
-
-If the worktree is not synced to the NPU host, apply the equivalent patch
-manually: add an `import os`, call a `_debug_log_proposal(...)` helper in
-`AscendDominoSpeculator.propose`, and log rows where `num_sampled <= 1`.
-
-### Client procedure
-
-1. Restart the server with:
-
-   ```bash
-   VLLM_DOMINO_DEBUG=1 <your normal vllm serve command>
-   ```
-
-2. Run the 32-worker humaneval workload until the monitor or server running
-   stats show near-zero per-position acceptance.
-
-3. While the service is still degraded, start a single long request:
-
-   ```bash
-   python probes/domino_service_npu/probe_acceptance_over_generation.py \
-     --server-port 4144 \
-     --served-model-name qwen3.6-35b \
-     --prompt "Solve this step by step: ..." \
-     --max-tokens 512
-   ```
-
-4. Capture the server log tail for `[DOMINO_DEBUG]`, and keep the probe JSON
-   from `results/domino_acceptance/acceptance_trace_*.json`.
-
-Send back:
-
-- the launch command / startup log (max_num_seqs, mamba_cache_mode,
-  async_scheduling, graph vs eager);
-- the replacement-delay summaries;
-- the `[DOMINO_DEBUG]` lines for a degraded request;
-- the probe trace JSON showing whether that single request stayed degraded.
-
-## Next experiments (pending)
-
-1. Keep sliding attention but cap each draft layer window to `<=2048`
-   (replace the two `3072` windows with `2048`). If corruption disappears,
-   focus on the FIA non-causal band/mask boundary.
-2. Keep the 512/1024 sliding layers but make the two large-window layers full
-   attention, preserving more draft quality while isolating which layer(s)
-   trigger corruption.
-3. Make the debug hook request-scoped (wall-clock timestamped per-request JSON
-   files) so the degraded single request can be separated from the 32-worker
-   background.
+- Cap the two 3072 windows to 2048: DONE, and required for the eager path.
+- Graph-only target GDN/Mamba padding replay bug: FIXED in vllm-ascend
+  `aa66a707e`; the failing dp=2/48 graph run no longer decays.
