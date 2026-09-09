@@ -76,6 +76,11 @@ with descriptor 4, `decode_query_len=8`, and real query lengths
 tokens. The new query-length guard (vllm-ascend `3bc298c3e`, port of PR
 #15707) produces the correct mixed layout `[0, 4, 16, 32, 32]`.
 
+The same upstream PR also expands 1D text positions to the three T/H/W
+planes expected by Qwen3.5/3.6's fused MRoPE kernel. Without that, the H/W
+plane offsets read the wrong cos/sin cache rows as positions grow, which can
+corrupt attention late in long responses.
+
 ## Script notes after resolution
 
 - `probe_non_causal_band.py` supports `--compare` for W=2048 vs W=3072 if the
