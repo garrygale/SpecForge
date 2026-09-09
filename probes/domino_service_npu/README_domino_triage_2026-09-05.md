@@ -64,6 +64,18 @@ Fix (vllm-ascend `aa66a707e`, porting vllm-ascend PR #15529 semantics):
 After `aa66a707e`, the previously failing graph configurations run without
 the acceptance decay.
 
+### Follow-up (2026-09-09): correct acceptance, repeated garbage tokens
+
+The service later showed correct acceptance counters but repeated garbage
+text after roughly 60 requests, often beginning midway through a response.
+The remaining bug was still in `_pad_query_start_loc_for_fia`: it classified
+a FULL graph as uniform decode from total token count alone. A mixed batch
+with descriptor 4, `decode_query_len=8`, and real query lengths
+`[4, 12, 16]` sums to 32, so the old code produced
+`query_start_loc=[0, 4, 16, 32, 40]` even though the graph has only 32
+tokens. The new query-length guard (vllm-ascend `3bc298c3e`, port of PR
+#15707) produces the correct mixed layout `[0, 4, 16, 32, 32]`.
+
 ## Script notes after resolution
 
 - `probe_non_causal_band.py` supports `--compare` for W=2048 vs W=3072 if the
