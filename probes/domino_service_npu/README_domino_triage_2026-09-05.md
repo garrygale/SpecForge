@@ -1,9 +1,10 @@
 # Domino acceptance triage scripts
 
 These probes were used to isolate the acceptance-decay issue (dp=1/32 or
-dp=2/16) from the previously fixed DP hang. The issue is now resolved; the
-ad-hoc patch/note artifacts from the investigation have been removed and the
-final fixes live in the vllm/vllm-ascend branches.
+dp=2/16) from the previously fixed DP hang. The acceptance decay is resolved;
+the graph-only target-state corruption has a further 2026-09-09 follow-up
+recorded below. The ad-hoc patch/note artifacts from the investigation have
+been removed and the final fixes live in the vllm/vllm-ascend branches.
 
 ## Results so far (2026-09-05)
 
@@ -80,6 +81,34 @@ The same upstream PR also expands 1D text positions to the three T/H/W
 planes expected by Qwen3.5/3.6's fused MRoPE kernel. Without that, the H/W
 plane offsets read the wrong cos/sin cache rows as positions grow, which can
 corrupt attention late in long responses.
+
+### Follow-up (2026-09-09): no-spec FULL replay and the 16-per-rank boundary
+
+After the fixed-row GDN state-indexing change, graph mode could still produce
+correct acceptance counters with garbage text after request churn. The new
+observation is that the failure does not occur below 16 concurrent requests
+per DP rank.
+
+That boundary points to mixed prefill/decode batches. A FULL graph captured
+with speculative decoding contains the speculative conv1d/recurrent tasks.
+At replay those tasks consume persistent spec inputs instead of rebuilding
+the Python branch. The builder reset those inputs only for a pure non-spec
+decode replay. Mixed batches with no runtime draft rows therefore replayed
+the captured spec tasks with stale `spec_state_indices_tensor`,
+`spec_query_start_loc`, `num_accepted_tokens`, and
+`spec_actual_seq_lengths`, advancing persistent GDN state for the wrong
+request. Below 16 per-rank concurrency the scheduler rarely forms such a
+mixed batch, which explains the threshold.
+
+The fix (vllm-ascend `5f1e3ee03`) resets the captured spec inputs whenever
+`num_spec_decodes == 0`, including mixed prefill/decode replays, and clears
+the spec masks when a dynamic-SD batch has no runtime draft tokens. It also
+keeps Domino on the base `1 + 2 * num_spec` reorder threshold; the local
+`num_spec` override was smaller than the target's `1 + num_spec`
+verification width.
+
+Regression tests cover mixed-prefill no-spec FULL replay, zero-draft dynamic
+SD rows, and the Domino threshold. NPU end-to-end confirmation is pending.
 
 ## Script notes after resolution
 
