@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Merge per-NPU acceptance-length logs into one JSON result."""
+"""Merge per-DP acceptance-length logs into one JSON result.
+
+``check_acceptance.py`` writes one log per data-parallel rank
+(``<timestamp>_acceptance_lengths_dp<rank>.jsonl``, written by TP rank 0 of
+that group) and keeps the historical unsuffixed file name for single-process
+runs.
+"""
 
 import glob
 import json
@@ -65,9 +71,9 @@ def main() -> int:
     elif len(sys.argv) == 2:
         timestamp = sys.argv[1]
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        pattern = os.path.join(
-            script_dir, f"{timestamp}_acceptance_lengths_npu*.jsonl"
-        )
+        # Matches the per-DP logs of a dp * tp run as well as the legacy
+        # per-NPU (``_npu<rank>``) and single-process (no suffix) names.
+        pattern = os.path.join(script_dir, f"{timestamp}_acceptance_lengths*.jsonl")
         file_paths = sorted(glob.glob(pattern))
         if not file_paths:
             print(f"No log files found matching: {pattern}")
