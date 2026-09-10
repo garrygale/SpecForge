@@ -279,6 +279,40 @@ def _tp_device_mesh(tp_size: int):
     return mesh
 
 
+def _tp_loader_attempts(tp_size: int, device_mesh) -> list[tuple[str, dict]]:
+    """Return the tensor-parallel loader calls to try, newest API first.
+
+    transformers moved from ``tp_plan="auto"`` to
+    ``distributed_config=DistributedConfig(tp_size=N)``; both spellings take
+    the explicit ``tp`` submesh so ``dp > 1`` jobs shard per data-parallel
+    group instead of across the whole world.
+    """
+    attempts: list[tuple[str, dict]] = []
+    try:
+        from transformers.distributed.configuration_utils import DistributedConfig
+    except Exception:
+        distributed_config_cls = None
+    else:
+        distributed_config_cls = DistributedConfig
+    if distributed_config_cls is not None:
+        attempts.append(
+            (
+                "distributed_config=DistributedConfig(tp_size=...)",
+                {
+                    "distributed_config": distributed_config_cls(tp_size=tp_size),
+                    "device_mesh": device_mesh,
+                },
+            )
+        )
+    attempts.append(
+        (
+            "tp_plan='auto' with an explicit tp submesh",
+            {"tp_plan": "auto", "device_mesh": device_mesh},
+        )
+    )
+    return attempts
+
+
 def _load_target_model_tp(target_path: str, dp_size: int, tp_size: int, torch_dtype):
     """Load the target sharded across the ``tp`` ranks of one DP group.
 
@@ -286,9 +320,7 @@ def _load_target_model_tp(target_path: str, dp_size: int, tp_size: int, torch_dt
     a target that does not fit on a single NPU is never materialized in full.
     """
     device_mesh = _tp_device_mesh(tp_size)
-    attempts = [
-        ("tp_plan with an explicit tp submesh", {"device_mesh": device_mesh}),
-    ]
+    attempts = _tp_loader_attempts(tp_size, device_mesh)
     if dp_size == 1:
         # With a single DP group the tp submesh is the whole job, so a build
         # that derives the mesh on its own still shards correctly.
@@ -302,7 +334,6 @@ def _load_target_model_tp(target_path: str, dp_size: int, tp_size: int, torch_dt
                 target_path,
                 torch_dtype=torch_dtype,
                 trust_remote_code=True,
-                tp_plan="auto",
                 **extra,
             )
         except TypeError as exc:
@@ -319,7 +350,6 @@ def _load_target_model_tp(target_path: str, dp_size: int, tp_size: int, torch_dt
                     target_path,
                     torch_dtype=torch_dtype,
                     trust_remote_code=True,
-                    tp_plan="auto",
                     **extra,
                 )
             except Exception as fallback_exc:
@@ -331,9 +361,10 @@ def _load_target_model_tp(target_path: str, dp_size: int, tp_size: int, torch_dt
         f"could not load the target with tensor parallel size {tp_size} "
         f"(dp={dp_size}):\n{detail}\n"
         "  hint: --tp > 1 needs a transformers build that supports tensor "
-        "parallelism (tp_plan) for this architecture; on an out-of-memory "
-        "failure raise --tp (more NPUs per target copy) or lower --dp, "
-        "otherwise fall back to --tp 1."
+        "parallelism for this architecture (tp_plan='auto' or "
+        "DistributedConfig(tp_size=...)) — new loaders also need accelerate "
+        "installed; on an out-of-memory failure raise --tp (more NPUs per "
+        "target copy) or lower --dp, otherwise fall back to --tp 1."
     ) from last_error
 
 
@@ -345,38 +376,73 @@ def _mesh_size(mesh) -> Optional[int]:
         return None
 
 
-def _assert_tp_sharded(model, tp_size: int) -> None:
-    """Fail loudly when tensor-parallel loading did not shard as requested."""
+def _dtensor_sharded(model) -> bool:
+    """Return whether any parameter is a sharded (non-replicated) DTensor."""
     dtensor_cls, replicate_cls = _dtensor_types()
     if dtensor_cls is None:
-        raise RuntimeError(
-            "tensor parallel requires torch.distributed.tensor (DTensor), which "
-            "this torch build does not provide"
-        )
+        return False
     for parameter in model.parameters():
-        if not isinstance(parameter, dtensor_cls):
-            continue
-        if all(
+        if isinstance(parameter, dtensor_cls) and not all(
             isinstance(placement, replicate_cls) for placement in parameter.placements
         ):
-            continue
-        sharded_over = _mesh_size(getattr(parameter, "device_mesh", None))
-        if sharded_over is not None and sharded_over != tp_size:
-            raise RuntimeError(
-                f"the target is sharded over {sharded_over} ranks instead of "
-                f"--tp {tp_size}: this transformers build ignored the (dp, tp) "
-                "device mesh, so a dp > 1 run would produce wrong results. Use "
-                f"--dp 1 --tp {tp_size} (the implicit mesh then matches), or "
-                "use a transformers build that accepts an explicit device mesh."
-            )
+            return True
+    return False
+
+
+def _tp_plan_of(model) -> dict:
+    """Return the resolved tensor-parallel plan of a loaded model, if any."""
+    for attribute in ("tp_plan", "_tp_plan"):
+        plan = getattr(model, attribute, None)
+        if isinstance(plan, dict) and plan:
+            return plan
+    return {}
+
+
+def _report_tp_sharding(model, tp_size: int) -> None:
+    """Describe how the target was sharded, warning when it was not.
+
+    transformers' tensor-parallel implementations differ across releases: the
+    current one shards into plain local tensors and inserts the collectives
+    with hooks, while older ones expose the shards as DTensor parameters. Both
+    are detected here, and so is the case where nothing was sharded at all.
+    """
+    plan = _tp_plan_of(model)
+    hooked = sum(1 for module in model.modules() if getattr(module, "_is_hooked", False))
+    declared = getattr(model, "_tp_size", None)
+    if declared is None:
+        declared = getattr(model, "tp_size", None)
+    sharded = _dtensor_sharded(model) or hooked > 0
+
+    mesh_size = _mesh_size(getattr(model, "_device_mesh", None))
+    if mesh_size is not None and mesh_size != tp_size:
+        raise RuntimeError(
+            f"the target was sharded across {mesh_size} ranks instead of "
+            f"--tp {tp_size}: the loader ignored the (dp, tp) device mesh, so a "
+            "dp > 1 run would produce wrong results. Use --dp 1 with this "
+            "transformers build, or upgrade it."
+        )
+
+    if not sharded:
+        print(
+            "[check_acceptance] warning: no tensor-parallel sharding was found "
+            f"after loading with tp={tp_size}; the target stays replicated on "
+            "every rank, which saves no memory. Verify the per-rank memory "
+            "usage and the transformers support for this architecture.",
+            flush=True,
+        )
         return
-    print(
-        "[check_acceptance] warning: no DTensor parameters were found after "
-        f"loading with tp_plan='auto'; the target may be replicated instead of "
-        f"sharded over {tp_size} ranks, which saves no memory. Verify the "
-        "per-rank memory usage and transformers support for this architecture.",
-        flush=True,
-    )
+
+    detail = f"plan entries={len(plan)}" if plan else "sharded weights"
+    if hooked:
+        detail += f", hooked modules={hooked}"
+    print(f"Target sharded over {tp_size} ranks ({detail})", flush=True)
+    if plan and not any("layers" in key for key in plan):
+        print(
+            "[check_acceptance] warning: this tensor-parallel plan only covers "
+            f"{sorted(plan)}; the per-rank memory will stay close to the full "
+            "model. Check the transformers TP plan for this architecture.",
+            flush=True,
+        )
 
 
 def _target_vocab_size(target) -> Optional[int]:
@@ -445,7 +511,7 @@ def _load_target_model(
 ):
     if tp_size > 1:
         model = _load_target_model_tp(target_path, dp_size, tp_size, torch_dtype)
-        _assert_tp_sharded(model, tp_size)
+        _report_tp_sharding(model, tp_size)
         hooked = _install_output_localizers(model)
         print(
             f"Target loaded with tensor parallel size {tp_size} "

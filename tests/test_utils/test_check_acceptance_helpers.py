@@ -11,11 +11,13 @@ from unittest import mock
 
 from inference import check_acceptance
 from inference.check_acceptance import (
-    _assert_tp_sharded,
+    _dtensor_sharded,
     _log_path,
     _localize_outputs,
     _parallel_sizes,
+    _report_tp_sharding,
     _split_world,
+    _tp_loader_attempts,
     aggregate_stats,
     load_humaneval,
     load_math500,
@@ -323,27 +325,132 @@ class AcceptanceTensorParallelGuardTest(unittest.TestCase):
         self.addCleanup(self._dtensor_patch.stop)
 
     @staticmethod
-    def _model(placements, mesh_size):
-        parameter = _FakeDTensor("weight", placements)
-        ranks = types.SimpleNamespace(numel=lambda: mesh_size)
-        parameter.device_mesh = types.SimpleNamespace(mesh=ranks)
-        return types.SimpleNamespace(parameters=lambda: iter([parameter]))
+    def _model(
+        *,
+        placements=(),
+        tp_size=None,
+        plan=None,
+        hooked=False,
+        mesh_size=None,
+    ):
+        parameters = []
+        if placements:
+            parameter = _FakeDTensor("weight", list(placements))
+            ranks = types.SimpleNamespace(numel=lambda: mesh_size or 1)
+            parameter.device_mesh = types.SimpleNamespace(mesh=ranks)
+            parameters.append(parameter)
+        module = types.SimpleNamespace(_is_hooked=True) if hooked else types.SimpleNamespace()
+        model = types.SimpleNamespace(parameters=lambda: iter(parameters))
+        model.modules = lambda: iter([model, module])
+        model.tp_plan = {} if plan is None else plan
+        if tp_size is not None:
+            model._tp_size = tp_size
+        if mesh_size is not None:
+            ranks = types.SimpleNamespace(numel=lambda size=mesh_size: size)
+            model._device_mesh = types.SimpleNamespace(mesh=ranks)
+        return model
 
-    def test_sharding_over_the_requested_tp_size_passes(self):
-        model = self._model(["Shard(dim=0)"], 2)
-        _assert_tp_sharded(model, 2)
+    def test_sharded_dtensor_parameters_are_detected(self):
+        model = self._model(placements=["Shard(dim=0)"], mesh_size=2)
+        self.assertTrue(_dtensor_sharded(model))
+        _report_tp_sharding(model, 2)
 
-    def test_sharding_over_the_wrong_size_is_rejected(self):
-        model = self._model(["Shard(dim=0)"], 4)
+    def test_replicated_dtensor_parameters_are_not_sharding(self):
+        model = self._model(placements=[_FakeReplicate()], mesh_size=1)
+        self.assertFalse(_dtensor_sharded(model))
+
+    def test_hooked_modules_report_a_sharded_model(self):
+        model = self._model(tp_size=2, plan={"layers.*.q_proj": "colwise"}, hooked=True)
+        with mock.patch("builtins.print") as fake_print:
+            _report_tp_sharding(model, 2)
+        self.assertIn("Target sharded over 2 ranks", str(fake_print.call_args_list[0]))
+
+    def test_sharding_over_the_wrong_group_size_is_rejected(self):
+        model = self._model(tp_size=2, hooked=True, mesh_size=4)
         with self.assertRaises(RuntimeError) as caught:
-            _assert_tp_sharded(model, 2)
-        self.assertIn("sharded over 4 ranks", str(caught.exception))
+            _report_tp_sharding(model, 2)
+        self.assertIn("sharded across 4 ranks", str(caught.exception))
+
+    def test_lm_head_only_plan_is_called_out(self):
+        model = self._model(tp_size=2, plan={"lm_head": "colwise_gather_output"}, hooked=True)
+        with mock.patch("builtins.print") as fake_print:
+            _report_tp_sharding(model, 2)
+        printed = " ".join(str(call) for call in fake_print.call_args_list)
+        self.assertIn("only covers", printed)
 
     def test_replicated_only_model_warns_instead_of_failing(self):
-        model = self._model([_FakeReplicate()], 1)
+        model = self._model()
         with mock.patch("builtins.print") as fake_print:
-            _assert_tp_sharded(model, 2)
-        self.assertTrue(fake_print.called)
+            _report_tp_sharding(model, 2)
+        printed = " ".join(str(call) for call in fake_print.call_args_list)
+        self.assertIn("no tensor-parallel sharding", printed)
+
+
+class AcceptanceTensorParallelLoaderTest(unittest.TestCase):
+    def test_loader_attempts_cover_both_transformers_apis(self):
+        mesh = object()
+        attempts = _tp_loader_attempts(2, mesh)
+        self.assertTrue(attempts)
+        self.assertEqual(attempts[-1][1]["tp_plan"], "auto")
+        for _, kwargs in attempts:
+            self.assertIs(kwargs["device_mesh"], mesh)
+        if len(attempts) > 1:
+            distributed_config = attempts[0][1]["distributed_config"]
+            self.assertEqual(distributed_config.tp_size, 2)
+
+    def test_load_falls_back_to_the_older_tp_plan_api(self):
+        model = types.SimpleNamespace()
+        calls = []
+
+        def _from_pretrained(path, **kwargs):
+            calls.append(kwargs)
+            if "distributed_config" in kwargs:
+                raise TypeError(
+                    "Qwen3_5MoeForCausalLM.__init__() got an unexpected keyword "
+                    "argument 'distributed_config'"
+                )
+            return model
+
+        with (
+            mock.patch.object(
+                check_acceptance, "_tp_device_mesh", return_value="mesh"
+            ),
+            mock.patch.object(
+                check_acceptance.AutoModelForCausalLM,
+                "from_pretrained",
+                _from_pretrained,
+            ),
+        ):
+            loaded = check_acceptance._load_target_model_tp("target", 1, 2, None)
+
+        self.assertIs(loaded, model)
+        self.assertTrue(any("distributed_config" in kwargs for kwargs in calls))
+        self.assertEqual(calls[-1]["tp_plan"], "auto")
+        self.assertEqual(calls[-1]["device_mesh"], "mesh")
+
+    def test_load_uses_the_new_api_when_accepted(self):
+        model = types.SimpleNamespace()
+        calls = []
+
+        def _from_pretrained(path, **kwargs):
+            calls.append(kwargs)
+            return model
+
+        with (
+            mock.patch.object(
+                check_acceptance, "_tp_device_mesh", return_value="mesh"
+            ),
+            mock.patch.object(
+                check_acceptance.AutoModelForCausalLM,
+                "from_pretrained",
+                _from_pretrained,
+            ),
+        ):
+            loaded = check_acceptance._load_target_model_tp("target", 1, 2, None)
+
+        self.assertIs(loaded, model)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("device_mesh", calls[0])
 
 
 if __name__ == "__main__":
