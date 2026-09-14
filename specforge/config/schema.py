@@ -591,7 +591,7 @@ class TrainingConfig(StrictConfigModel):
     domino_ce_loss_alpha: float = Field(default=1.0, ge=0.0)
     domino_l1_loss_alpha: float = Field(default=0.0, ge=0.0)
     domino_base_tv_loss: bool = False
-    domino_final_tv_loss: bool = True
+    domino_final_tv_loss: bool = False
     dspark_ce_loss_alpha: float = 0.1
     dspark_l1_loss_alpha: float = 0.9
     dspark_confidence_head_alpha: float = 1.0
