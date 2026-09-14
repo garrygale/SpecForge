@@ -993,63 +993,6 @@ def _target_device(target: nn.Module) -> torch.device:
     return next(target.parameters()).device
 
 
-def _target_uses_linear_attention(target: nn.Module) -> bool:
-    """Return whether the target mixes linear-attention layers with attention."""
-    config = getattr(target, "config", None)
-    get_text_config = getattr(config, "get_text_config", None)
-    if callable(get_text_config):
-        config = get_text_config(decoder=True)
-    layer_types = getattr(config, "layer_types", None) or []
-    return any("linear" in str(layer_type).lower() for layer_type in layer_types)
-
-
-def build_decoding_cache(model: nn.Module) -> Cache:
-    """Build the decoding cache a model wants for its layer types.
-
-    Hybrid models (Qwen3.5 / Qwen3.5-MoE targets) interleave linear-attention
-    and full-attention layers, and transformers needs a ``DynamicCache``
-    created from the model config so every layer gets the matching cache
-    mixin. A bare ``DynamicCache()`` only ever holds attention layers, and the
-    linear attention layers then fail with ``has_previous_state can only be
-    called on LinearAttention layers``. Sliding-window layers need the same
-    treatment, otherwise they refuse to roll back once their window is full.
-
-    Past recording is activated so speculative decoding can roll the rejected
-    draft tokens back out of the cache.
-    """
-    config = getattr(model, "config", None)
-    cache = None
-    if config is not None:
-        try:
-            cache = DynamicCache(config=config)
-        except Exception:
-            # Older transformers, or a config that carries no cache layer
-            # information: fall back to the attention-only cache.
-            cache = None
-    if cache is None:
-        cache = DynamicCache()
-    activate_past_recording = getattr(cache, "activate_past_recording", None)
-    if callable(activate_past_recording):
-        try:
-            activate_past_recording()
-        except Exception:
-            pass
-    return cache
-
-
-def _rollback_cache(cache: Cache, tokens_to_remove: int, hybrid: bool) -> None:
-    """Drop the rejected draft tokens from a decoding cache.
-
-    Attention-only caches accept an absolute length, so they only need a call
-    when something is rejected. Hybrid caches are cropped by token count, and
-    they also need a zero rollback so that they shrink the recorded
-    convolution states back to their working window. ``tokens_to_remove`` may
-    be negative when a cache is empty, which crops nothing.
-    """
-    if tokens_to_remove > 0 or (tokens_to_remove == 0 and hybrid):
-        cache.crop(-tokens_to_remove)
-
-
 def normalize_draft_head_checkpoint_keys(
     module,
     state_dict,
@@ -1381,11 +1324,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             use_cache=True,
             is_causal=False,
         )
-        _rollback_cache(
-            past_key_values_draft,
-            past_key_values_draft.get_seq_length() - start,
-            hybrid=False,
-        )
+        past_key_values_draft.crop(start)
 
         k_draft = block_size
         prefix_len = int(getattr(self, "pure_draft_prefix_len", 0))
@@ -1562,12 +1501,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             output_ids.shape[1], device=_target_device(target)
         ).unsqueeze(0)
 
-        # Hybrid (linear attention) targets need a config-aware cache, and
-        # every target needs the cache to record past states for rollback.
-        past_key_values_target = build_decoding_cache(text_target)
-        hybrid_target = _target_uses_linear_attention(text_target)
-        # The same applies to the draft's own sliding-window layers.
-        past_key_values_draft = build_decoding_cache(self)
+        past_key_values_target = DynamicCache()
+        past_key_values_draft = DynamicCache()
 
         # Prefill stage
         output = text_target(
@@ -1622,13 +1557,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                         :, acceptance_length
                     ]
                 start += acceptance_length + 1
-                # The verify pass appended `block_size + 1` positions and
-                # `acceptance_length + 1` of them are accepted.
-                _rollback_cache(
-                    past_key_values_target,
-                    block_size - acceptance_length,
-                    hybrid_target,
-                )
+                past_key_values_target.crop(start)
                 target_hidden = extract_context_feature(
                     output.hidden_states, self.target_layer_ids
                 )[:, : acceptance_length + 1, :]
@@ -1653,11 +1582,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                     use_cache=True,
                     is_causal=False,
                 )
-                _rollback_cache(
-                    past_key_values_draft,
-                    past_key_values_draft.get_seq_length() - start,
-                    hybrid=False,
-                )
+                past_key_values_draft.crop(start)
                 block_output_ids[:, 1:] = self._sample_draft_tokens(
                     text_target,
                     draft_hidden,
@@ -1693,13 +1618,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                         :, acceptance_length
                     ]
                 start += acceptance_length + 1
-                # The verify pass appended `block_size` positions and
-                # `acceptance_length + 1` of them are accepted.
-                _rollback_cache(
-                    past_key_values_target,
-                    block_size - acceptance_length - 1,
-                    hybrid_target,
-                )
+                past_key_values_target.crop(start)
                 target_hidden = extract_context_feature(
                     output.hidden_states, self.target_layer_ids
                 )[:, : acceptance_length + 1, :]

@@ -40,40 +40,6 @@ from specforge.modeling.draft.mtp.base import MTPDraftModel
 from specforge.modeling.draft.registry import register_draft
 
 
-def _target_cache(target: nn.Module) -> Cache:
-    """Return the decoding cache the target model wants for its layer types.
-
-    Qwen3.5 targets mix linear-attention and full-attention layers, so the
-    cache has to be built from the model config (mirrors
-    ``dflash.build_decoding_cache``). A bare ``DynamicCache()`` only ever holds
-    attention layers, and the linear-attention layers then raise
-    ``has_previous_state can only be called on LinearAttention layers``.
-
-    Past recording is activated so the rejected draft token can be rolled back
-    out of the cache.
-    """
-    from transformers.cache_utils import DynamicCache
-
-    config = getattr(target, "config", None)
-    cache = None
-    if config is not None:
-        try:
-            cache = DynamicCache(config=config)
-        except Exception:
-            # Older transformers, or a config that carries no cache layer
-            # information: fall back to the attention-only cache.
-            cache = None
-    if cache is None:
-        cache = DynamicCache()
-    activate_past_recording = getattr(cache, "activate_past_recording", None)
-    if callable(activate_past_recording):
-        try:
-            activate_past_recording()
-        except Exception:
-            pass
-    return cache
-
-
 class Qwen3_5RMSNorm(nn.Module):
     """Gemma-style RMSNorm used by Qwen3.5 in vLLM.
 
@@ -492,7 +458,9 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
         max_length = num_input_tokens + max_new_tokens
         output_ids = input_ids.clone()
 
-        past_key_values_target = _target_cache(target)
+        from transformers.cache_utils import DynamicCache
+
+        past_key_values_target = DynamicCache()
 
         # Prefill target once to get initial last hidden state
         target_out = target(
@@ -558,9 +526,8 @@ class Qwen3_5MTPDraftModel(MTPDraftModel, Qwen3PreTrainedModel):
             # h at the newest committed token drives the next draft round.
             target_hidden = target_out.hidden_states[-1][:, 0:1, :]
             # Trim the scored draft token's KV again: wrong on rejection, and
-            # re-appended by next round's verify on acceptance. Hybrid caches
-            # are cropped by token count, not by absolute length.
-            past_key_values_target.crop(-1)
+            # re-appended by next round's verify on acceptance.
+            past_key_values_target.crop(committed)
 
             if torch.equal(draft_token, target_token):
                 output_ids = torch.cat([output_ids, draft_token], dim=1)
