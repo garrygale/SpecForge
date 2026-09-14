@@ -461,6 +461,10 @@ def build_domino_model(
         lambda common: OnlineDominoModel(
             **common,
             shift_label=bool(getattr(draft_model, "shift_label", False)),
+            ce_loss_alpha=cfg.training.domino_ce_loss_alpha,
+            l1_loss_alpha=cfg.training.domino_l1_loss_alpha,
+            base_tv_loss=cfg.training.domino_base_tv_loss,
+            final_tv_loss=cfg.training.domino_final_tv_loss,
         ),
     )
 

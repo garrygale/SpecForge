@@ -25,7 +25,12 @@ class BuiltinProviderParityTest(unittest.TestCase):
             ),
             "domino": (
                 "DominoDraftModel",
-                {"input_ids", "loss_mask", "hidden_states"},
+                {
+                    "input_ids",
+                    "loss_mask",
+                    "hidden_states",
+                    "target_last_hidden_states",
+                },
                 {"eager", "sdpa", "flex_attention"},
                 None,
             ),
@@ -93,7 +98,7 @@ class BuiltinProviderParityTest(unittest.TestCase):
             ),
             "domino": (
                 "hidden_states",
-                None,
+                "target_last_hidden_states",
                 (("input_ids", "input_ids", ()), ("loss_mask", "loss_mask", ())),
                 None,
             ),
@@ -169,11 +174,13 @@ class BuiltinProviderParityTest(unittest.TestCase):
             "input_ids": torch.tensor([[1, 2, 3]]),
             "loss_mask": torch.tensor([[1, 1, 1]]),
             "hidden_states": torch.ones(1, 3, 4),
+            "target_last_hidden_states": torch.ones(1, 3, 4),
         }
         long = {
             "input_ids": torch.tensor([[4, 5, 6, 7, 8]]),
             "loss_mask": torch.tensor([[1, 1, 1, 1, 1]]),
             "hidden_states": torch.ones(1, 5, 4),
+            "target_last_hidden_states": torch.ones(1, 5, 4),
         }
         for name in ("dflash", "domino"):
             with self.subTest(algorithm=name):
@@ -187,7 +194,7 @@ class BuiltinProviderParityTest(unittest.TestCase):
                 self.assertEqual((2, 5, 4), tuple(batch["hidden_states"].shape))
                 self.assertEqual([1, 1, 1, 0, 0], batch["loss_mask"][0].tolist())
 
-    def test_dspark_collator_preserves_target_last_hidden_states(self):
+    def test_target_hidden_collator_preserves_target_last_hidden_states(self):
         short = {
             "input_ids": torch.tensor([[1, 2]]),
             "loss_mask": torch.ones(1, 2, dtype=torch.long),
@@ -200,20 +207,24 @@ class BuiltinProviderParityTest(unittest.TestCase):
             "hidden_states": torch.ones(1, 3, 4),
             "target_last_hidden_states": torch.ones(1, 3, 3),
         }
-        providers = self.registry.resolve("dspark").providers
-        for provider in (
-            providers.offline_for("text"),
-            providers.server_streaming_for("text"),
-        ):
-            with self.subTest(provider=type(provider).__name__):
-                batch = provider.build_collator()([short, long])
-                self.assertEqual(
-                    (2, 3, 3),
-                    tuple(batch["target_last_hidden_states"].shape),
-                )
-                self.assertTrue(
-                    torch.all(batch["target_last_hidden_states"][0, 2:] == 0)
-                )
+        for algorithm in ("dspark", "domino"):
+            providers = self.registry.resolve(algorithm).providers
+            for provider in (
+                providers.offline_for("text"),
+                providers.server_streaming_for("text"),
+            ):
+                with self.subTest(
+                    algorithm=algorithm,
+                    provider=type(provider).__name__,
+                ):
+                    batch = provider.build_collator()([short, long])
+                    self.assertEqual(
+                        (2, 3, 3),
+                        tuple(batch["target_last_hidden_states"].shape),
+                    )
+                    self.assertTrue(
+                        torch.all(batch["target_last_hidden_states"][0, 2:] == 0)
+                    )
 
     def test_dspark_offline_contract_and_normalizer_preserve_target_hidden(self):
         registration = self.registry.resolve("dspark")
@@ -336,19 +347,34 @@ class BuiltinProviderParityTest(unittest.TestCase):
             "loss_mask": torch.ones(4, dtype=torch.long),
             "hidden_states": torch.arange(24).reshape(1, 4, 6),
         }
+        domino_raw = {
+            **dflash_raw,
+            "target_last_hidden_states": torch.arange(20).reshape(1, 4, 5),
+        }
         cases = (
-            ("eagle3", eagle_raw, process_offline_eagle3_sample),
-            ("dflash", dflash_raw, process_offline_dflash_sample),
-            ("domino", dflash_raw, process_offline_dflash_sample),
+            ("eagle3", eagle_raw, process_offline_eagle3_sample, ()),
+            ("dflash", dflash_raw, process_offline_dflash_sample, ()),
+            (
+                "domino",
+                domino_raw,
+                process_offline_dflash_sample,
+                ("target_last_hidden_states",),
+            ),
         )
-        for name, raw, retained in cases:
+        for name, raw, retained, extra_keys in cases:
             with self.subTest(algorithm=name):
                 provider = self.registry.resolve(name).providers.offline_for("text")
                 actual = provider.build_normalizer(3)(raw)
                 expected = retained(raw, 3)
-                self.assertEqual(set(expected), set(actual))
+                self.assertEqual({*expected, *extra_keys}, set(actual))
                 for key in expected:
                     self.assertTrue(torch.equal(expected[key], actual[key]), key)
+                for key in extra_keys:
+                    self.assertEqual((1, 3, 5), tuple(actual[key].shape))
+                    self.assertTrue(
+                        torch.equal(raw[key].squeeze(0)[:3], actual[key][0]),
+                        key,
+                    )
 
 
 if __name__ == "__main__":

@@ -211,21 +211,39 @@ def build_eagle3(workdir, ttt=3):
 # target-layer capture (no EAGLE3 aux/target swap or target distribution).
 
 
-def write_offline_files_dflash(d, n=4, seq=32, hidden=H, vocab=V, seed=0):
-    """Write synthetic DFlash/Domino offline feature files."""
+def write_offline_files_dflash(
+    d,
+    n=4,
+    seq=32,
+    hidden=H,
+    vocab=V,
+    seed=0,
+    target_hidden=None,
+):
+    """Write synthetic DFlash offline feature files.
+
+    ``target_hidden`` additionally stores ``target_last_hidden_states``, which
+    the Domino objective requires for its L1/TV distillation term (the DFlash
+    feature schema ignores it).
+    """
     os.makedirs(d, exist_ok=True)
     generator = torch.Generator().manual_seed(seed)
     for index in range(n):
-        torch.save(
-            {
-                "input_ids": torch.randint(0, vocab, (seq,), generator=generator),
-                "loss_mask": torch.ones(seq, dtype=torch.long),
-                "hidden_states": torch.randn(1, seq, hidden, generator=generator).to(
-                    torch.bfloat16
-                ),
-            },
-            os.path.join(d, f"{index:04d}.ckpt"),
-        )
+        record = {
+            "input_ids": torch.randint(0, vocab, (seq,), generator=generator),
+            "loss_mask": torch.ones(seq, dtype=torch.long),
+            "hidden_states": torch.randn(1, seq, hidden, generator=generator).to(
+                torch.bfloat16
+            ),
+        }
+        if target_hidden is not None:
+            record["target_last_hidden_states"] = torch.randn(
+                1,
+                seq,
+                target_hidden,
+                generator=generator,
+            ).to(torch.bfloat16)
+        torch.save(record, os.path.join(d, f"{index:04d}.ckpt"))
     return d
 
 
@@ -346,12 +364,16 @@ def build_domino(
     num_anchors=8,
     mask_token_id=0,
     attention_backend="sdpa",
+    **model_kwargs,
 ):
     """Build a tiny OnlineDominoModel on CUDA through the package model pieces.
 
     Domino uses a DFlash-backed DominoDraftModel with a GRU prefix + embed
     projection head. Returns
     (domino_model, hidden_states_width, target_dir, target_layer_ids).
+
+    ``model_kwargs`` forward extra ``OnlineDominoModel`` objective settings,
+    such as the CE/L1(TV) alphas and their per-path toggles.
     """
     from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
 
@@ -405,6 +427,7 @@ def build_domino(
         attention_backend=attention_backend,
         num_anchors=num_anchors,
         shift_label=draft_model.shift_label,
+        **model_kwargs,
     ).cuda()
     width = len(draft_model.target_layer_ids) * hidden
     return domino_model, width, target_dir, list(draft_model.target_layer_ids)

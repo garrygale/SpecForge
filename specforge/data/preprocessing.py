@@ -670,12 +670,13 @@ def process_offline_dflash_sample(
 ) -> Dict[str, torch.Tensor]:
     """Normalize one prepared DFlash-family feature sample.
 
-    DFlash and Domino consume the same capture contract: token ids, a loss
-    mask, and the concatenated target-layer states.  Unlike EAGLE3, there is no
-    auxiliary/final-state swap and no target distribution.  Offline feature
-    files may store ``hidden_states`` as either ``[seq, width]`` or
-    ``[1, seq, width]``; the canonical loader always receives a leading batch
-    dimension.
+    DFlash consumes token ids, a loss mask, and the concatenated target-layer
+    states; Domino's registered normalizer layers the captured target
+    final-layer state (``target_last_hidden_states``) on top of this retained
+    transform.  Unlike EAGLE3, there is no auxiliary/final-state swap and no
+    target distribution here.  Offline feature files may store ``hidden_states``
+    as either ``[seq, width]`` or ``[1, seq, width]``; the canonical loader
+    always receives a leading batch dimension.
     """
     input_ids = raw["input_ids"][:max_len].unsqueeze(0)
     loss_mask = raw["loss_mask"][:max_len].unsqueeze(0)

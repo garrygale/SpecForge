@@ -12,7 +12,17 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 NORMALIZER_ID = "dflash_family_offline_v1"
 DSPARK_NORMALIZER_ID = "dspark_offline_v1"
+DOMINO_NORMALIZER_ID = "domino_offline_v1"
 MTP_NORMALIZER_ID = "mtp_offline_v1"
+
+#: Feature keys stored by the DFlash-family objectives that distill against
+#: the captured target distribution (DSpark, Domino with L1/TV enabled).
+LAST_HIDDEN_FEATURE_KEYS = (
+    "input_ids",
+    "loss_mask",
+    "hidden_states",
+    "target_last_hidden_states",
+)
 
 
 def _normalize_hidden_states(
@@ -72,21 +82,25 @@ def normalize_offline_sample(raw, max_len: int):
     }
 
 
-def normalize_dspark_offline_sample(raw, max_len: int):
-    """Normalize DSpark capture tensors, including target final-layer states."""
-
+def _normalize_offline_sample_with_last_hidden(
+    raw,
+    max_len: int,
+    *,
+    description: str,
+):
+    """Normalize capture tensors plus the target's final-layer hidden states."""
     normalized = normalize_offline_sample(raw, max_len)
     target_last_hidden_states = _normalize_hidden_states(
         raw,
         "target_last_hidden_states",
         max_len,
-        description="DSpark target_last_hidden_states",
+        description=f"{description} target_last_hidden_states",
     )
     expected_length = normalized["input_ids"].shape[1]
     if target_last_hidden_states.shape[1] != expected_length:
         raise ValueError(
-            "offline DSpark features have mismatched sequence lengths after "
-            f"truncation: input_ids={expected_length}, "
+            f"offline {description} features have mismatched sequence lengths "
+            f"after truncation: input_ids={expected_length}, "
             "target_last_hidden_states="
             f"{target_last_hidden_states.shape[1]}"
         )
@@ -94,6 +108,26 @@ def normalize_dspark_offline_sample(raw, max_len: int):
         **normalized,
         "target_last_hidden_states": target_last_hidden_states,
     }
+
+
+def normalize_dspark_offline_sample(raw, max_len: int):
+    """Normalize DSpark capture tensors, including target final-layer states."""
+
+    return _normalize_offline_sample_with_last_hidden(
+        raw,
+        max_len,
+        description="DSpark",
+    )
+
+
+def normalize_domino_offline_sample(raw, max_len: int):
+    """Normalize Domino capture tensors, including target final-layer states."""
+
+    return _normalize_offline_sample_with_last_hidden(
+        raw,
+        max_len,
+        description="Domino",
+    )
 
 
 def build_offline_reader(
@@ -133,12 +167,29 @@ def build_dspark_offline_reader(
         hidden_states_path,
         run_id=run_id,
         strategy=strategy,
-        feature_keys=(
-            "input_ids",
-            "loss_mask",
-            "hidden_states",
-            "target_last_hidden_states",
-        ),
+        feature_keys=LAST_HIDDEN_FEATURE_KEYS,
+        target_repr="hidden_state",
+        ttt_length=ttt_length,
+        max_len=max_len,
+    )
+
+
+def build_domino_offline_reader(
+    strategy,
+    hidden_states_path,
+    *,
+    run_id,
+    ttt_length,
+    max_len,
+):
+    # Transitional runtime import; the composition root will inject this port.
+    from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
+
+    return OfflineManifestReader(
+        hidden_states_path,
+        run_id=run_id,
+        strategy=strategy,
+        feature_keys=LAST_HIDDEN_FEATURE_KEYS,
         target_repr="hidden_state",
         ttt_length=ttt_length,
         max_len=max_len,
@@ -151,6 +202,10 @@ def build_offline_normalizer(max_len, **_topology):
 
 def build_dspark_offline_normalizer(max_len, **_topology):
     return partial(normalize_dspark_offline_sample, max_len=max_len)
+
+
+def build_domino_offline_normalizer(max_len, **_topology):
+    return partial(normalize_domino_offline_sample, max_len=max_len)
 
 
 def build_collator():
@@ -184,6 +239,22 @@ def build_dspark_collator():
                 "hidden_states",
                 "target_last_hidden_states",
             ),
+        )
+
+    return collate
+
+
+def build_domino_collator():
+    def collate(features):
+        return pad_and_concatenate_features(
+            features,
+            sequence_axes={
+                "input_ids": 1,
+                "loss_mask": 1,
+                "hidden_states": 1,
+                "target_last_hidden_states": 1,
+            },
+            required_keys=LAST_HIDDEN_FEATURE_KEYS,
         )
 
     return collate
@@ -269,10 +340,15 @@ def build_mtp_collator():
 
 
 __all__ = [
+    "DOMINO_NORMALIZER_ID",
     "DSPARK_NORMALIZER_ID",
+    "LAST_HIDDEN_FEATURE_KEYS",
     "MTP_NORMALIZER_ID",
     "NORMALIZER_ID",
     "build_collator",
+    "build_domino_collator",
+    "build_domino_offline_normalizer",
+    "build_domino_offline_reader",
     "build_dspark_collator",
     "build_dspark_offline_normalizer",
     "build_dspark_offline_reader",
@@ -281,6 +357,7 @@ __all__ = [
     "build_mtp_offline_reader",
     "build_offline_normalizer",
     "build_offline_reader",
+    "normalize_domino_offline_sample",
     "normalize_dspark_offline_sample",
     "normalize_mtp_offline_sample",
     "normalize_offline_sample",

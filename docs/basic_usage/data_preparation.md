@@ -299,14 +299,17 @@ Each output record contains the strategy's exact offline feature contract:
 | Strategy | Tensors in each `.ckpt` or `.ckpt.gz` record |
 | --- | --- |
 | EAGLE3 | `input_ids`, `loss_mask`, `hidden_state`, `aux_hidden_state` |
-| DFlash, DFlash2, and Domino | `input_ids`, `loss_mask`, `hidden_states` |
+| DFlash and DFlash2 | `input_ids`, `loss_mask`, `hidden_states` |
+| Domino | `input_ids`, `loss_mask`, `hidden_states`, `target_last_hidden_states` |
 | DSpark | `input_ids`, `loss_mask`, `hidden_states`, `target_last_hidden_states` |
 
 For the DFlash family, `hidden_states` concatenates the target layers selected
-by the draft config. DSpark additionally stores the target model's final hidden
-state for its L1 and confidence objectives. Keep each strategy in a separate
-output directory; the offline reader validates the contract instead of
-silently adapting incompatible features.
+by the draft config. Domino and DSpark additionally store the target model's
+final hidden state (`target_last_hidden_states`) for their L1/TV distillation
+objectives. A Domino dataset prepared before that objective existed has to be
+regenerated, because the reader now requires the tensor instead of ignoring
+it. Keep each strategy in a separate output directory; the offline reader
+validates the contract instead of silently adapting incompatible features.
 
 DFlash2 feature preparation still uses `--strategy dflash`; pass a
 `DFlash2DraftModel` config such as `configs/qwen3.6-27b-dflash2.json` so capture

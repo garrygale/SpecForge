@@ -75,6 +75,7 @@ class TestDominoLambdaSchedule(unittest.TestCase):
                 "input_ids": torch.ones(1, 2, dtype=torch.long),
                 "hidden_states": torch.ones(1, 2, 2),
                 "loss_mask": torch.ones(1, 2),
+                "target_last_hidden_states": torch.ones(1, 2, 2),
             },
         )
 
@@ -91,6 +92,10 @@ class TestDominoLambdaSchedule(unittest.TestCase):
             self.assertIs(output.metrics[name], value)
         self.assertEqual(float(output.metrics["accuracy"]), 0.75)
         self.assertEqual(model.last_kwargs["max_valid_anchors"], 1)
+        torch.testing.assert_close(
+            model.last_kwargs["target_last_hidden_states"],
+            batch.tensors["target_last_hidden_states"],
+        )
 
 
 @unittest.skipUnless(CUDA, "Domino offline launcher path requires CUDA")
@@ -112,6 +117,7 @@ class TestDominoOfflineLaunch(unittest.TestCase):
             n=4,
             seq=sequence_length,
             hidden=hidden,
+            target_hidden=hidden,
         )
         model, width, _target_dir, _layers = fx.build_domino(
             workdir,
@@ -119,6 +125,12 @@ class TestDominoOfflineLaunch(unittest.TestCase):
             block_size=4,
             num_anchors=8,
             attention_backend="sdpa",
+            # End-to-end coverage for the DSpark-style L1/TV distillation on
+            # both the corrected and the base logits.
+            ce_loss_alpha=1.0,
+            l1_loss_alpha=0.5,
+            base_tv_loss=True,
+            final_tv_loss=True,
         )
         self.assertEqual(width, hidden)
 

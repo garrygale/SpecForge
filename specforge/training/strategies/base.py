@@ -651,13 +651,20 @@ class MTPTrainStrategy(DraftTrainStrategy):
 class DominoTrainStrategy(DraftTrainStrategy):
     """Domino block-parallel strategy wrapping ``OnlineDominoModel``.
 
-    Shares the trainer/backend/loader/checkpoint spine and feature schema with
-    DFlash. Unlike the others, its loss blends a base loss with a weight
-    ``lambda_base`` that decays over training, so it reads :class:`StepContext`.
+    Shares the trainer/backend/loader/checkpoint spine with DFlash, plus the
+    captured target final-layer state that enables the optional DSpark-style
+    L1/TV distillation term. Unlike the others, its loss blends a base loss
+    with a weight ``lambda_base`` that decays over training, so it reads
+    :class:`StepContext`.
     """
 
     name = "domino"
-    required_features = {"input_ids", "hidden_states", "loss_mask"}
+    required_features = {
+        "input_ids",
+        "hidden_states",
+        "loss_mask",
+        "target_last_hidden_states",
+    }
 
     def __init__(
         self,
@@ -696,6 +703,9 @@ class DominoTrainStrategy(DraftTrainStrategy):
             input_ids=t["input_ids"].to(device, non_blocking=True),
             hidden_states=t["hidden_states"].to(device, non_blocking=True),
             loss_mask=t["loss_mask"].to(device, non_blocking=True),
+            target_last_hidden_states=t["target_last_hidden_states"].to(
+                device, non_blocking=True
+            ),
             lambda_base=lambda_base,
             max_valid_anchors=max_valid_anchors,
         )

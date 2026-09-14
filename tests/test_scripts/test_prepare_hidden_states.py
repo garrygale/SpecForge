@@ -95,7 +95,12 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             "domino": (
                 "qwen3-8b-domino.json",
                 (1, 9, 17, 25, 33),
-                {"input_ids", "loss_mask", "hidden_states"},
+                {
+                    "input_ids",
+                    "loss_mask",
+                    "hidden_states",
+                    "target_last_hidden_states",
+                },
             ),
             "dspark": (
                 "qwen3-4b-dspark.json",

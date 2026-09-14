@@ -381,6 +381,31 @@ class OnlineDFlashModel(nn.Module):
             return suffix / prefix.clamp_min(torch.finfo(prefix.dtype).tiny)
         raise ValueError(f"unknown D-PACE loss_type {loss_type!r}")
 
+    def _aligned_target_hidden(
+        self,
+        target_last_hidden_states: torch.Tensor,
+        safe_label_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather the target state that predicts each block label token.
+
+        The captured final-layer state at position ``i`` predicts token ``i+1``,
+        so every label gathered from ``input_ids[label_index]`` is matched with
+        the target state at ``label_index - 1``. Shared by the DSpark L1/TV
+        objective and Domino's optional L1/TV distillation terms.
+        """
+
+        target_pred_indices = (safe_label_indices - 1).clamp(min=0)
+        batch_size = target_last_hidden_states.shape[0]
+        hidden_size = target_last_hidden_states.shape[-1]
+        gather_indices = target_pred_indices.reshape(batch_size, -1, 1).expand(
+            -1, -1, hidden_size
+        )
+        return torch.gather(
+            target_last_hidden_states,
+            1,
+            gather_indices,
+        ).reshape(*safe_label_indices.shape, hidden_size)
+
     def _forward_draft_blocks(
         self,
         input_ids: torch.Tensor,
@@ -823,6 +848,10 @@ class OnlineDominoModel(OnlineDFlashModel):
         loss_decay_gamma: Optional[float] = None,
         objective_chunk_blocks: int = 128,
         shift_label: bool = False,
+        ce_loss_alpha: float = 1.0,
+        l1_loss_alpha: float = 0.0,
+        base_tv_loss: bool = False,
+        final_tv_loss: bool = True,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -836,7 +865,15 @@ class OnlineDominoModel(OnlineDFlashModel):
             objective_chunk_blocks=objective_chunk_blocks,
             loss_type="dflash",
         )
+        if ce_loss_alpha < 0:
+            raise ValueError("domino ce_loss_alpha must be >= 0")
+        if l1_loss_alpha < 0:
+            raise ValueError("domino l1_loss_alpha must be >= 0")
         self.shift_label = shift_label
+        self.domino_ce_loss_alpha = float(ce_loss_alpha)
+        self.domino_l1_loss_alpha = float(l1_loss_alpha)
+        self.domino_base_tv_loss = bool(base_tv_loss)
+        self.domino_final_tv_loss = bool(final_tv_loss)
         self._use_fused_domino_ce = (
             os.environ.get("SPECFORGE_DOMINO_TRITON_CE", "1") == "1"
         )
@@ -874,6 +911,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         target_ids: torch.Tensor,
         weight_mask: torch.Tensor,
         eval_weight_mask: torch.Tensor,
+        aligned_target_hidden: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, ...]:
         """Return additive Domino loss and telemetry terms for one block slice."""
         from specforge.core.domino_loss import domino_weighted_cross_entropy
@@ -900,6 +938,12 @@ class OnlineDominoModel(OnlineDFlashModel):
             )
         )
         loss_den = weight_mask.sum()
+        base_l1_num, final_l1_num = self._domino_l1_numerators(
+            base_logits=base_logits,
+            correction_logits=correction_logits,
+            aligned_target_hidden=aligned_target_hidden,
+            weight_mask=weight_mask,
+        )
 
         with torch.no_grad():
             predicted_ids = predicted_ids.reshape_as(target_ids)
@@ -930,6 +974,8 @@ class OnlineDominoModel(OnlineDFlashModel):
         return (
             final_num,
             base_num,
+            base_l1_num,
+            final_l1_num,
             loss_den,
             correct_num,
             base_correct_num,
@@ -939,11 +985,71 @@ class OnlineDominoModel(OnlineDFlashModel):
             accept_den,
         )
 
+    def _domino_l1_numerators(
+        self,
+        *,
+        base_logits: torch.Tensor,
+        correction_logits: torch.Tensor,
+        aligned_target_hidden: Optional[torch.Tensor],
+        weight_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Weighted L1 (2x total variation) numerators for one block slice.
+
+        ``L1 = sum_v |p_draft - p_teacher|`` matches DSpark's ``l1_per_token``;
+        the teacher distribution is the frozen target head applied to the
+        captured final-layer state and never carries gradient. ``None``
+        ``aligned_target_hidden`` (L1 disabled, or a slice without teacher
+        data) yields zero terms so the caller can stay branch-free.
+        """
+
+        zero = base_logits.new_zeros(())
+        if aligned_target_hidden is None:
+            return zero, zero
+        if not (self.domino_base_tv_loss or self.domino_final_tv_loss):
+            return zero, zero
+
+        batch_size, num_blocks, block_size = base_logits.shape[:3]
+        hidden_size = aligned_target_hidden.shape[-1]
+        with torch.no_grad():
+            teacher_logits = self.lm_head(
+                aligned_target_hidden.reshape(
+                    batch_size,
+                    num_blocks * block_size,
+                    hidden_size,
+                )
+            ).reshape_as(base_logits)
+            teacher_probabilities = torch.softmax(teacher_logits.float(), dim=-1)
+
+        base_l1_num = zero
+        final_l1_num = zero
+        if self.domino_base_tv_loss:
+            base_probabilities = torch.softmax(base_logits.float(), dim=-1)
+            base_l1_num = (
+                (base_probabilities - teacher_probabilities).abs().sum(dim=-1)
+                * weight_mask
+            ).sum()
+        if self.domino_final_tv_loss:
+            suffix_start = self.draft_model.suffix_start
+            final_logits = torch.cat(
+                [
+                    base_logits[:, :, :suffix_start, :],
+                    base_logits[:, :, suffix_start:, :] + correction_logits,
+                ],
+                dim=2,
+            )
+            final_probabilities = torch.softmax(final_logits.float(), dim=-1)
+            final_l1_num = (
+                (final_probabilities - teacher_probabilities).abs().sum(dim=-1)
+                * weight_mask
+            ).sum()
+        return base_l1_num, final_l1_num
+
     def forward(
         self,
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        target_last_hidden_states: Optional[torch.Tensor] = None,
         lambda_base: float = 0.0,
         max_valid_anchors: Optional[int] = None,
     ):
@@ -1009,9 +1115,25 @@ class OnlineDominoModel(OnlineDFlashModel):
             )
             weight_mask = weight_mask * decay_weights
 
+        wants_l1 = self.domino_l1_loss_alpha > 0 and (
+            self.domino_base_tv_loss or self.domino_final_tv_loss
+        )
+        aligned_target_hidden = None
+        if wants_l1:
+            if target_last_hidden_states is None:
+                raise ValueError(
+                    "Domino L1/TV loss requires target_last_hidden_states"
+                )
+            aligned_target_hidden = self._aligned_target_hidden(
+                target_last_hidden_states,
+                safe_target_indices,
+            )
+
         (
             final_num,
             base_num,
+            base_l1_num,
+            final_l1_num,
             loss_den,
             correct_num,
             base_correct_num,
@@ -1026,6 +1148,7 @@ class OnlineDominoModel(OnlineDFlashModel):
             target_ids,
             weight_mask,
             eval_weight_mask,
+            aligned_target_hidden,
             chunk_size=self.objective_chunk_blocks,
             dim=1,
         )
@@ -1033,11 +1156,28 @@ class OnlineDominoModel(OnlineDFlashModel):
         valid_token_count = loss_den + 1e-6
         final_loss = final_num / valid_token_count
         base_loss = base_num / valid_token_count
-        loss = (1.0 - lambda_base) * final_loss + lambda_base * base_loss
+        final_l1_loss = final_l1_num / valid_token_count
+        base_l1_loss = base_l1_num / valid_token_count
+
+        # CE and L1(TV) mix independently per path: each toggle selects pure CE
+        # or CE + TV for that part of the Domino loss, and lambda_base keeps
+        # blending the corrected path against the base path exactly as before.
+        ce_alpha = self.domino_ce_loss_alpha
+        l1_alpha = self.domino_l1_loss_alpha
+        base_objective = ce_alpha * base_loss
+        if self.domino_base_tv_loss:
+            base_objective = base_objective + l1_alpha * base_l1_loss
+        final_objective = ce_alpha * final_loss
+        if self.domino_final_tv_loss:
+            final_objective = final_objective + l1_alpha * final_l1_loss
+
+        loss = (1.0 - lambda_base) * final_objective + lambda_base * base_objective
         accuracy = correct_num / (accuracy_denom + 1e-6)
         metrics = {
             "final_loss": final_loss.detach(),
             "base_loss": base_loss.detach(),
+            "final_l1_loss": final_l1_loss.detach(),
+            "base_l1_loss": base_l1_loss.detach(),
             "base_accuracy": (base_correct_num / (accuracy_denom + 1e-6)).detach(),
             "accept_len": (accept_num / (accept_den + 1e-6)).detach(),
             "base_accept_len": (base_accept_num / (accept_den + 1e-6)).detach(),
@@ -1140,25 +1280,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
             decay_weights = torch.exp(-positions.float() / float(self.loss_decay_gamma))
             loss_weight_mask = loss_weight_mask * decay_weights
         return loss_weight_mask
-
-    def _aligned_target_hidden(
-        self,
-        target_last_hidden_states: torch.Tensor,
-        safe_label_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Gather the target state that predicts each DSpark label token."""
-
-        target_pred_indices = (safe_label_indices - 1).clamp(min=0)
-        batch_size = target_last_hidden_states.shape[0]
-        hidden_size = target_last_hidden_states.shape[-1]
-        gather_indices = target_pred_indices.reshape(batch_size, -1, 1).expand(
-            -1, -1, hidden_size
-        )
-        return torch.gather(
-            target_last_hidden_states,
-            1,
-            gather_indices,
-        ).reshape(*safe_label_indices.shape, hidden_size)
 
     def _dspark_objective_chunk_terms(
         self,

@@ -177,6 +177,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             layers=[object(), object()],
             norm_before_residual=True,
             target_layer_ids=[3, 7],
+            target_hidden_size=8,
             pure_draft_prefix_len=2,
         )
         dflash_family = SimpleNamespace(
@@ -191,6 +192,10 @@ class BuiltinProviderContractTest(unittest.TestCase):
             kl_scale=0.9,
             kl_decay=0.8,
             shift_label=True,
+            domino_ce_loss_alpha=1.0,
+            domino_l1_loss_alpha=0.5,
+            domino_base_tv_loss=True,
+            domino_final_tv_loss=True,
             dspark_ce_loss_alpha=0.1,
             dspark_l1_loss_alpha=0.8,
             dspark_confidence_head_alpha=0.2,
@@ -244,6 +249,10 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "domino_pure_draft_prefix_len",
                 "domino_lambda_base_start",
                 "domino_lambda_base_decay_ratio",
+                "domino_ce_loss_alpha",
+                "domino_l1_loss_alpha",
+                "domino_base_tv_loss",
+                "domino_final_tv_loss",
             },
             "dspark": {
                 "dspark_block_size",

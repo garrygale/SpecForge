@@ -6,10 +6,10 @@ from functools import partial
 
 from specforge.algorithms.common.defaults import no_missing_checkpoint_keys
 from specforge.algorithms.common.hidden_states_data import (
-    NORMALIZER_ID,
-    build_collator,
-    build_offline_normalizer,
-    build_offline_reader,
+    DOMINO_NORMALIZER_ID,
+    build_domino_collator,
+    build_domino_offline_normalizer,
+    build_domino_offline_reader,
 )
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
@@ -87,6 +87,10 @@ def resume_contract(config, draft_model, training_model):
         "domino_lambda_base_decay_ratio": float(
             config.training.lambda_base_decay_ratio
         ),
+        "domino_ce_loss_alpha": float(training_model.domino_ce_loss_alpha),
+        "domino_l1_loss_alpha": float(training_model.domino_l1_loss_alpha),
+        "domino_base_tv_loss": bool(training_model.domino_base_tv_loss),
+        "domino_final_tv_loss": bool(training_model.domino_final_tv_loss),
     }
 
 
@@ -127,7 +131,12 @@ def needs_input_tools(config, draft_model):
 
 
 def algorithm_spec() -> AlgorithmSpec:
-    ready = {"input_ids", "loss_mask", "hidden_states"}
+    ready = {
+        "input_ids",
+        "loss_mask",
+        "hidden_states",
+        "target_last_hidden_states",
+    }
     return AlgorithmSpec(
         name=ALGORITHM_NAME,
         draft=DraftRequirement(
@@ -139,16 +148,20 @@ def algorithm_spec() -> AlgorithmSpec:
                 mode=FeatureMode.OFFLINE,
                 modality="text",
                 required_tensors=ready,
+                allowed_target_representations={"hidden_state"},
+                default_target_representation="hidden_state",
                 storage=OfflineStorageContract(
                     format="specforge_hidden_states_v1",
                     required_tensors=ready,
-                    normalizer=NORMALIZER_ID,
+                    normalizer=DOMINO_NORMALIZER_ID,
                 ),
             ),
             FeatureContract(
                 mode=FeatureMode.STREAMING,
                 modality="text",
                 required_tensors=ready,
+                allowed_target_representations={"hidden_state"},
+                default_target_representation="hidden_state",
             ),
         ),
         capabilities=AlgorithmCapabilities(
@@ -158,7 +171,7 @@ def algorithm_spec() -> AlgorithmSpec:
 
 
 def algorithm_providers() -> AlgorithmProviders:
-    collator = build_collator
+    collator = build_domino_collator
     return AlgorithmProviders(
         algorithm_name=ALGORITHM_NAME,
         step=StepProvider(
@@ -184,18 +197,18 @@ def algorithm_providers() -> AlgorithmProviders:
         offline=(
             OfflineDataProvider(
                 modality="text",
-                normalizer_id=NORMALIZER_ID,
+                normalizer_id=DOMINO_NORMALIZER_ID,
                 capture_layout=OfflineCaptureLayout(
                     capture_method="dflash",
                     aux_feature="hidden_states",
-                    last_hidden_feature=None,
+                    last_hidden_feature="target_last_hidden_states",
                     passthrough=(
                         ("input_ids", "input_ids"),
                         ("loss_mask", "loss_mask"),
                     ),
                 ),
-                build_reader=partial(build_offline_reader, ALGORITHM_NAME),
-                build_normalizer=build_offline_normalizer,
+                build_reader=partial(build_domino_offline_reader, ALGORITHM_NAME),
+                build_normalizer=build_domino_offline_normalizer,
                 build_collator=collator,
             ),
         ),
@@ -203,10 +216,10 @@ def algorithm_providers() -> AlgorithmProviders:
             ServerStreamingProvider(
                 modality="text",
                 capture_method="dflash",
-                target_representation=None,
+                target_representation="hidden_state",
                 layout=ServerCaptureLayout(
                     aux_feature="hidden_states",
-                    last_hidden_feature=None,
+                    last_hidden_feature="target_last_hidden_states",
                     passthrough=(
                         ("input_ids", "input_ids", ()),
                         ("loss_mask", "loss_mask", ()),

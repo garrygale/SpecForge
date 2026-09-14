@@ -354,7 +354,10 @@ The online producer sends prompts to the URLs in
 with the model, capture method, and auxiliary layer ids matching the draft
 config. DFlash, DFlash2, and Domino use the DFlash capture contract, DSpark
 uses its dedicated K3 capture contract, and EAGLE3 and P-EAGLE use the EAGLE3
-capture contract. Capture rejects chunked prefill and
+capture contract. Domino and DSpark additionally request the `last_hidden`
+artifact (the target's post-norm final hidden state) for their L1/TV
+distillation terms; the capture server writes it whenever a request asks for
+it. Capture rejects chunked prefill and
 gives every request attempt a unique radix-cache namespace so cached prefixes
 cannot truncate the captured sequence. Online capture is text-only: VLM
 training, including Qwen2.5-VL, is not supported. Online evaluation is also not

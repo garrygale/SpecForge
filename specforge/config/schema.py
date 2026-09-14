@@ -580,6 +580,16 @@ class TrainingConfig(StrictConfigModel):
     dflash2_selector_stop_gradient: bool = False
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
+    #: Domino objective: CE/L1(TV) mixing for the base and the corrected
+    #: (GRU-suffix) logits. ``domino_ce_loss_alpha`` scales CE on both paths and
+    #: ``domino_l1_loss_alpha`` scales the DSpark-style L1 (2x total variation)
+    #: distillation against the captured target distribution. Each toggle
+    #: selects pure CE (False) or CE + L1 (True) for that path; the default
+    #: ``domino_l1_loss_alpha=0.0`` keeps the historical CE-only objective.
+    domino_ce_loss_alpha: float = Field(default=1.0, ge=0.0)
+    domino_l1_loss_alpha: float = Field(default=0.0, ge=0.0)
+    domino_base_tv_loss: bool = False
+    domino_final_tv_loss: bool = True
     dspark_ce_loss_alpha: float = 0.1
     dspark_l1_loss_alpha: float = 0.9
     dspark_confidence_head_alpha: float = 1.0

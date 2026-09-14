@@ -32,6 +32,7 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
                 "input_ids": "input_ids",
                 "loss_mask": "loss_mask",
                 "hidden_states": "aux_hidden_states",
+                "target_last_hidden_states": "last_hidden_states",
             },
             "dspark": {
                 "input_ids": "input_ids",

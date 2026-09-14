@@ -97,6 +97,24 @@ class ApplicationCompositionTest(unittest.TestCase):
         provider = resolved.algorithm.providers.offline_for("text")
         self.assertEqual("dspark_offline_v1", provider.normalizer_id)
 
+    def test_domino_offline_resolves_its_registered_provider(self):
+        resolved = resolve_run(
+            Config.model_validate(_payload("domino", mode="offline"))
+        )
+
+        provider = resolved.algorithm.providers.offline_for("text")
+        self.assertEqual("domino_offline_v1", provider.normalizer_id)
+        self.assertEqual(
+            "target_last_hidden_states",
+            provider.capture_layout.last_hidden_feature,
+        )
+        self.assertEqual(
+            "hidden_state",
+            resolved.algorithm.providers.server_streaming_for(
+                "text"
+            ).target_representation,
+        )
+
     def test_application_planning_defends_offline_data_parallelism(self):
         config = Config.model_validate(_payload(mode="offline"))
         invalid_training = config.training.model_copy(update={"tp_size": 2})

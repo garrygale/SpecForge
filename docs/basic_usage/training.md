@@ -241,6 +241,39 @@ explicit draft config (or a pretrained warm-start source that contains
 no-config branch immediately failed because those required projector fields
 had no defaults; the unified schema rejects that unusable combination early.
 
+### Domino objective: CE and optional L1 (TV) distillation
+
+Domino trains the corrected block logits with cross-entropy and blends the
+base (uncorrected) path in through the decaying `training.lambda_base_*`
+schedule. Both paths can additionally learn from the target distribution with
+the same total-variation objective DSpark uses. The teacher distribution is
+`softmax(target_head(target_last_hidden_states))`, computed under `no_grad`
+from the captured final-layer target state, and the distillation term is the
+L1 distance between the draft and teacher distributions (twice the total
+variation distance), weighted by the same per-token loss mask and decay:
+
+```yaml
+training:
+  strategy: domino
+  domino_ce_loss_alpha: 1.0    # weight of the CE term on both paths
+  domino_l1_loss_alpha: 0.9    # weight of the L1(TV) distillation term
+  domino_base_tv_loss: false   # base path: pure CE (false) or CE + L1 (true)
+  domino_final_tv_loss: true   # corrected path: pure CE (false) or CE + L1
+```
+
+The toggles select pure CE or CE + L1 independently for the base and corrected
+parts, and `lambda_base` keeps blending the two parts exactly as before:
+`loss = (1 - lambda_base) * final_objective + lambda_base * base_objective`.
+`domino_l1_loss_alpha: 0.0` (the default) keeps the historical CE-only
+objective and is bit-for-bit compatible with it.
+
+Enabling L1 requires the captured target final-layer state, so Domino's offline
+records now contain `target_last_hidden_states` and online capture requests the
+`last_hidden` artifact; see [Data Preparation](data_preparation.md). The
+teacher pass adds one frozen-head forward per objective chunk in fp32, so tune
+`training.objective_chunk_blocks` down (for example 16-32) when the draft
+vocabulary is large.
+
 There are two deliberately separate checkpoint operations:
 
 | Intent | Config field | Restored state |

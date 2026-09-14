@@ -335,6 +335,35 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "dspark_objective_chunk_blocks"):
             Config.model_validate(payload)
 
+    def test_domino_ce_l1_objective_settings_are_typed(self):
+        default = Config.model_validate(_online_payload("domino"))
+        self.assertEqual(default.training.domino_ce_loss_alpha, 1.0)
+        self.assertEqual(default.training.domino_l1_loss_alpha, 0.0)
+        self.assertFalse(default.training.domino_base_tv_loss)
+        self.assertTrue(default.training.domino_final_tv_loss)
+
+        payload = _online_payload("domino")
+        payload["training"].update(
+            {
+                "domino_ce_loss_alpha": 0.5,
+                "domino_l1_loss_alpha": 0.9,
+                "domino_base_tv_loss": True,
+                "domino_final_tv_loss": False,
+            }
+        )
+        config = Config.model_validate(payload)
+        self.assertEqual(config.training.domino_ce_loss_alpha, 0.5)
+        self.assertEqual(config.training.domino_l1_loss_alpha, 0.9)
+        self.assertTrue(config.training.domino_base_tv_loss)
+        self.assertFalse(config.training.domino_final_tv_loss)
+
+        for field_name in ("domino_ce_loss_alpha", "domino_l1_loss_alpha"):
+            payload = _online_payload("domino")
+            payload["training"][field_name] = -0.1
+            with self.subTest(field=field_name):
+                with self.assertRaisesRegex(ValidationError, field_name):
+                    Config.model_validate(payload)
+
     def test_dflash2_selector_objective_settings_are_bounded(self):
         payload = _online_payload("dflash")
         payload["training"]["dflash2_selector_loss_alpha"] = 0.25
