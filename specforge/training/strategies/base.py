@@ -659,12 +659,9 @@ class DominoTrainStrategy(DraftTrainStrategy):
     """
 
     name = "domino"
-    required_features = {
-        "input_ids",
-        "hidden_states",
-        "loss_mask",
-        "target_last_hidden_states",
-    }
+    #: The captured target distribution is optional: only the L1/TV objective
+    #: reads it, and the model raises when L1 is enabled without it.
+    required_features = {"input_ids", "hidden_states", "loss_mask"}
 
     def __init__(
         self,
@@ -699,12 +696,15 @@ class DominoTrainStrategy(DraftTrainStrategy):
         device = self._device()
         lambda_base = self._lambda_base(ctx)
         max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
+        target_last_hidden_states = t.get("target_last_hidden_states")
         loss, accuracy, model_metrics = self.domino_model(
             input_ids=t["input_ids"].to(device, non_blocking=True),
             hidden_states=t["hidden_states"].to(device, non_blocking=True),
             loss_mask=t["loss_mask"].to(device, non_blocking=True),
-            target_last_hidden_states=t["target_last_hidden_states"].to(
-                device, non_blocking=True
+            target_last_hidden_states=(
+                None
+                if target_last_hidden_states is None
+                else target_last_hidden_states.to(device, non_blocking=True)
             ),
             lambda_base=lambda_base,
             max_valid_anchors=max_valid_anchors,

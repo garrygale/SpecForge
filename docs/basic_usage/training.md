@@ -267,12 +267,17 @@ parts, and `lambda_base` keeps blending the two parts exactly as before:
 `domino_l1_loss_alpha: 0.0` (the default) keeps the historical CE-only
 objective and is bit-for-bit compatible with it.
 
-Enabling L1 requires the captured target final-layer state, so Domino's offline
-records now contain `target_last_hidden_states` and online capture requests the
-`last_hidden` artifact; see [Data Preparation](data_preparation.md). The
+Enabling L1 requires the captured target final-layer state. Offline records
+always store it, while an online run requests the `last_hidden` artifact only
+when one of the toggles is on with a positive alpha: a CE-only run therefore
+keeps working against a capture server that does not produce that artifact, and
+the default configuration never pays for it. See
+[Data Preparation](data_preparation.md) for the offline record schema. The
 teacher pass adds one frozen-head forward per objective chunk in fp32, so tune
 `training.objective_chunk_blocks` down (for example 16-32) when the draft
-vocabulary is large.
+vocabulary is large. A run that enables L1 against a capture server without the
+last-hidden artifact fails at the capture boundary with the missing feature
+name rather than training on a partial objective.
 
 There are two deliberately separate checkpoint operations:
 

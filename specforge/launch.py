@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Callable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, FrozenSet, List, Mapping, Optional, Tuple
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.runtime.contracts import SampleRef
@@ -476,6 +476,7 @@ def _assemble_server_rollout_workers(
     vocab_map_version: Optional[str],
     num_rollout_workers: int,
     feature_source,
+    required_features: Optional[FrozenSet[str]] = None,
 ):
     """Build workers over injected SGLang-server ref sources only."""
 
@@ -500,7 +501,11 @@ def _assemble_server_rollout_workers(
 
     contract = algorithm.spec.feature_contract("streaming", modality)
     capture_config = CaptureConfig.from_strategy(
-        required_features=contract.required_tensors,
+        required_features=(
+            contract.required_tensors
+            if required_features is None
+            else required_features
+        ),
         aux_hidden_state_layer_ids=tuple(aux_hidden_state_layer_ids or ()),
         target_repr=target_repr,
         target_hidden_size=target_hidden_size,
@@ -803,6 +808,10 @@ def build_disagg_online_producer(
     target_repr: Optional[str] = None,
     aux_hidden_state_layer_ids=None,
     vocab_map_version: Optional[str] = None,
+    #: Streaming features this run must capture. Defaults to the streaming
+    #: contract's required tensors; callers that resolved optional tensors
+    #: (see ``resolve_streaming_capture``) pass the effective set.
+    required_features: Optional[FrozenSet[str]] = None,
     num_rollout_workers: int = 1,
     feature_source=None,
     lease: int = 8,
@@ -968,6 +977,7 @@ def build_disagg_online_producer(
         aux_hidden_state_layer_ids=aux_hidden_state_layer_ids,
         vocab_map_version=vocab_map_version,
         num_rollout_workers=num_rollout_workers,
+        required_features=required_features,
     )
     producer_timing(
         "assemble rollout workers done "

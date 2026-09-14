@@ -593,6 +593,21 @@ class TrainingConfig(StrictConfigModel):
     dspark_ce_loss_alpha: float = 0.1
     dspark_l1_loss_alpha: float = 0.9
     dspark_confidence_head_alpha: float = 1.0
+
+    @property
+    def domino_l1_enabled(self) -> bool:
+        """Whether the Domino objective consumes the captured target distribution.
+
+        The teacher tensor (``target_last_hidden_states``) is optional for
+        Domino, so online capture only requests the ``last_hidden`` artifact
+        when this is true. A CE-only run therefore stays compatible with a
+        capture server that never produced that artifact.
+        """
+
+        return self.domino_l1_loss_alpha > 0.0 and (
+            self.domino_base_tv_loss or self.domino_final_tv_loss
+        )
+
     #: P-EAGLE COD sampling/model knobs.
     num_depths: int = Field(default=8, gt=0)
     down_sample_ratio: float = 0.8

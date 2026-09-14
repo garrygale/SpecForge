@@ -246,6 +246,21 @@ def build_dspark_collator():
 
 def build_domino_collator():
     def collate(features):
+        # The target-distribution state is optional: online capture only
+        # requests it when the Domino L1/TV objective is enabled, so a CE-only
+        # run must collate without it. Presence must be batch-uniform, or the
+        # teacher signal would silently cover only part of a batch.
+        optional_names = tuple(
+            name
+            for name in ("target_last_hidden_states",)
+            if any(name in feature for feature in features)
+        )
+        for name in optional_names:
+            if not all(name in feature for feature in features):
+                raise ValueError(
+                    f"optional feature {name!r} must be present for every "
+                    "sample in a batch or for none of them"
+                )
         return pad_and_concatenate_features(
             features,
             sequence_axes={
@@ -254,7 +269,12 @@ def build_domino_collator():
                 "hidden_states": 1,
                 "target_last_hidden_states": 1,
             },
-            required_keys=LAST_HIDDEN_FEATURE_KEYS,
+            required_keys=(
+                "input_ids",
+                "loss_mask",
+                "hidden_states",
+                *optional_names,
+            ),
         )
 
     return collate

@@ -548,6 +548,12 @@ class ServerStreamingProvider:
     ``build_input_adapter`` is deliberately modality-neutral. Text providers
     can leave it unset; the current runtime does not support VLM registration
     or media requests.
+
+    ``resolve_optional_tensors`` is the algorithm-owned policy for the
+    contract's ``optional_tensors``: it maps one resolved run config onto the
+    optional tensors that run actually consumes, so an artifact an objective
+    does not need is never requested from the capture server. Leaving it unset
+    means "no optional tensor is needed".
     """
 
     modality: str
@@ -556,6 +562,7 @@ class ServerStreamingProvider:
     layout: ServerCaptureLayout
     build_collator: Factory
     build_input_adapter: Factory | None = None
+    resolve_optional_tensors: Factory | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.modality, field_name="modality")
@@ -573,6 +580,10 @@ class ServerStreamingProvider:
             self.build_input_adapter
         ):
             raise TypeError("build_input_adapter must be callable or None")
+        if self.resolve_optional_tensors is not None and not callable(
+            self.resolve_optional_tensors
+        ):
+            raise TypeError("resolve_optional_tensors must be callable or None")
 
     def create_input_adapter(self, config: Any) -> ServerInputAdapter | None:
         """Construct and validate the optional modality-owned input adapter."""

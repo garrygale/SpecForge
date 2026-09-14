@@ -91,12 +91,16 @@ class _StubCaptureServer:
         aux_width: int = len(AUX_LAYERS) * HIDDEN,
         aux_layer_ids=AUX_LAYERS,
         error_sample_ids=(),
+        supports_last_hidden: bool = True,
     ) -> None:
         self.backend = backend
         self.hidden = hidden
         self.aux_width = aux_width
         self.aux_layer_ids = None if aux_layer_ids is None else list(aux_layer_ids)
         self.error_sample_ids = set(error_sample_ids)
+        # A capture build without the last-hidden plumbing ignores that part of
+        # the request: it still writes aux + passthrough and reports only those.
+        self.supports_last_hidden = supports_last_hidden
         self.expected: Dict[str, Dict[str, torch.Tensor]] = {}
 
     def _put(self, key: str, t: torch.Tensor) -> None:
@@ -136,7 +140,7 @@ class _StubCaptureServer:
                     mapping["aux"],
                     torch.randn(1, length, self.aux_width, dtype=torch.bfloat16),
                 )
-            if "last_hidden" in mapping:
+            if "last_hidden" in mapping and self.supports_last_hidden:
                 _write(
                     mapping["last_hidden"],
                     torch.randn(1, length, self.hidden, dtype=torch.bfloat16),
@@ -249,6 +253,60 @@ def _capture_schema(algorithm: str) -> ServerCaptureSchema:
     )
 
 
+def _domino_online_config(*, l1_alpha: float):
+    from specforge.config import Config
+
+    return Config.model_validate(
+        {
+            "model": {
+                "target_model_path": "some/target",
+                "draft_model_config": "draft.json",
+                "target_backend": "sglang",
+            },
+            "data": {"train_data_path": "/train.jsonl"},
+            "training": {
+                "strategy": "domino",
+                "max_steps": 1,
+                "domino_l1_loss_alpha": l1_alpha,
+            },
+            "deployment": {
+                "mode": "disaggregated",
+                "disaggregated": {
+                    "control_dir": "/control",
+                    "backend": "mooncake",
+                    "server_urls": ["http://127.0.0.1:30000"],
+                },
+            },
+        }
+    )
+
+
+def _domino_capture(*, l1_alpha: float):
+    """Resolve the online capture request for one Domino objective setting."""
+
+    from specforge.training.capture_contract import resolve_streaming_capture
+
+    registration = builtin_algorithm_registry().resolve("domino")
+    resolved = resolve_streaming_capture(
+        _domino_online_config(l1_alpha=l1_alpha),
+        algorithm=registration,
+    )
+    layout = resolved.layout
+    schema = ServerCaptureSchema(
+        aux_feature=layout.aux_feature,
+        last_hidden_feature=layout.last_hidden_feature,
+        passthrough=layout.passthrough,
+        attention_mask_feature=layout.attention_mask_feature,
+    )
+    capture = CaptureConfig.from_strategy(
+        required_features=resolved.required_features,
+        aux_hidden_state_layer_ids=AUX_LAYERS,
+        target_repr="hidden_state",
+        target_hidden_size=HIDDEN,
+    )
+    return schema, capture
+
+
 class _GenericRequestInputAdapter:
     def __init__(self, request_inputs):
         self.request_inputs = request_inputs
@@ -287,6 +345,41 @@ def _mk(
 
 
 class TestServerCaptureAdapter(unittest.TestCase):
+    def test_domino_ce_only_capture_tolerates_a_server_without_last_hidden(self):
+        """Regression: CE-only Domino online runs must still publish refs.
+
+        The teacher artifact is optional for Domino and is requested only when
+        the L1/TV objective consumes it. A capture server that never produced
+        ``last_hidden`` therefore cannot starve the inboxes of a CE-only run,
+        while a run that really needs the teacher state fails loudly.
+        """
+
+        def produce(l1_alpha):
+            backend = _FakeMooncakeStore()
+            server = _StubCaptureServer(backend, supports_last_hidden=False)
+            store = MooncakeFeatureStore(store=backend, store_id="run0")
+            schema, capture = _domino_capture(l1_alpha=l1_alpha)
+            adapter = SGLangServerCaptureAdapter(
+                "http://server:30000",
+                store,
+                run_id="run0",
+                algorithm="domino",
+                schema=schema,
+                post_fn=server,
+            )
+            return adapter.produce_refs([_task(0, 4)], capture=capture)[0]
+
+        ce_only = produce(0.0)
+        self.assertIsInstance(ce_only, SampleRef)
+        self.assertEqual(
+            {"input_ids", "loss_mask", "hidden_states"},
+            set(ce_only.feature_specs),
+        )
+
+        l1_enabled = produce(0.9)
+        self.assertIsInstance(l1_enabled, ServerCaptureFailure)
+        self.assertIn("target_last_hidden_states", l1_enabled.reason)
+
     def test_generic_adapter_inputs_merge_with_runtime_owned_request_fields(self):
         backend = _FakeMooncakeStore()
         server = _StubCaptureServer(backend)

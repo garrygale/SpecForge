@@ -25,12 +25,7 @@ class BuiltinProviderParityTest(unittest.TestCase):
             ),
             "domino": (
                 "DominoDraftModel",
-                {
-                    "input_ids",
-                    "loss_mask",
-                    "hidden_states",
-                    "target_last_hidden_states",
-                },
+                {"input_ids", "loss_mask", "hidden_states"},
                 {"eager", "sdpa", "flex_attention"},
                 None,
             ),
@@ -153,6 +148,83 @@ class BuiltinProviderParityTest(unittest.TestCase):
         stream = self.registry.resolve("dspark").providers.server_streaming_for("text")
 
         self.assertEqual("dspark", stream.capture_method)
+
+    def test_domino_teacher_state_is_optional_for_streaming(self):
+        registration = self.registry.resolve("domino")
+        streaming = registration.spec.feature_contract("streaming", "text")
+
+        self.assertEqual(
+            {"input_ids", "loss_mask", "hidden_states"},
+            streaming.required_tensors,
+        )
+        self.assertEqual(
+            {"target_last_hidden_states"},
+            streaming.optional_tensors,
+        )
+
+    def test_domino_online_capture_follows_the_resolved_objective(self):
+        """A CE-only run must not request the optional teacher artifact."""
+
+        from specforge.config import Config
+        from specforge.training.capture_contract import resolve_streaming_capture
+
+        registration = self.registry.resolve("domino")
+
+        def config_for(**training):
+            payload = {
+                "model": {
+                    "target_model_path": "some/target",
+                    "draft_model_config": "draft.json",
+                    "target_backend": "sglang",
+                },
+                "data": {"train_data_path": "/train.jsonl"},
+                "training": {"strategy": "domino", "max_steps": 1, **training},
+                "deployment": {
+                    "mode": "disaggregated",
+                    "disaggregated": {
+                        "control_dir": "/control",
+                        "backend": "mooncake",
+                        "server_urls": ["http://127.0.0.1:30000"],
+                    },
+                },
+            }
+            return Config.model_validate(payload)
+
+        ce_config = config_for()
+        self.assertFalse(ce_config.training.domino_l1_enabled)
+        ce_only = resolve_streaming_capture(ce_config, algorithm=registration)
+        self.assertIsNone(ce_only.layout.last_hidden_feature)
+        self.assertEqual(
+            {"input_ids", "loss_mask", "hidden_states"},
+            ce_only.required_features,
+        )
+
+        tv_config = config_for(domino_l1_loss_alpha=0.9)
+        self.assertTrue(tv_config.training.domino_l1_enabled)
+        enabled = resolve_streaming_capture(tv_config, algorithm=registration)
+        self.assertEqual(
+            "target_last_hidden_states",
+            enabled.layout.last_hidden_feature,
+        )
+        self.assertEqual(
+            {
+                "input_ids",
+                "loss_mask",
+                "hidden_states",
+                "target_last_hidden_states",
+            },
+            enabled.required_features,
+        )
+
+        alpha_without_toggle = resolve_streaming_capture(
+            config_for(
+                domino_l1_loss_alpha=0.9,
+                domino_base_tv_loss=False,
+                domino_final_tv_loss=False,
+            ),
+            algorithm=registration,
+        )
+        self.assertIsNone(alpha_without_toggle.layout.last_hidden_feature)
 
     def test_step_factories_preserve_concrete_strategy_types(self):
         expected = {

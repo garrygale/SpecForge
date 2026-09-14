@@ -331,6 +331,64 @@ class TestDominoDraftModel(unittest.TestCase):
                 lambda_base=0.0,
             )
 
+    def test_strategy_trains_without_teacher_state_when_l1_is_off(self):
+        """Regression: a CE-only run must train from three-feature captures."""
+
+        from specforge.runtime.contracts import TrainBatch
+        from specforge.training.strategies.base import DominoTrainStrategy
+
+        hidden_size, vocab_size, block_size = 4, 7, 4
+        model = self._fixed_blocks_model(
+            anchors=torch.tensor([[0, 3]]),
+            keep_mask=torch.ones(1, 2, dtype=torch.bool),
+            output_hidden=torch.randn(1, 2 * block_size, hidden_size),
+            block_size=block_size,
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            l1_loss_alpha=0.0,
+        )
+        batch = TrainBatch(
+            sample_ids=["sample-0"],
+            strategy="domino",
+            tensors={
+                "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 0, 1]]),
+                "hidden_states": torch.zeros(1, 2 * block_size, hidden_size),
+                "loss_mask": torch.ones(1, 2 * block_size),
+            },
+        )
+        output = DominoTrainStrategy(model).forward_loss(batch, None)
+
+        self.assertTrue(torch.isfinite(output.loss).all())
+        self.assertEqual(float(output.metrics["final_l1_loss"]), 0.0)
+        self.assertEqual(float(output.metrics["base_l1_loss"]), 0.0)
+
+    def test_strategy_surfaces_missing_teacher_state_when_l1_is_on(self):
+        from specforge.runtime.contracts import TrainBatch
+        from specforge.training.strategies.base import DominoTrainStrategy
+
+        hidden_size, vocab_size, block_size = 4, 7, 4
+        model = self._fixed_blocks_model(
+            anchors=torch.tensor([[0, 3]]),
+            keep_mask=torch.ones(1, 2, dtype=torch.bool),
+            output_hidden=torch.randn(1, 2 * block_size, hidden_size),
+            block_size=block_size,
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            l1_loss_alpha=0.9,
+        )
+        batch = TrainBatch(
+            sample_ids=["sample-0"],
+            strategy="domino",
+            tensors={
+                "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 0, 1]]),
+                "hidden_states": torch.zeros(1, 2 * block_size, hidden_size),
+                "loss_mask": torch.ones(1, 2 * block_size),
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "target_last_hidden_states"):
+            DominoTrainStrategy(model).forward_loss(batch, None)
+
     def test_l1_tv_matches_reference_teacher_distribution(self):
         """L1 is the true distributional TV against the captured target state."""
 

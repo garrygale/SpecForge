@@ -593,6 +593,7 @@ def _build_online(
             SGLangServerCaptureAdapter,
         )
         from specforge.launch import build_disagg_online_producer
+        from specforge.training.capture_contract import resolve_streaming_capture
         from specforge.training.model_loading import resolve_draft_config
 
         # This check is independent of dataset size. Keep it before tokenizer
@@ -633,7 +634,11 @@ def _build_online(
         layers, hidden_size, target_vocab, draft_vocab = _producer_capture_metadata(
             cfg, algorithm
         )
-        layout = streaming.layout
+        # Resolve the artifacts this run actually consumes: optional tensors
+        # (such as Domino's teacher state) stay out of the request unless the
+        # resolved objective enables them.
+        capture = resolve_streaming_capture(cfg, algorithm=algorithm)
+        layout = capture.layout
         capture_schema = ServerCaptureSchema(
             aux_feature=layout.aux_feature,
             last_hidden_feature=layout.last_hidden_feature,
@@ -669,6 +674,7 @@ def _build_online(
             draft_vocab_size=draft_vocab,
             target_repr=target_repr,
             aux_hidden_state_layer_ids=layers,
+            required_features=capture.required_features,
             prompt_epochs=cfg.training.num_epochs,
             prompt_seed=_online_prompt_seed(cfg),
             lease=cfg.runtime.producer_lease,

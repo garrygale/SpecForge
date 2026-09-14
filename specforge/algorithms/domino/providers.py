@@ -59,6 +59,19 @@ def step_options(config):
     return domino_strategy_kwargs(config)
 
 
+def resolve_optional_tensors(config):
+    """Request the captured target distribution only when the objective uses it.
+
+    ``target_last_hidden_states`` is optional for Domino: the CE-only objective
+    never reads it, so an online run must not depend on a capture server that
+    produces the ``last_hidden`` artifact.
+    """
+
+    if config.training.domino_l1_enabled:
+        return frozenset({"target_last_hidden_states"})
+    return frozenset()
+
+
 def resume_contract(config, draft_model, training_model):
     """Persist resolved Domino model, sampling, and objective semantics."""
 
@@ -159,7 +172,8 @@ def algorithm_spec() -> AlgorithmSpec:
             FeatureContract(
                 mode=FeatureMode.STREAMING,
                 modality="text",
-                required_tensors=ready,
+                required_tensors=ready - {"target_last_hidden_states"},
+                optional_tensors={"target_last_hidden_states"},
                 allowed_target_representations={"hidden_state"},
                 default_target_representation="hidden_state",
             ),
@@ -226,6 +240,7 @@ def algorithm_providers() -> AlgorithmProviders:
                     ),
                 ),
                 build_collator=collator,
+                resolve_optional_tensors=resolve_optional_tensors,
             ),
         ),
     )
@@ -235,4 +250,9 @@ def create_registration():
     return make_registration(algorithm_spec(), algorithm_providers())
 
 
-__all__ = ["algorithm_providers", "algorithm_spec", "create_registration"]
+__all__ = [
+    "algorithm_providers",
+    "algorithm_spec",
+    "create_registration",
+    "resolve_optional_tensors",
+]

@@ -308,8 +308,12 @@ by the draft config. Domino and DSpark additionally store the target model's
 final hidden state (`target_last_hidden_states`) for their L1/TV distillation
 objectives. A Domino dataset prepared before that objective existed has to be
 regenerated, because the reader now requires the tensor instead of ignoring
-it. Keep each strategy in a separate output directory; the offline reader
-validates the contract instead of silently adapting incompatible features.
+it. Online capture is stricter about what a run needs and looser about what a
+server must provide: a Domino run requests the `last_hidden` artifact only when
+`training.domino_l1_loss_alpha` enables the L1 objective, so a CE-only online
+run is unaffected by capture servers that never produced it. Keep each strategy
+in a separate output directory; the offline reader validates the contract
+instead of silently adapting incompatible features.
 
 DFlash2 feature preparation still uses `--strategy dflash`; pass a
 `DFlash2DraftModel` config such as `configs/qwen3.6-27b-dflash2.json` so capture

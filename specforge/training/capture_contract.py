@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import FrozenSet
 
+from specforge.algorithms.common.providers import ServerCaptureLayout
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
 
@@ -16,6 +18,76 @@ class ServerCaptureContract:
     target_hidden_size: int
     target_vocab_size: int
     draft_vocab_size: int
+
+
+@dataclass(frozen=True)
+class ResolvedStreamingCapture:
+    """The capture request this run actually issues.
+
+    ``required_features`` is the streaming contract's required set plus the
+    optional tensors the resolved objective consumes, and ``layout`` drops the
+    artifacts that back no needed tensor. A run whose objective never reads an
+    optional tensor therefore never asks the capture server for it.
+    """
+
+    required_features: FrozenSet[str]
+    layout: ServerCaptureLayout
+
+
+def resolve_streaming_capture(
+    cfg: Config,
+    *,
+    algorithm: AlgorithmRegistration,
+) -> ResolvedStreamingCapture:
+    """Resolve the effective streaming capture request for one run."""
+
+    modality = cfg.model.input_modality
+    streaming = algorithm.providers.server_streaming_for(modality)
+    contract = algorithm.spec.feature_contract("streaming", modality)
+    needed = frozenset()
+    if streaming.resolve_optional_tensors is not None:
+        needed = frozenset(streaming.resolve_optional_tensors(cfg))
+    undeclared = needed - contract.optional_tensors
+    if undeclared:
+        raise ValueError(
+            f"algorithm {algorithm.name!r} requested undeclared optional "
+            f"tensors {sorted(undeclared)} for modality {modality!r}"
+        )
+
+    layout = streaming.layout
+    last_hidden = layout.last_hidden_feature
+    if (
+        last_hidden is not None
+        and last_hidden in contract.optional_tensors
+        and last_hidden not in needed
+    ):
+        # The artifact backs an optional tensor this run does not consume, so
+        # keep it out of the capture request entirely.
+        layout = replace(layout, last_hidden_feature=None)
+
+    emitted = {
+        *(
+            feature
+            for feature in (
+                layout.aux_feature,
+                layout.last_hidden_feature,
+                layout.attention_mask_feature,
+            )
+            if feature is not None
+        ),
+        *(feature for feature, _payload, _shape in layout.passthrough),
+    }
+    unbacked = needed - emitted
+    if unbacked:
+        raise ValueError(
+            f"algorithm {algorithm.name!r} needs optional tensors "
+            f"{sorted(unbacked)} for modality {modality!r}, but its server "
+            f"capture layout only emits {sorted(emitted)}"
+        )
+    return ResolvedStreamingCapture(
+        required_features=frozenset(contract.required_tensors) | needed,
+        layout=layout,
+    )
 
 
 def resolve_server_capture_contract(
@@ -68,4 +140,9 @@ def resolve_server_capture_contract(
     )
 
 
-__all__ = ["ServerCaptureContract", "resolve_server_capture_contract"]
+__all__ = [
+    "ResolvedStreamingCapture",
+    "ServerCaptureContract",
+    "resolve_server_capture_contract",
+    "resolve_streaming_capture",
+]
