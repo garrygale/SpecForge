@@ -81,6 +81,57 @@ def get_layer_sliding_window(config, layer_idx: int) -> Optional[int]:
     return value
 
 
+def describe_sliding_draft_causal(config) -> tuple[bool, str]:
+    """Return ``(causal, reason)`` for the sliding draft-block mask decision.
+
+    ``dflash_config.causal`` is the only knob, exactly as in
+    ``_domino_layer_attention`` (vLLM's Qwen3 Domino) and
+    ``_dflash_layer_causal`` (vLLM's Qwen3 DFlash, also used by DSpark).
+
+    * Domino reads ``dflash_config.get("causal", False)`` for every layer, so
+      the default is non-causal: Ascend FIA/CUDA run the symmetric band
+      ``[q-(W-1), q+W]``.
+    * DFlash/DSpark read ``dflash_config.causal`` when present and otherwise
+      keep sliding layers causal (``next_tokens=0``, band ``[q-(W-1), q]``).
+
+    The reason string is used for launch-time logging so the resolved choice
+    is visible without re-reading the config.
+    """
+    method_config = _dflash_method_config(config)
+    override = method_config.get("causal")
+    if override is not None:
+        return bool(override), f"dflash_config.causal={bool(override)}"
+    if method_config.get("projector_type") == "domino":
+        return False, "dflash_config.causal not set -> Domino default false"
+    return True, "dflash_config.causal not set -> DFlash/DSpark default true"
+
+
+def resolve_sliding_draft_causal(config) -> bool:
+    """Whether sliding draft layers are served causal, read as serving reads it.
+
+    ``True`` keeps the causal draft block (``[q-(W-1), q]``); ``False`` lets
+    each query attend to its own block's other elements as well
+    (``[q-(W-1), q+W]``). Both modes keep the sliding lower bound and
+    ``kv < anchor``, so no target tap at or after the anchor leaks.
+    """
+    return describe_sliding_draft_causal(config)[0]
+
+
+def resolve_training_sliding_draft_causal(training_model, draft_model) -> bool:
+    """Resolve the sliding draft-block causality of a bound training wrapper.
+
+    Reads the flag the wrapper resolved at construction time, falling back to
+    the draft model's own attribute and finally to its config. Used by the
+    algorithm resume contracts so a resumed run keeps the same mask.
+    """
+    value = getattr(training_model, "sliding_draft_causal", None)
+    if value is None:
+        value = getattr(draft_model, "sliding_draft_causal", None)
+    if value is None:
+        value = resolve_sliding_draft_causal(getattr(draft_model, "config", None))
+    return bool(value)
+
+
 def has_sliding_window_attention(config) -> bool:
     """Return whether any instantiated DFlash layer uses SWA."""
     layer_types = getattr(config, "layer_types", None)
@@ -1180,6 +1231,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             get_layer_sliding_window(config, layer_idx)
             for layer_idx in range(config.num_hidden_layers)
         )
+        # Whether sliding layers keep the legacy causal-in-block training mask
+        # (True) or reproduce the served non-causal band (False). See
+        # ``resolve_sliding_draft_causal`` for the resolution order.
+        self.sliding_draft_causal = resolve_sliding_draft_causal(config)
         validate_dflash_attention_backend(
             config, getattr(config, "_attn_implementation", None)
         )

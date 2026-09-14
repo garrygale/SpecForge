@@ -13,7 +13,7 @@ from specforge.modeling.draft.dflash import (
 )
 
 
-def _draft_config(layer_types, sliding_window=None):
+def _draft_config(layer_types, sliding_window=None, dflash_config=None):
     config = Qwen3Config(
         architectures=["DFlashDraftModel"],
         block_size=2,
@@ -30,6 +30,8 @@ def _draft_config(layer_types, sliding_window=None):
         sliding_window=sliding_window,
         use_sliding_window=sliding_window is not None,
     )
+    if dflash_config is not None:
+        config.dflash_config = dict(dflash_config)
     config._attn_implementation = "sdpa"
     return config
 
@@ -51,8 +53,10 @@ class _RotaryStub(nn.Module):
         return (torch.empty(0), torch.empty(0))
 
 
-def _capture_model(layer_types, sliding_window=None):
-    model = DFlashDraftModel(_draft_config(layer_types, sliding_window))
+def _capture_model(layer_types, sliding_window=None, dflash_config=None):
+    model = DFlashDraftModel(
+        _draft_config(layer_types, sliding_window, dflash_config)
+    )
     capture_layers = [_CaptureLayer() for _ in layer_types]
     model.layers = nn.ModuleList(capture_layers)
     model.fc = nn.Identity()
@@ -178,6 +182,28 @@ class TestDFlashSlidingDispatch(unittest.TestCase):
 
 
 class TestDFlashSlidingConfig(unittest.TestCase):
+    def test_sliding_draft_causality_defaults_and_overrides(self):
+        """Draft models expose the sliding-layer causality the mask follows."""
+        # DFlash/DSpark keep causal sliding layers unless configured otherwise.
+        dflash = _capture_model(["sliding_attention"], sliding_window=8)[0]
+        self.assertTrue(dflash.sliding_draft_causal)
+
+        # Explicit opt-in to the served non-causal band, using the same
+        # dflash_config.causal field the service reads.
+        banded = _capture_model(
+            ["sliding_attention"],
+            sliding_window=8,
+            dflash_config={"causal": False},
+        )[0]
+        self.assertFalse(banded.sliding_draft_causal)
+
+        serving_causal = _capture_model(
+            ["sliding_attention"],
+            sliding_window=8,
+            dflash_config={"causal": True},
+        )[0]
+        self.assertTrue(serving_causal.sliding_draft_causal)
+
     def test_checked_in_qwen36_config_preserves_hybrid_layout(self):
         config_path = (
             Path(__file__).resolve().parents[2] / "configs" / "qwen3.6-27b-dflash.json"

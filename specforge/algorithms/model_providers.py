@@ -372,6 +372,37 @@ def build_peagle_model(
     return AlgorithmModelParts(model=model, target_head=target_head)
 
 
+def describe_draft_mask_choice(training_model: Any, draft_model: Any) -> str:
+    """One-line launch banner for the sliding draft-block mask choice.
+
+    Reports the mask the training forward will actually build, the per-layer
+    sliding windows, and where the causality decision came from, so a run log
+    shows it without opening the draft config.
+    """
+    from specforge.modeling.draft.dflash import describe_sliding_draft_causal
+
+    config_causal, reason = describe_sliding_draft_causal(
+        getattr(draft_model, "config", None)
+    )
+    causal = bool(getattr(training_model, "sliding_draft_causal", config_causal))
+    windows = tuple(getattr(draft_model, "layer_sliding_windows", ()) or ())
+    sliding_windows = tuple(window for window in windows if window is not None)
+    full_layers = sum(1 for window in windows if window is None)
+
+    if not sliding_windows:
+        return (
+            "[draft-mask] FULL ATTENTION on every draft layer "
+            f"(full_layers={full_layers}); dflash_config.causal has no effect"
+        )
+    mode = "DRAFT BLOCK CAUSAL" if causal else "DRAFT BLOCK NON-CAUSAL"
+    band = "q-(W-1)..q" if causal else "q-(W-1)..q+W"
+    return (
+        f"[draft-mask] {mode} (band={band}): "
+        f"sliding_layers={len(sliding_windows)} "
+        f"windows={list(sliding_windows)} full_layers={full_layers}; {reason}"
+    )
+
+
 def _build_dflash_family_model(
     cfg: Config,
     draft_model: Any,
@@ -411,6 +442,7 @@ def _build_dflash_family_model(
         "objective_chunk_blocks": cfg.training.objective_chunk_blocks,
     }
     model = model_factory(common).to(device=_device(), dtype=_torch_dtype(cfg))
+    print(describe_draft_mask_choice(model, draft_model))
     return AlgorithmModelParts(
         model=model,
         capture_layers=list(draft_model.target_layer_ids),

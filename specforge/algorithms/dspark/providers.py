@@ -49,6 +49,9 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved DSpark model, sampling, and objective semantics."""
+    from specforge.modeling.draft.dflash import (
+        resolve_training_sliding_draft_causal,
+    )
 
     return {
         "dspark_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
@@ -59,6 +62,9 @@ def resume_contract(_config, draft_model, training_model):
         "dspark_mask_token_id": int(training_model.mask_token_id),
         "dspark_attention_backend": str(training_model.attention_backend),
         "dspark_num_anchors": int(training_model.num_anchors),
+        "dspark_sliding_draft_causal": resolve_training_sliding_draft_causal(
+            training_model, draft_model
+        ),
         "dspark_loss_decay_gamma": training_model.loss_decay_gamma,
         "dspark_ce_loss_alpha": float(training_model.dspark_ce_loss_alpha),
         "dspark_l1_loss_alpha": float(training_model.dspark_l1_loss_alpha),

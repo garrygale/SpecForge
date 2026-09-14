@@ -77,6 +77,11 @@ The exported draft `config.json` must use:
 * `dflash_config.target_hidden_size`: 2048 / 5120 respectively
 * `dflash_config.sliding_window`: the per-layer list if the training config
   used one
+* `dflash_config.causal`: causality of the draft attention; absent means
+  `false`, which is the non-causal symmetric band (`sparse_mode=4` with
+  `pre_tokens=next_tokens=W`). Training reads this same field, so a draft
+  trained with the default already matches the service; only set `true` to run
+  (and retrain) the causal variant
 * `dflash_config.qat_w_bit`: 4 (W4A8 bulk) with `qat_w4a4_layers`
 
 The target auxiliary hidden states are looked up under

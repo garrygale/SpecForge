@@ -29,6 +29,10 @@ class _DFlashDraftStub(nn.Module):
 
 
 _stub_dflash_draft.DFlashDraftModel = _DFlashDraftStub
+# The real resolver lives in the modeling stack this harness deliberately
+# avoids importing. The stub drafts below declare no sliding layers, so the
+# historical causal default keeps these formula tests on the legacy mask.
+_stub_dflash_draft.resolve_sliding_draft_causal = lambda config: True
 
 _spec = importlib.util.spec_from_file_location(
     "specforge.algorithms.common.dflash_family_model",

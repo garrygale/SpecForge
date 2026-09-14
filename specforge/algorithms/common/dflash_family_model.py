@@ -9,7 +9,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from specforge.core.chunking import checkpointed_chunk_reduce
-from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.modeling.draft.dflash import (
+    DFlashDraftModel,
+    resolve_sliding_draft_causal,
+)
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
 
 try:
@@ -95,8 +98,20 @@ def create_dflash_sdpa_mask(
     block_size,
     device,
     sliding_window: Optional[int] = None,
+    sliding_draft_causal: bool = False,
 ):
-    """Construct a full or sliding dense boolean DFlash mask."""
+    """Construct a full or sliding dense boolean DFlash mask.
+
+    ``sliding_draft_causal`` selects the draft-half visibility of a sliding
+    layer. ``False`` (the default, and what Domino serves) reproduces the
+    served symmetric band ``[q-(W-1), q+W]`` inside the query's own block —
+    draft positions may read their block's other elements, while the sliding
+    lower bound still drops old positions. ``True`` keeps the legacy causal
+    draft block (``[q-(W-1), q]``), which is what DFlash/DSpark serve; for
+    ``W >= block_size`` it is identical to the historical causal mask.
+    ``OnlineDFlashModel`` sets this from ``dflash_config.causal`` — the same
+    field vLLM / vLLM-Ascend read — via ``resolve_sliding_draft_causal``.
+    """
 
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError("sliding_window must be > 0")
@@ -127,7 +142,20 @@ def create_dflash_sdpa_mask(
     mask_draft = is_draft & (q_block_ids == kv_block_ids)
     if sliding_window is not None:
         kv_block_offsets = (kv_indices - S) % block_size
-        mask_draft = mask_draft & (kv_block_offsets <= q_block_offsets)
+        # Both served bands share the sliding lower bound; they differ only in
+        # their forward half. Domino serves sliding layers non-causally: the
+        # symmetric band `[q-(W-1), q+W]` (Ascend FIA sparse_mode=4 with
+        # pre_tokens=next_tokens=W; CUDA symmetrizes the same way). DFlash and
+        # DSpark serve the causal band `[q-(W-1), q]`.
+        draft_forward_reach = (
+            q_block_offsets
+            if sliding_draft_causal
+            else q_block_offsets + sliding_window
+        )
+        mask_draft = mask_draft & (
+            (kv_block_offsets >= q_block_offsets - (sliding_window - 1))
+            & (kv_block_offsets <= draft_forward_reach)
+        )
 
     valid_block = block_keep_mask.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
 
@@ -143,8 +171,13 @@ def create_dflash_block_mask(
     device: torch.device,
     flex_block_size=None,
     sliding_window: Optional[int] = None,
+    sliding_draft_causal: bool = False,
 ):
-    """Construct a full or sliding Flex Attention mask for DFlash training."""
+    """Construct a full or sliding Flex Attention mask for DFlash training.
+
+    ``sliding_draft_causal`` mirrors :func:`create_dflash_sdpa_mask` and is set
+    from ``dflash_config.causal``.
+    """
 
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError("sliding_window must be > 0")
@@ -169,7 +202,15 @@ def create_dflash_block_mask(
         mask_draft = is_draft & (q_block_id == kv_block_id)
         if sliding_window is not None:
             kv_block_offset = (kv_idx - S) % block_size
-            mask_draft = mask_draft & (kv_block_offset <= q_block_offset)
+            draft_forward_reach = (
+                q_block_offset
+                if sliding_draft_causal
+                else q_block_offset + sliding_window
+            )
+            mask_draft = mask_draft & (
+                (kv_block_offset >= q_block_offset - (sliding_window - 1))
+                & (kv_block_offset <= draft_forward_reach)
+            )
 
         is_valid_block = block_keep_mask[b, safe_q_block_id]
         in_bounds = q_block_id < N
@@ -238,6 +279,16 @@ class OnlineDFlashModel(nn.Module):
             )
 
         self.draft_model = draft_model
+        # Sliding-window layers must train against the KV visibility they will
+        # see in serving, so this mirrors the served decision read from
+        # ``dflash_config.causal`` by the vLLM / vLLM-Ascend draft models.
+        self.sliding_draft_causal = bool(
+            getattr(
+                draft_model,
+                "sliding_draft_causal",
+                resolve_sliding_draft_causal(getattr(draft_model, "config", None)),
+            )
+        )
         self.lm_head = target_lm_head
         self.embed_tokens = target_embed_tokens
         self.block_size = block_size
@@ -460,7 +511,11 @@ class OnlineDFlashModel(nn.Module):
                 (
                     full_attn_mask
                     if window is None
-                    else mask_builder(**mask_args, sliding_window=window)
+                    else mask_builder(
+                        **mask_args,
+                        sliding_window=window,
+                        sliding_draft_causal=self.sliding_draft_causal,
+                    )
                 )
                 for window in layer_sliding_windows
             ]
@@ -473,6 +528,7 @@ class OnlineDFlashModel(nn.Module):
                     "sliding_attention": mask_builder(
                         **mask_args,
                         sliding_window=sliding_window,
+                        sliding_draft_causal=self.sliding_draft_causal,
                     ),
                 }
 

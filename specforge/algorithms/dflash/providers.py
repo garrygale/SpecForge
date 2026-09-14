@@ -53,6 +53,9 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved DFlash architecture, sampling, and loss semantics."""
+    from specforge.modeling.draft.dflash import (
+        resolve_training_sliding_draft_causal,
+    )
 
     contract = {
         "dflash_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
@@ -63,6 +66,9 @@ def resume_contract(_config, draft_model, training_model):
         "dflash_mask_token_id": int(training_model.mask_token_id),
         "dflash_attention_backend": str(training_model.attention_backend),
         "dflash_num_anchors": int(training_model.num_anchors),
+        "dflash_sliding_draft_causal": resolve_training_sliding_draft_causal(
+            training_model, draft_model
+        ),
         "dflash_loss_decay_gamma": training_model.loss_decay_gamma,
         "dflash_loss_type": str(training_model.loss_type),
         "dflash_dpace_alpha": float(training_model.dpace_alpha),

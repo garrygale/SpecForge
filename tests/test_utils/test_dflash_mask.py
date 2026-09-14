@@ -21,10 +21,15 @@ def _reference_dflash_mask(
     block_size,
     device,
     sliding_window=None,
+    sliding_draft_causal=False,
 ):
     """Element-level reference for full and sliding DFlash attention.
 
     This uses plain Python loops so correctness is obvious by inspection.
+
+    ``sliding_draft_causal=False`` (the training default) mirrors the served
+    non-causal draft band: each query reads the sliding window's forward half
+    inside its own block. ``True`` keeps the causal draft block.
     """
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
@@ -53,7 +58,14 @@ def _reference_dflash_mask(
                     ctx_visible = ctx_visible and (
                         kv_idx >= anchor_pos + q_offset - (sliding_window - 1)
                     )
-                    draft_visible = draft_visible and kv_offset <= q_offset
+                    draft_forward_reach = (
+                        q_offset
+                        if sliding_draft_causal
+                        else q_offset + sliding_window
+                    )
+                    draft_visible = draft_visible and (
+                        kv_offset >= q_offset - (sliding_window - 1)
+                    ) and (kv_offset <= draft_forward_reach)
 
                 if ctx_visible or draft_visible:
                     mask[b, 0, q_idx, kv_idx] = True
@@ -79,7 +91,7 @@ class TestDFlashMask(unittest.TestCase):
 
     def setUp(self):
         torch.manual_seed(42)
-        self.device = torch.device("cuda")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def _compare_masks(
         self,
@@ -88,6 +100,7 @@ class TestDFlashMask(unittest.TestCase):
         S,
         block_size,
         sliding_window=None,
+        sliding_draft_causal=False,
     ):
         """Compare create_dflash_sdpa_mask against element-level reference (ground truth)."""
         anchor_positions = anchor_positions.to(self.device)
@@ -100,6 +113,7 @@ class TestDFlashMask(unittest.TestCase):
             block_size=block_size,
             device=self.device,
             sliding_window=sliding_window,
+            sliding_draft_causal=sliding_draft_causal,
         )
 
         ref_mask = _reference_dflash_mask(
@@ -109,6 +123,7 @@ class TestDFlashMask(unittest.TestCase):
             block_size=block_size,
             device=self.device,
             sliding_window=sliding_window,
+            sliding_draft_causal=sliding_draft_causal,
         )
 
         self.assertEqual(
@@ -120,6 +135,7 @@ class TestDFlashMask(unittest.TestCase):
             torch.equal(sdpa_mask, ref_mask),
             f"Mask mismatch with S={S}, block_size={block_size}, "
             f"sliding_window={sliding_window}, anchors={anchor_positions.tolist()}, "
+            f"sliding_draft_causal={sliding_draft_causal}, "
             f"keep={block_keep_mask.tolist()}\n"
             f"Diff positions: {(sdpa_mask != ref_mask).nonzero(as_tuple=False).tolist()}",
         )
@@ -131,6 +147,7 @@ class TestDFlashMask(unittest.TestCase):
         S,
         block_size,
         sliding_window=None,
+        sliding_draft_causal=False,
     ):
         """Verify create_dflash_block_mask block-level mask is consistent with reference."""
         anchor_positions = anchor_positions.to(self.device)
@@ -143,6 +160,7 @@ class TestDFlashMask(unittest.TestCase):
             block_size=block_size,
             device=self.device,
             sliding_window=sliding_window,
+            sliding_draft_causal=sliding_draft_causal,
         )
 
         ref_mask = _reference_dflash_mask(
@@ -152,6 +170,7 @@ class TestDFlashMask(unittest.TestCase):
             block_size=block_size,
             device=self.device,
             sliding_window=sliding_window,
+            sliding_draft_causal=sliding_draft_causal,
         )
 
         dense_blocks = block_mask.to_dense()  # (B, H, Q_blocks, KV_blocks)
@@ -232,18 +251,40 @@ class TestDFlashMask(unittest.TestCase):
         block_keep_mask = torch.tensor([[True, True, True]])
         self._compare_masks(anchor_positions, block_keep_mask, S=64, block_size=1)
 
+    def _sliding_mask(self, sliding_window, block_size=4, S=12, anchor=6,
+                      sliding_draft_causal=False):
+        return create_dflash_sdpa_mask(
+            anchor_positions=torch.tensor([[anchor]]).to(self.device),
+            block_keep_mask=torch.tensor([[True]]).to(self.device),
+            S=S,
+            block_size=block_size,
+            device=self.device,
+            sliding_window=sliding_window,
+            sliding_draft_causal=sliding_draft_causal,
+        )
+
     def test_sliding_window_moves_with_query_offset(self):
-        """The context window advances while the draft block stays causal."""
+        """Context window advances; the draft block is non-causal by default."""
+        mask = self._sliding_mask(sliding_window=4)
+        # Band [q-(W-1), q+W] inside the own block, sliding context behind the
+        # anchor: every query sees all four block elements (12..15) plus its
+        # context window.
+        expected_visible_keys = (
+            [3, 4, 5, 12, 13, 14, 15],
+            [4, 5, 12, 13, 14, 15],
+            [5, 12, 13, 14, 15],
+            [12, 13, 14, 15],
+        )
+        for query_offset, expected in enumerate(expected_visible_keys):
+            with self.subTest(query_offset=query_offset):
+                actual = mask[0, 0, query_offset].nonzero().flatten().tolist()
+                self.assertEqual(actual, expected)
+
+    def test_sliding_window_causal_draft_option(self):
+        """``sliding_draft_causal=True`` gives the served causal band."""
+        mask = self._sliding_mask(sliding_window=4, sliding_draft_causal=True)
         anchor_positions = torch.tensor([[6]])
         block_keep_mask = torch.tensor([[True]])
-        mask = create_dflash_sdpa_mask(
-            anchor_positions=anchor_positions.to(self.device),
-            block_keep_mask=block_keep_mask.to(self.device),
-            S=12,
-            block_size=4,
-            device=self.device,
-            sliding_window=4,
-        )
         expected_visible_keys = (
             [3, 4, 5, 12],
             [4, 5, 12, 13],
@@ -255,8 +296,8 @@ class TestDFlashMask(unittest.TestCase):
                 actual = mask[0, 0, query_offset].nonzero().flatten().tolist()
                 self.assertEqual(actual, expected)
 
-    def test_sliding_window_one_has_no_context_and_causal_draft(self):
-        """A one-token window removes context but keeps causal own-block keys."""
+    def test_sliding_window_one_has_no_context_and_banded_draft(self):
+        """A one-token window keeps only the block's own band (no context)."""
         anchor_positions = torch.tensor([[4, 9]])
         block_keep_mask = torch.tensor([[True, True]])
         self._compare_masks(
@@ -266,6 +307,34 @@ class TestDFlashMask(unittest.TestCase):
             block_size=3,
             sliding_window=1,
         )
+        mask = self._sliding_mask(sliding_window=1, block_size=3, anchor=4)
+        # W=1 -> block offsets [j, j+1] (kv slots S+j); context window empty.
+        expected_visible_keys = ([12, 13], [13, 14], [14])
+        for query_offset, expected in enumerate(expected_visible_keys):
+            with self.subTest(query_offset=query_offset):
+                actual = mask[0, 0, query_offset].nonzero().flatten().tolist()
+                self.assertEqual(actual, expected)
+
+    def test_sliding_window_legacy_causal_draft_mask_consistency(self):
+        anchor_positions = torch.tensor([[12, 24]])
+        block_keep_mask = torch.tensor([[True, True]])
+        self._compare_block_mask_consistency(
+            anchor_positions,
+            block_keep_mask,
+            S=32,
+            block_size=4,
+            sliding_window=8,
+            sliding_draft_causal=True,
+        )
+
+    def test_sliding_draft_never_reads_future_target_taps(self):
+        """Non-causal draft blocks still exclude target taps at/after the anchor."""
+        anchor_positions = torch.tensor([[6]])
+        block_keep_mask = torch.tensor([[True]])
+        mask = self._sliding_mask(sliding_window=8, anchor=6, S=12)
+        # Context columns >= S are block slots; context slot 6..11 must stay
+        # closed even though the block half is non-causal.
+        self.assertFalse(bool(mask[0, 0, :, 6:12].any()))
 
     def test_sliding_window_block_mask_consistency(self):
         anchor_positions = torch.tensor([[12, 24]])

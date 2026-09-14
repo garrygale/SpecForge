@@ -237,6 +237,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             "dflash": {
                 "dflash_block_size",
                 "dflash_num_anchors",
+                "dflash_sliding_draft_causal",
                 "dflash_loss_type",
                 "dflash_dpace_alpha",
                 "dflash_lk_loss_type",
@@ -246,6 +247,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             "domino": {
                 "domino_block_size",
                 "domino_shift_label",
+                "domino_sliding_draft_causal",
                 "domino_pure_draft_prefix_len",
                 "domino_lambda_base_start",
                 "domino_lambda_base_decay_ratio",
@@ -256,6 +258,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             },
             "dspark": {
                 "dspark_block_size",
+                "dspark_sliding_draft_causal",
                 "dspark_ce_loss_alpha",
                 "dspark_l1_loss_alpha",
                 "dspark_confidence_head_alpha",

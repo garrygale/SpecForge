@@ -176,6 +176,40 @@ Use `"full_attention"` for every entry, `"use_sliding_window": false`, and
 `num_hidden_layers`. A layer-count override may resize a uniform layout, but a
 mixed layout must be edited explicitly in the draft JSON.
 
+##### Sliding-window draft-block visibility
+
+Serving applies the per-layer window to the draft's own attention, so the
+training mask has to describe the same KV visibility or the draft is trained
+against a different attention pattern than it runs with. Training therefore
+reads the served causality decision from the same field the service does:
+
+* Domino's `_domino_layer_attention` reads
+  `dflash_config.get("causal", False)` for every layer, so the default is
+  non-causal: Ascend FIA runs `sparse_mode=4` with `pre_tokens=next_tokens=W`
+  (the CUDA backends symmetrize the window the same way) and every draft query
+  reads the other elements of its own block inside `[q-(W-1), q+W]`. Training
+  matches that band by default.
+* DFlash and DSpark read `dflash_config.causal` when it is set and otherwise
+  keep sliding layers causal: `[q-(W-1), q]`.
+
+There is no separate training flag: `dflash_config.causal` is the only knob,
+and it is the field the service reads, so training and serving flip together.
+Both modes keep the sliding lower bound and never expose target taps at or
+after the anchor, so no label information leaks into the draft block. Windows
+below `block_size` make the served band truncate the block itself; keep
+`W >= block_size`. A global `"causal": true` also makes *full*-attention layers
+causal at serving, which the draft mask cannot express, so avoid it on mixed
+sliding/full layouts.
+
+The resolved choice is printed once when the training model is built, so a run
+log states it without opening the draft config:
+
+```text
+[draft-mask] DRAFT BLOCK NON-CAUSAL (band=q-(W-1)..q+W): sliding_layers=7 \
+windows=[3072, 2048, 512, 512, 1024, 1024, 3072] full_layers=0; \
+dflash_config.causal not set -> Domino default false
+```
+
 The `eager`, `sdpa`, and `flex_attention` backends support both layouts.
 
 ### DFlash2
