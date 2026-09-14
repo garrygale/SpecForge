@@ -1400,10 +1400,19 @@ def build_disagg_online_producer(
             st = controller.status()
             stopped = should_stop is not None and should_stop()
             if st["prompts_failed"] and not stopped:
+                reasons = sorted(
+                    {
+                        reason
+                        for w in workers
+                        for reason in w.health().get("recent_failures", ())
+                    }
+                )
                 raise RuntimeError(
                     "producer finished with "
                     f"{st['prompts_failed']} terminally failed prompt(s); "
-                    "refusing to publish a successful EOF for partial data"
+                    "refusing to publish a successful EOF for partial data. "
+                    f"produced={state['produced']} capture_failure_reasons="
+                    f"{reasons[:3] if reasons else 'unrecorded'}"
                 )
             if not stopped and (st["prompts_pending"] or st["prompts_leased"]):
                 raise RuntimeError(

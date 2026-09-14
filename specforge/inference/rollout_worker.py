@@ -20,6 +20,7 @@ schema, not here.
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Any, Dict, List, Optional, Protocol
 
@@ -33,6 +34,13 @@ from specforge.runtime.contracts import PromptTask, SampleRef
 
 # health states: a worker REPORTS health; the controller decides scheduling.
 HEALTH_STATES = ("starting", "ready", "paused", "draining", "unhealthy", "stopped")
+
+#: Repeat the same capture failure reason at most once per this many
+#: occurrences, so a systematic contract mismatch is visible in the logs
+#: without flooding them per sample.
+_FAILURE_LOG_EVERY = 64
+
+logger = logging.getLogger(__name__)
 
 
 class FeatureSource(Protocol):
@@ -82,6 +90,7 @@ class RolloutWorker:
         self._inflight = 0
         self._recent_failures: List[str] = []
         self._last_commit_count = 0
+        self._failure_counts: Dict[str, int] = {}
         self.worker_id = controller.register_rollout_worker(
             {"worker_id": worker_id, "strategy": strategy, "role": "rollout"}
         )
@@ -115,6 +124,18 @@ class RolloutWorker:
     def _record_failure(self, reason: str) -> None:
         with self._health_lock:
             self._recent_failures.append(reason)
+            count = self._failure_counts.get(reason, 0) + 1
+            self._failure_counts[reason] = count
+        # A capture failure is the reason a run can publish nothing at all, so
+        # surface it (and its first occurrence) instead of only recording it in
+        # the health snapshot the driver never prints.
+        if count == 1 or count % _FAILURE_LOG_EVERY == 0:
+            logger.warning(
+                "rollout worker %s capture failed (%d time(s)): %s",
+                self.worker_id,
+                count,
+                reason,
+            )
 
     def _record_commit(self, count: int) -> None:
         with self._health_lock:
@@ -343,6 +364,7 @@ class RolloutWorker:
                 "draft_weight_version": self.draft_weight_version,
                 "in_flight": self._inflight,
                 "recent_failures": self._recent_failures[-5:],
+                "failure_counts": dict(self._failure_counts),
                 "committed": self._last_commit_count,
             }
 

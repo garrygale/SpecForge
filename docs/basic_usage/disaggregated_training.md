@@ -369,6 +369,39 @@ The `external`/`managed-local` subdivision applies only to online
 disaggregation. Offline disaggregation has no capture-server lifecycle and is
 instead distinguished by its `shared_dir` or Mooncake feature-store backend.
 
+### When the inbox stays empty
+
+Rank 0 writes `inbox-rank<N>.jsonl` only once a whole optimizer window is
+committed (`dp_size × batch_size × accumulation_steps` refs), so an inbox is
+empty until the producer has published at least that many samples. The producer
+logs `published refs ... produced=N` as it captures, and a run with zero
+published refs now aborts instead of draining quietly.
+
+When that happens, the producer log and the channel's `.failed` sidecar name the
+reason:
+
+| Message | Cause |
+| --- | --- |
+| `response carries no spec_capture result` | The capture server is not patched with `patches/sglang/v0.5.18/spec-capture.patch`, or it was started without `--enable-spec-capture`. |
+| `capture missing features [...]` | The server returned fewer artifacts than the run needs — for example `target_last_hidden_states` on a build without the last-hidden plumbing, or a model path whose capture does not yield it. |
+| `captured seq len != prompt len` | Chunked prefill is enabled; the capture server needs `--chunked-prefill-size -1`. |
+| `capture omitted aux-layer ids` | The server was started without `--spec-capture-aux-layer-ids` matching the draft config. |
+| `consumer failed before publishing its optimizer window` | The consumer aborted first; read its traceback or the `.consumer_failed` sidecar. |
+| `fresh online attempt cannot reuse a ledger` | A reused `consumer_state_dir` still holds committed samples: resume with `training.resume_from`, or point the run at a fresh state dir. |
+
+To check the server in one request, mirroring exactly what the run asks for:
+
+```bash
+python scripts/probe_capture_server.py \
+  --server-url http://127.0.0.1:30000 \
+  --target-model-path Qwen/Qwen3.6-35B-A3B \
+  --draft-model-config configs/qwen3.6-35b-a3b-domino-dflare-verifiedBase.json
+# add --l1 to probe the Domino CE+L1 request (needs the last_hidden artifact)
+```
+
+The probe prints the requested artifacts, the artifacts the server returned,
+and the client-side reason it would reject the capture.
+
 For the strict e2e one-sample overfit and serving validation procedure, follow
 [`scripts/gates/README.md`](../../scripts/gates/README.md).
 

@@ -867,6 +867,58 @@ class TestLoaderGcPump(unittest.TestCase):
 class TestServerCaptureProducerWiring(unittest.TestCase):
     """The example's exact path: build_disagg_online_producer(feature_source=...)."""
 
+    def test_producer_reports_why_nothing_was_published(self):
+        """An empty inbox must come with the capture reason, not silence.
+
+        The L1-enabled Domino capture requires the teacher artifact, so a
+        server without it rejects every sample: the run must abort with that
+        reason instead of draining quietly and leaving the inbox empty.
+        """
+
+        from specforge.launch import build_disagg_online_producer
+        from specforge.runtime.data_plane.streaming_ref_channel import (
+            StreamingRefChannel,
+        )
+
+        backend = _FakeMooncakeStore()
+        server = _StubCaptureServer(backend, supports_last_hidden=False)
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        schema, capture = _domino_capture(l1_alpha=0.9)
+        adapter = SGLangServerCaptureAdapter(
+            "http://server:30000",
+            store,
+            run_id="run0",
+            algorithm="domino",
+            schema=schema,
+            post_fn=server,
+        )
+        prompts = [
+            {"payload": {"input_ids": list(range(1, 6)), "loss_mask": [1] * 5}},
+            {"payload": {"input_ids": list(range(1, 7)), "loss_mask": [1] * 6}},
+        ]
+        channel = StreamingRefChannel(
+            os.path.join(tempfile.mkdtemp(prefix="sc_fail_"), "refs.jsonl")
+        )
+        channel.publish_consumer_quantum(2)
+        _workers, drive = build_disagg_online_producer(
+            algorithm=builtin_algorithm_registry().resolve("domino"),
+            feature_source=adapter,
+            prompts=prompts,
+            feature_store=store,
+            channel=channel,
+            run_id="run0",
+            target_hidden_size=HIDDEN,
+            target_repr="hidden_state",
+            aux_hidden_state_layer_ids=AUX_LAYERS,
+            required_features=capture.feature_names,
+            producer_concurrency=1,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "target_last_hidden_states"):
+            drive()
+        self.assertEqual(0, channel.published)
+        self.assertIsNotNone(channel.failure())
+
     def test_producer_streams_refs_via_feature_source(self):
         from specforge.launch import build_disagg_online_producer
         from specforge.runtime.data_plane.streaming_ref_channel import (
