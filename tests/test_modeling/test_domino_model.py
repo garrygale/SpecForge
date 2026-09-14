@@ -499,8 +499,8 @@ class TestDominoDraftModel(unittest.TestCase):
                 draft=prototype,
                 head=head,
                 embedding=embedding,
-                ce_loss_alpha=1.0,
-                l1_loss_alpha=0.25,
+                ce_loss_alpha=0.1,
+                l1_loss_alpha=0.9,
                 **overrides,
             )
             return model(
@@ -530,44 +530,88 @@ class TestDominoDraftModel(unittest.TestCase):
         self.assertGreater(float(both["base_l1_loss"]), 0.0)
         self.assertGreater(float(both["final_l1_loss"]), 0.0)
 
-        lambda_base, ce_alpha, l1_alpha = 0.4, 1.0, 0.25
+        lambda_base, ce_alpha, l1_alpha = 0.4, 0.1, 0.9
         final_scale = 1.0 - lambda_base
         base_scale = lambda_base
 
-        def mixed(metrics, path):
-            return ce_alpha * float(metrics[f"{path}_loss"])
+        def objective(metrics, path, *, tv_loss):
+            """The documented per-path objective for one measured pair."""
 
-        ce_only_base = base_scale * mixed(ce_only, "base")
-        ce_only_final = final_scale * mixed(ce_only, "final")
+            ce = float(metrics[f"{path}_loss"])
+            if not tv_loss:
+                return ce
+            return ce_alpha * ce + l1_alpha * float(metrics[f"{path}_l1_loss"])
+
+        # A disabled path stays full-weight CE: with ce_alpha=0.1 the base path
+        # must still contribute 1.0 * CE, not 0.1 * CE.
         self.assertAlmostEqual(
             float(ce_loss.detach()),
-            ce_only_final + ce_only_base,
+            final_scale * objective(ce_only, "final", tv_loss=False)
+            + base_scale * objective(ce_only, "base", tv_loss=False),
             places=6,
-        )
-        final_only_corrected = mixed(final_only, "final") + l1_alpha * float(
-            final_only["final_l1_loss"]
         )
         self.assertAlmostEqual(
             float(final_loss_value.detach()),
-            final_scale * final_only_corrected
-            + base_scale * mixed(final_only, "base"),
+            final_scale * objective(final_only, "final", tv_loss=True)
+            + base_scale * objective(final_only, "base", tv_loss=False),
             places=6,
-        )
-        base_only_base = mixed(base_only, "base") + l1_alpha * float(
-            base_only["base_l1_loss"]
         )
         self.assertAlmostEqual(
             float(base_loss_value.detach()),
-            final_scale * mixed(base_only, "final")
-            + base_scale * base_only_base,
+            final_scale * objective(base_only, "final", tv_loss=False)
+            + base_scale * objective(base_only, "base", tv_loss=True),
             places=6,
         )
-        expected_both = final_scale * (
-            mixed(both, "final") + l1_alpha * float(both["final_l1_loss"])
-        ) + base_scale * (
-            mixed(both, "base") + l1_alpha * float(both["base_l1_loss"])
+        self.assertAlmostEqual(
+            float(both_loss.detach()),
+            final_scale * objective(both, "final", tv_loss=True)
+            + base_scale * objective(both, "base", tv_loss=True),
+            places=6,
         )
-        self.assertAlmostEqual(float(both_loss.detach()), expected_both, places=6)
+
+    def test_disabled_tv_path_keeps_full_weight_ce(self):
+        """A path with its TV term off trains with plain CE, at any alpha.
+
+        Regression for the mixed-objective reading: ``domino_ce_loss_alpha``
+        and ``domino_l1_loss_alpha`` describe the CE/TV mix inside an
+        L1-enabled path, never a global CE scale. With ce=0.1, l1=0.9, the base
+        toggle off and the corrected toggle on, the base path must keep weight
+        1.0 * CE rather than collapsing to 0.1 * CE.
+        """
+
+        torch.manual_seed(7)
+        hidden_size, vocab_size, block_size = 4, 7, 4
+        model = self._fixed_blocks_model(
+            anchors=torch.tensor([[0, 3]]),
+            keep_mask=torch.ones(1, 2, dtype=torch.bool),
+            output_hidden=torch.randn(1, 2 * block_size, hidden_size),
+            block_size=block_size,
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            ce_loss_alpha=0.1,
+            l1_loss_alpha=0.9,
+            base_tv_loss=False,
+            final_tv_loss=True,
+        )
+        loss, _accuracy, metrics = model(
+            input_ids=torch.tensor([[1, 2, 3, 4, 5, 6, 0, 1]]),
+            hidden_states=torch.zeros(1, 2 * block_size, hidden_size),
+            loss_mask=torch.ones(1, 2 * block_size),
+            target_last_hidden_states=torch.randn(1, 8, hidden_size),
+            lambda_base=0.5,
+        )
+
+        final_objective = 0.1 * float(metrics["final_loss"]) + 0.9 * float(
+            metrics["final_l1_loss"]
+        )
+        expected = 0.5 * final_objective + 0.5 * float(metrics["base_loss"])
+        self.assertAlmostEqual(float(loss.detach()), expected, places=6)
+
+        # The pre-fix composition scaled the CE-only base path by ce_alpha.
+        rescaled_base = 0.5 * final_objective + 0.5 * 0.1 * float(
+            metrics["base_loss"]
+        )
+        self.assertNotAlmostEqual(float(loss.detach()), rescaled_base, places=4)
 
     def test_chunked_l1_tv_matches_full_objective_and_gradients(self):
         from specforge.algorithms.common.dflash_family_model import OnlineDominoModel

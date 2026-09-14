@@ -1044,6 +1044,26 @@ class OnlineDominoModel(OnlineDFlashModel):
             ).sum()
         return base_l1_num, final_l1_num
 
+    def _domino_path_objective(
+        self,
+        ce_loss: torch.Tensor,
+        l1_loss: torch.Tensor,
+        *,
+        tv_loss: bool,
+    ) -> torch.Tensor:
+        """Compose one Domino path: plain CE, or the weighted CE + L1 mix.
+
+        The alphas describe how CE and L1(TV) are mixed when the path's TV term
+        is active. A path whose toggle is off (or a run with L1 disabled
+        entirely) trains with its unweighted CE, so the alphas can never
+        rescale a CE-only objective: ``domino_ce_loss_alpha=0.1`` with the base
+        TV toggle off still gives the base path weight 1.
+        """
+
+        if not tv_loss or self.domino_l1_loss_alpha <= 0.0:
+            return ce_loss
+        return self.domino_ce_loss_alpha * ce_loss + self.domino_l1_loss_alpha * l1_loss
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1159,17 +1179,21 @@ class OnlineDominoModel(OnlineDFlashModel):
         final_l1_loss = final_l1_num / valid_token_count
         base_l1_loss = base_l1_num / valid_token_count
 
-        # CE and L1(TV) mix independently per path: each toggle selects pure CE
-        # or CE + TV for that part of the Domino loss, and lambda_base keeps
+        # CE and L1(TV) mix independently per path: a path with its TV term
+        # active contributes ce_alpha * CE + l1_alpha * L1, while a path with
+        # the toggle off keeps its unweighted CE, because the alphas describe
+        # that CE/TV mix rather than a global CE scale. lambda_base keeps
         # blending the corrected path against the base path exactly as before.
-        ce_alpha = self.domino_ce_loss_alpha
-        l1_alpha = self.domino_l1_loss_alpha
-        base_objective = ce_alpha * base_loss
-        if self.domino_base_tv_loss:
-            base_objective = base_objective + l1_alpha * base_l1_loss
-        final_objective = ce_alpha * final_loss
-        if self.domino_final_tv_loss:
-            final_objective = final_objective + l1_alpha * final_l1_loss
+        base_objective = self._domino_path_objective(
+            base_loss,
+            base_l1_loss,
+            tv_loss=self.domino_base_tv_loss,
+        )
+        final_objective = self._domino_path_objective(
+            final_loss,
+            final_l1_loss,
+            tv_loss=self.domino_final_tv_loss,
+        )
 
         loss = (1.0 - lambda_base) * final_objective + lambda_base * base_objective
         accuracy = correct_num / (accuracy_denom + 1e-6)

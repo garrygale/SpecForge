@@ -255,17 +255,27 @@ variation distance), weighted by the same per-token loss mask and decay:
 ```yaml
 training:
   strategy: domino
-  domino_ce_loss_alpha: 1.0    # weight of the CE term on both paths
-  domino_l1_loss_alpha: 0.9    # weight of the L1(TV) distillation term
-  domino_base_tv_loss: false   # base path: pure CE (false) or CE + L1 (true)
-  domino_final_tv_loss: true   # corrected path: pure CE (false) or CE + L1
+  domino_ce_loss_alpha: 0.1    # CE weight inside an L1-enabled path
+  domino_l1_loss_alpha: 0.9    # L1(TV) weight inside an L1-enabled path
+  domino_base_tv_loss: false   # base path: plain CE (false) or 0.1*CE + 0.9*L1
+  domino_final_tv_loss: true   # corrected path: plain CE (false) or CE + L1
 ```
 
-The toggles select pure CE or CE + L1 independently for the base and corrected
-parts, and `lambda_base` keeps blending the two parts exactly as before:
+The toggles select the objective independently per path, and the alphas apply
+only where the TV term is active:
+
+| Path toggle | Objective for that path |
+| --- | --- |
+| `false` | `CE` — plain cross-entropy with weight 1; the alphas do not apply |
+| `true` | `domino_ce_loss_alpha · CE + domino_l1_loss_alpha · L1` |
+
+`lambda_base` keeps blending the two parts exactly as before:
 `loss = (1 - lambda_base) * final_objective + lambda_base * base_objective`.
-`domino_l1_loss_alpha: 0.0` (the default) keeps the historical CE-only
-objective and is bit-for-bit compatible with it.
+So with `ce_alpha=0.1, l1_alpha=0.9, base_tv_loss=false, final_tv_loss=true`
+the base path still trains with full-weight CE while the corrected path mixes
+0.1·CE with 0.9·L1. `domino_l1_loss_alpha: 0.0` (the default) keeps the
+historical CE-only objective — both paths plain CE — and is bit-for-bit
+compatible with it, whatever the alphas are.
 
 Enabling L1 requires the captured target final-layer state. Offline records
 always store it, while an online run requests the `last_hidden` artifact only
