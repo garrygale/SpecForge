@@ -17,6 +17,13 @@ is installed, otherwise read from ``--vllm-source`` /
 of the implementation they used, so a passing run proves the two images agree
 on the same revision.
 
+``check`` also simulates tensor parallelism (``--tp-sim 2,4`` by default): it
+builds one readout per rank, sums the per-rank partial mixtures the way the
+module's all-reduce does, projects each rank's slice and compares against the
+reference output.  fp32 reconstructions match to float32 rounding; bf16 ones
+match to summation-order noise (relative error ~5e-3), which is the price of
+splitting the accumulation across ranks.
+
 Exit codes: 0 = parity, 1 = mismatch, 2 = serving implementation not found.
 """
 
@@ -70,6 +77,23 @@ SMALL_CASES = (
 )
 
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
+
+# bf16 partial sums are reordered by the sharded mixture (per-rank partials
+# plus one extra all-reduce), so the reconstruction is expected to differ from
+# the single-rank reference by summation noise rather than bit-exactly.  fp32
+# must still match tightly.
+DEFAULT_TOLERANCES = {
+    "fp32": (1e-4, 1e-4),
+    "bf16": (2e-2, 2e-2),
+}
+
+
+def _tolerances(args, dtype_name: str):
+    atol, rtol = DEFAULT_TOLERANCES[dtype_name]
+    return (
+        atol if args.atol is None else args.atol,
+        rtol if args.rtol is None else args.rtol,
+    )
 
 
 def _sha256(path: pathlib.Path) -> str:
@@ -176,12 +200,92 @@ def _build_serving_readout(readout_cls, case, dtype):
     readout.granularity = case["granularity"]
     readout.folded_size = case["intermediate_size"] // case["branches"]
     readout.repeats = readout.folded_size // case["granularity"]
+    readout.tp_size = 1
+    readout.tp_rank = 0
+    readout.local_hidden_size = case["intermediate_size"]
+    readout.local_input_size = readout.folded_size
     readout.proj = _StubRowParallelLinear(readout.folded_size, case["hidden_size"])
     readout.proj = readout.proj.to(dtype)
     with torch.no_grad():
         readout.proj.weight.copy_(case["proj_weight"].to(dtype))
     readout.fold_logits = nn.Parameter(case["fold_logits"].to(dtype).clone())
     return readout
+
+
+def _build_rank_readout(readout_cls, case, dtype, rank: int, tp_size: int):
+    """One tensor-parallel rank's readout, with the distributed bits by hand."""
+
+    readout = _build_serving_readout(readout_cls, case, dtype)
+    readout.tp_size = tp_size
+    readout.tp_rank = rank
+    readout.local_hidden_size = case["intermediate_size"] // tp_size
+    readout.local_input_size = readout.folded_size // tp_size
+    readout._init_tp_mixture()
+    return readout
+
+
+def _check_simulated_tp(readout_cls, fixture, args) -> int:
+    """Reconstruct the unsharded mixture from per-rank partials.
+
+    The module all-reduces its per-rank partial mixture, so summing the
+    partials of every rank has to reproduce the reference output exactly.  This
+    needs no distributed group: the ranks are built by hand and the all-reduce
+    is the sum below.
+    """
+
+    if not hasattr(readout_cls, "_local_mixture"):
+        print("tp simulation  : skipped (serving revision predates sharded mixture)")
+        return 0
+
+    failures = 0
+    for tp_size in args.tp_sim:
+        for case in fixture["cases"]:
+            folded_size = case["intermediate_size"] // case["branches"]
+            if (
+                case["intermediate_size"] % tp_size
+                or folded_size % tp_size
+            ):
+                continue
+            dtype = DTYPES[case["dtype"]]
+            gated = case["gated"].to(dtype)
+            lead = gated.shape[:-1]
+            local_hidden = case["intermediate_size"] // tp_size
+            local_slot = folded_size // tp_size
+            weight = case["proj_weight"].to(dtype)
+            partials = [
+                _build_rank_readout(
+                    readout_cls, case, dtype, rank, tp_size
+                )
+                ._local_mixture(
+                    gated[..., rank * local_hidden : (rank + 1) * local_hidden]
+                )
+                .reshape(*lead, folded_size)
+                for rank in range(tp_size)
+            ]
+            # 1) the mixture partials are all-reduced into the full folded
+            #    vector, 2) every rank projects its own input slice, 3) the
+            #    row-parallel output is all-reduced, here just summed.
+            mixed = torch.stack(partials).sum(dim=0)
+            projected = torch.zeros(
+                *lead, case["hidden_size"], dtype=weight.dtype
+            )
+            for rank in range(tp_size):
+                slot = rank * local_slot
+                projected += torch.nn.functional.linear(
+                    mixed[..., slot : slot + local_slot].reshape(-1, local_slot),
+                    weight[:, slot : slot + local_slot],
+                ).reshape(*lead, case["hidden_size"])
+            expected = case["expected"].to(dtype)
+            diff = (projected.float() - expected.float()).abs().max().item()
+            scale = max(expected.float().abs().max().item(), 1e-6)
+            atol, rtol = _tolerances(args, case["dtype"])
+            ok = torch.allclose(projected, expected, atol=atol, rtol=rtol)
+            failures += 0 if ok else 1
+            print(
+                f"{'PASS' if ok else 'FAIL'} tp={tp_size} {case['name']:<28} "
+                f"dtype={case['dtype']} max|diff|={diff:.3e} rel={diff / scale:.2e}"
+            )
+    return failures
 
 
 def _real_case(args) -> dict:
@@ -297,18 +401,22 @@ def check(args) -> int:
             got = serving(gated)
             got_token = serving(gated[0, 0])
         diff = (got.float() - expected.float()).abs().max().item()
-        ok = torch.allclose(got, expected, atol=args.atol, rtol=args.rtol)
+        scale = max(expected.float().abs().max().item(), 1e-6)
+        atol, rtol = _tolerances(args, case["dtype"])
+        ok = torch.allclose(got, expected, atol=atol, rtol=rtol)
         ok_token = torch.allclose(
-            got_token, expected[0, 0], atol=args.atol, rtol=args.rtol
+            got_token, expected[0, 0], atol=atol, rtol=rtol
         )
         failures += 0 if (ok and ok_token) else 1
         print(
             f"{'PASS' if ok and ok_token else 'FAIL'} {case['name']:<28} "
-            f"dtype={case['dtype']} max|diff|={diff:.3e}"
+            f"dtype={case['dtype']} max|diff|={diff:.3e} rel={diff / scale:.2e}"
         )
 
+    if args.tp_sim:
+        failures += _check_simulated_tp(readout_cls, fixture, args)
     if failures:
-        print(f"FAILED: {failures}/{len(fixture['cases'])} cases disagree")
+        print(f"FAILED: {failures} parity check(s) disagree")
         return 1
     print(f"OK: {len(fixture['cases'])} cases match the training module")
     return 0
@@ -336,8 +444,13 @@ def main(argv=None) -> int:
     check_parser = sub.add_parser("check", help="verify a fixture (serving side)")
     check_parser.add_argument("--fixture", type=pathlib.Path, required=True)
     check_parser.add_argument("--vllm-source", default=None)
-    check_parser.add_argument("--atol", type=float, default=1e-3)
-    check_parser.add_argument("--rtol", type=float, default=1e-3)
+    check_parser.add_argument("--atol", type=float, default=None)
+    check_parser.add_argument("--rtol", type=float, default=None)
+    check_parser.add_argument(
+        "--tp-sim",
+        default="2,4",
+        help="tensor-parallel sizes to simulate; empty string disables",
+    )
     check_parser.set_defaults(func=check)
 
     args = parser.parse_args(argv)
@@ -346,6 +459,13 @@ def main(argv=None) -> int:
         unknown = [item for item in args.dtypes if item not in DTYPES]
         if unknown:
             parser.error(f"unknown dtypes {unknown}; expected fp32/bf16")
+    else:
+        try:
+            args.tp_sim = [
+                int(item) for item in str(args.tp_sim).split(",") if item.strip()
+            ]
+        except ValueError:
+            parser.error("--tp-sim expects comma-separated integers")
     return args.func(args)
 
 

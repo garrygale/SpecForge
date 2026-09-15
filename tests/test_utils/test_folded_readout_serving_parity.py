@@ -172,6 +172,10 @@ def _serving_readout(
     readout.granularity = granularity
     readout.folded_size = intermediate_size // branches
     readout.repeats = readout.folded_size // granularity
+    readout.tp_size = 1
+    readout.tp_rank = 0
+    readout.local_hidden_size = intermediate_size
+    readout.local_input_size = readout.folded_size
     readout.proj = _StubRowParallelLinear(readout.folded_size, hidden_size).to(
         weight.dtype
     )
