@@ -13,6 +13,10 @@ executes the readout class straight out of a vLLM checkout
 (``VLLM_QWEN3_DOMINO_PATH`` or the sibling ``../vllm`` directory), so the
 parity check also runs on training-only boxes; it skips when neither is
 available.
+
+When training and serving live in separate images that cannot import each
+other, use ``scripts/folded_readout_parity.py`` instead: it emits a fixture on
+the training side and verifies it inside the serving container.
 """
 
 from __future__ import annotations
