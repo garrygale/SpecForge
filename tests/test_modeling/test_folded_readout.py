@@ -198,6 +198,26 @@ class TestFoldedSoftmaxReadout(unittest.TestCase):
             )
         )
 
+    def test_mixture_rides_the_module_dtype(self):
+        """No fp32 round-trip: the mixture follows the logits' dtype (flare-style)."""
+
+        mlp = DEFAULT_DFLASH_KERNELS.make_mlp(
+            _config(readout={"branches": BRANCHES, "granularity": GRANULARITY})
+        ).to(torch.bfloat16)
+        weights = mlp.down_proj.fold_weights()
+        self.assertEqual(weights.dtype, torch.bfloat16)
+        self.assertTrue(bool((weights >= 0).all()))
+        self.assertTrue(
+            torch.allclose(
+                weights.sum(dim=0),
+                torch.ones(GRANULARITY, dtype=torch.bfloat16),
+                atol=1e-2,
+            )
+        )
+        # The mixed hidden therefore stays in the activation dtype end to end.
+        inputs = torch.randn(4, HIDDEN, dtype=torch.bfloat16)
+        self.assertEqual(mlp(inputs).dtype, torch.bfloat16)
+
     def test_single_branch_is_a_dense_readout(self):
         torch.manual_seed(2)
         readout = FoldedSoftmaxReadout(16, 48, branches=1, granularity=4)

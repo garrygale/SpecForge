@@ -198,11 +198,15 @@ class FoldedSoftmaxReadout(nn.Module):
             self.fold_logits.zero_()
 
     def fold_weights(self) -> torch.Tensor:
-        """Current convex mixture, shape ``[branches, granularity]``."""
+        """Current convex mixture, shape ``[branches, granularity]``.
 
-        return torch.softmax(self.fold_logits.to(torch.float32), dim=0).to(
-            self.proj.weight.dtype
-        )
+        The softmax runs in the logits' own dtype, mirroring the flare fusion
+        weights (``torch.softmax(self.layer_fusion_weights, dim=1)``).  The
+        logits ride the module dtype, so the mixture already matches the
+        activations it multiplies — no fp32 round-trip, no cast back.
+        """
+
+        return torch.softmax(self.fold_logits, dim=0)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         lead = hidden_states.shape[:-1]

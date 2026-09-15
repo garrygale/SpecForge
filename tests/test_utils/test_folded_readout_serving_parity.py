@@ -168,7 +168,9 @@ def _serving_readout(
     readout.granularity = granularity
     readout.folded_size = intermediate_size // branches
     readout.repeats = readout.folded_size // granularity
-    readout.proj = _StubRowParallelLinear(readout.folded_size, hidden_size)
+    readout.proj = _StubRowParallelLinear(readout.folded_size, hidden_size).to(
+        weight.dtype
+    )
     with torch.no_grad():
         readout.proj.weight.copy_(weight)
     readout.fold_logits = nn.Parameter(logits.clone())
@@ -188,49 +190,58 @@ class TestFoldedReadoutServingParity(unittest.TestCase):
 
     def test_outputs_match_for_every_layout(self):
         for hidden, intermediate, branches, granularity in LAYOUTS:
-            with self.subTest(
-                hidden=hidden,
-                intermediate=intermediate,
-                branches=branches,
-                granularity=granularity,
-            ):
-                torch.manual_seed(hidden * 1000 + intermediate)
-                mlp = DEFAULT_DFLASH_KERNELS.make_mlp(
-                    _draft_config(hidden, intermediate, branches, granularity)
-                )
-                self.assertIsInstance(mlp, FoldedSoftmaxMLP)
-                with torch.no_grad():
-                    # Non-uniform mixture: a wrong softmax axis or chunk stride
-                    # cannot hide behind a uniform average.
-                    mlp.down_proj.fold_logits.normal_(std=1.5)
-
-                readout = mlp.down_proj
-                serving = _serving_readout(
-                    self.readout_cls,
-                    hidden_size=hidden,
-                    intermediate_size=intermediate,
+            # Serving runs bf16, training builds fp32 first; both must agree.
+            for dtype in (torch.float32, torch.bfloat16):
+                with self.subTest(
+                    hidden=hidden,
+                    intermediate=intermediate,
                     branches=branches,
                     granularity=granularity,
-                    weight=readout.proj.weight.detach(),
-                    logits=readout.fold_logits.detach(),
-                )
-                self.assertEqual(
-                    set(dict(serving.named_parameters())),
-                    {"proj.weight", "fold_logits"},
-                )
+                    dtype=dtype,
+                ):
+                    torch.manual_seed(hidden * 1000 + intermediate)
+                    mlp = DEFAULT_DFLASH_KERNELS.make_mlp(
+                        _draft_config(hidden, intermediate, branches, granularity)
+                    )
+                    self.assertIsInstance(mlp, FoldedSoftmaxMLP)
+                    with torch.no_grad():
+                        # Non-uniform mixture: a wrong softmax axis or chunk
+                        # stride cannot hide behind a uniform average.
+                        mlp.down_proj.fold_logits.normal_(std=1.5)
+                    mlp = mlp.to(dtype)
 
-                gated = torch.randn(2, 5, intermediate)
-                self.assertTrue(
-                    torch.allclose(
-                        serving(gated), readout(gated), atol=1e-6, rtol=1e-6
+                    readout = mlp.down_proj
+                    serving = _serving_readout(
+                        self.readout_cls,
+                        hidden_size=hidden,
+                        intermediate_size=intermediate,
+                        branches=branches,
+                        granularity=granularity,
+                        weight=readout.proj.weight.detach(),
+                        logits=readout.fold_logits.detach(),
                     )
-                )
-                # A single-token step must agree too.
-                self.assertTrue(
-                    torch.allclose(
-                        serving(gated[0, 0]), readout(gated[0, 0]), atol=1e-6
+                    self.assertEqual(
+                        set(dict(serving.named_parameters())),
+                        {"proj.weight", "fold_logits"},
                     )
-                )
+
+                    gated = torch.randn(2, 5, intermediate, dtype=dtype)
+                    served = serving(gated)
+                    self.assertEqual(served.dtype, dtype)
+                    self.assertTrue(
+                        torch.allclose(
+                            served, readout(gated), atol=1e-3, rtol=1e-3
+                        )
+                    )
+                    # A single-token step must agree too.
+                    self.assertTrue(
+                        torch.allclose(
+                            serving(gated[0, 0]),
+                            readout(gated[0, 0]),
+                            atol=1e-3,
+                            rtol=1e-3,
+                        )
+                    )
 
     def test_exported_keys_are_what_serving_expects(self):
         mlp = DEFAULT_DFLASH_KERNELS.make_mlp(_draft_config(8, 24, 3, 4))
