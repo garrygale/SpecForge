@@ -294,15 +294,277 @@ class FoldedSoftmaxMLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
+# ---------------------------------------------------------------------------
+# Shared gate/up projections (opt-in through ``dflash_config.ffn_sharing``)
+# ---------------------------------------------------------------------------
+#
+# The SwiGLU channel ``j`` becomes
+#
+#     h_j = act( gate[gate_idx[j]] ) * up[up_idx[j]]      j < intermediate_size
+#
+# where ``gate`` is the ``G_g``-wide ``gate_proj`` output and ``up`` the
+# ``G_u``-wide ``up_proj`` output, so the two projections hold
+# ``hidden * (G_g + G_u)`` weights instead of ``2 * hidden * M`` while
+# ``down_proj`` keeps its ``hidden * M`` shape.  The index maps pick the
+# pairing structure:
+#
+#     nested:  gate_idx[j] = j // (M / G_g),   up_idx[j] = j // (M / G_u)
+#              contiguous block grouping — pure gate sharing (``G_u = M``),
+#              pure up sharing (``G_g = M``) and hierarchical mixes.
+#     outer:   gate_idx[j] = j % G_g,           up_idx[j] = (j // G_g) % G_u
+#              the full ``G_g x G_u`` lattice spread over the ``M`` down
+#              channels; each (gate, up) combo repeats ``M / (G_g * G_u)``
+#              times with distinct down columns (``G_g * G_u = M`` is the
+#              exactly-once lattice).
+#
+# A baseline dense checkpoint warm-starts by scatter-averaging its ``[M, hidden]``
+# gate/up rows per shared group — the uniform-mixture least-squares analogue
+# of the folded readout's chunk sum.
+
+SHARING_KEY = "ffn_sharing"
+SHARING_PAIRINGS = frozenset({"nested", "outer"})
+
+
+def _sharing_indices(
+    intermediate_size: int, gate_groups: int, up_groups: int, pairing: str
+) -> tuple:
+    """Per-channel (gate, up) index maps for one pairing structure."""
+
+    channel = torch.arange(intermediate_size)
+    if pairing == "nested":
+        gate_idx = channel // (intermediate_size // gate_groups)
+        up_idx = channel // (intermediate_size // up_groups)
+    else:  # outer
+        gate_idx = channel % gate_groups
+        up_idx = (channel // gate_groups) % up_groups
+    return gate_idx, up_idx
+
+
+def resolve_ffn_sharing(config) -> Optional[Dict[str, object]]:
+    """Resolve ``dflash_config.ffn_sharing`` for one draft config.
+
+    Returns ``{"pairing": p, "gate_groups": G_g, "up_groups": G_u}`` when
+    sharing is enabled and ``None`` for the plain ``Qwen3MLP`` (the default).
+    ``gate_groups``/``up_groups`` default to ``intermediate_size``, i.e. no
+    sharing on that side, so ``{"gate_groups": 4864}`` alone is pure gate
+    sharing with ``k = 2`` on the 35B-A3B draft (9728 = 512 * 19 has no
+    factor 3).  ``pairing='outer'`` needs ``G_g * G_u`` to divide
+    ``intermediate_size``: 76 x 128 keeps 9728 exactly, while a 64 x 64
+    lattice requires switching ``intermediate_size`` to 4096.
+    """
+
+    dflash_config = getattr(config, "dflash_config", None) or {}
+    raw = dflash_config.get(SHARING_KEY)
+    if raw is None or raw is False:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"dflash_config.{SHARING_KEY} must be a dict with 'pairing', "
+            f"'gate_groups' and 'up_groups', got {type(raw).__name__}"
+        )
+    spec = dict(raw)
+    unknown = sorted(set(spec) - {"pairing", "gate_groups", "up_groups"})
+    if unknown:
+        raise ValueError(
+            f"unknown dflash_config.{SHARING_KEY} entries {unknown}; expected "
+            "'pairing', 'gate_groups' and 'up_groups'"
+        )
+
+    pairing = spec.get("pairing", "nested")
+    if pairing not in SHARING_PAIRINGS:
+        raise ValueError(
+            f"unknown dflash_config.{SHARING_KEY} pairing {pairing!r}; expected "
+            f"one of {sorted(SHARING_PAIRINGS)}"
+        )
+
+    intermediate_size = int(getattr(config, "intermediate_size", 0) or 0)
+    if intermediate_size <= 0:
+        raise ValueError("ffn sharing needs a positive intermediate_size")
+    gate_groups = int(spec.get("gate_groups", intermediate_size))
+    up_groups = int(spec.get("up_groups", intermediate_size))
+    for name, groups in (("gate_groups", gate_groups), ("up_groups", up_groups)):
+        if groups < 1 or groups > intermediate_size:
+            raise ValueError(
+                f"dflash_config.{SHARING_KEY}.{name}={groups} must be between 1 "
+                f"and intermediate_size={intermediate_size}"
+            )
+
+    if pairing == "nested":
+        for name, groups in (("gate_groups", gate_groups), ("up_groups", up_groups)):
+            if intermediate_size % groups:
+                raise ValueError(
+                    f"nested sharing {name}={groups} must divide "
+                    f"intermediate_size={intermediate_size}; nearby divisors "
+                    f"are {_divisors(intermediate_size)[:12]}"
+                )
+    elif intermediate_size % (gate_groups * up_groups):
+        pairs = sorted(
+            (
+                (d, intermediate_size // d)
+                for d in _divisors(intermediate_size)
+                if d <= intermediate_size // d
+            ),
+            key=lambda pair: abs(pair[0] - pair[1]),
+        )[:6]
+        raise ValueError(
+            f"outer sharing needs gate_groups * up_groups to divide "
+            f"intermediate_size, got {gate_groups} * {up_groups} = "
+            f"{gate_groups * up_groups} with intermediate_size="
+            f"{intermediate_size}; either pick a factorization of "
+            f"{intermediate_size} (most balanced: "
+            f"{', '.join(f'{d}x{q}' for d, q in pairs)}) or change "
+            f"intermediate_size to {gate_groups * up_groups}"
+        )
+    return {"pairing": pairing, "gate_groups": gate_groups, "up_groups": up_groups}
+
+
+class SharedGLUMLP(nn.Module):
+    """SwiGLU MLP whose gate/up projections serve multiple channels.
+
+    ``gate_proj`` outputs ``gate_groups`` channels and ``up_proj`` outputs
+    ``up_groups`` channels; intermediate channel ``j`` pairs them through the
+    precomputed ``gate_idx``/``up_idx`` maps (see the module note above).
+    ``down_proj`` is either a plain ``nn.Linear`` or a
+    :class:`FoldedSoftmaxReadout` when ``ffn_readout`` is also enabled.  The
+    index maps live as non-persistent buffers: derived from the config,
+    invisible to checkpoints and untouched by the QAT/NPU linear walkers.
+
+    A baseline checkpoint holding dense ``[intermediate_size, hidden]``
+    ``gate_proj``/``up_proj`` weights warm-starts by scatter-averaging the
+    legacy rows per shared group.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3Config,
+        *,
+        pairing: str = "nested",
+        gate_groups: int,
+        up_groups: int,
+        folded: Optional[Dict[str, int]] = None,
+    ) -> None:
+        super().__init__()
+        gate_groups = int(gate_groups)
+        up_groups = int(up_groups)
+        if pairing not in SHARING_PAIRINGS:
+            raise ValueError(
+                f"pairing must be one of {sorted(SHARING_PAIRINGS)}, got "
+                f"{pairing!r}"
+            )
+        intermediate_size = int(config.intermediate_size)
+        hidden_size = int(config.hidden_size)
+        if not 1 <= gate_groups <= intermediate_size:
+            raise ValueError(
+                f"gate_groups={gate_groups} must be between 1 and "
+                f"intermediate_size={intermediate_size}"
+            )
+        if not 1 <= up_groups <= intermediate_size:
+            raise ValueError(
+                f"up_groups={up_groups} must be between 1 and "
+                f"intermediate_size={intermediate_size}"
+            )
+        if pairing == "nested":
+            if intermediate_size % gate_groups or intermediate_size % up_groups:
+                raise ValueError(
+                    f"nested sharing needs gate_groups={gate_groups} and "
+                    f"up_groups={up_groups} to divide intermediate_size="
+                    f"{intermediate_size}"
+                )
+        elif intermediate_size % (gate_groups * up_groups):
+            raise ValueError(
+                f"outer sharing needs gate_groups * up_groups = "
+                f"{gate_groups * up_groups} to divide intermediate_size="
+                f"{intermediate_size}"
+            )
+
+        self.config = config
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.pairing = pairing
+        self.gate_groups = gate_groups
+        self.up_groups = up_groups
+
+        self.gate_proj = nn.Linear(hidden_size, gate_groups, bias=False)
+        self.up_proj = nn.Linear(hidden_size, up_groups, bias=False)
+        if folded is None:
+            self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        else:
+            self.down_proj = FoldedSoftmaxReadout(
+                hidden_size, intermediate_size, **folded
+            )
+        gate_idx, up_idx = _sharing_indices(
+            intermediate_size, gate_groups, up_groups, pairing
+        )
+        self.register_buffer("gate_idx", gate_idx, persistent=False)
+        self.register_buffer("up_idx", up_idx, persistent=False)
+        self.act_fn = ACT2FN[getattr(config, "hidden_act", "silu")]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        hidden = self.act_fn(gate[..., self.gate_idx]) * up[..., self.up_idx]
+        return self.down_proj(hidden)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        for proj_name, groups, idx in (
+            ("gate_proj", self.gate_groups, self.gate_idx),
+            ("up_proj", self.up_groups, self.up_idx),
+        ):
+            key = prefix + proj_name + ".weight"
+            legacy = state_dict.get(key)
+            if not (torch.is_tensor(legacy) and legacy.dim() == 2):
+                continue
+            if legacy.shape[0] == self.intermediate_size != groups:
+                # Baseline dense projection: scatter-average the rows per
+                # shared group (in fp32, then back to the checkpoint dtype).
+                index = idx.to(legacy.device)
+                sums = torch.zeros(
+                    groups, legacy.shape[1], dtype=torch.float32,
+                    device=legacy.device,
+                )
+                sums.index_add_(0, index, legacy.float())
+                counts = torch.bincount(index, minlength=groups).clamp(min=1)
+                state_dict[key] = (sums / counts.unsqueeze(1)).to(legacy.dtype)
+            elif legacy.shape[0] != groups:
+                error_msgs.append(
+                    f"size mismatch for {key}: ffn sharing cannot fold a legacy "
+                    f"{tuple(legacy.shape)} projection; expected a dense "
+                    f"[{self.intermediate_size}, {self.hidden_size}] checkpoint "
+                    f"(train from scratch or re-export the baseline) or a "
+                    f"sharing checkpoint with {groups} rows"
+                )
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+
 def _make_qwen3_rms_norm(hidden_size: int, eps: float) -> nn.Module:
     return Qwen3RMSNorm(hidden_size, eps=eps)
 
 
 def _make_qwen3_mlp(config: Qwen3Config) -> nn.Module:
     folded = resolve_folded_readout(config)
-    if folded is None:
-        return Qwen3MLP(config)
-    return FoldedSoftmaxMLP(config, **folded)
+    sharing = resolve_ffn_sharing(config)
+    if sharing is None:
+        if folded is None:
+            return Qwen3MLP(config)
+        return FoldedSoftmaxMLP(config, **folded)
+    return SharedGLUMLP(config, folded=folded, **sharing)
 
 
 DEFAULT_DFLASH_KERNELS = DFlashKernels(
@@ -329,10 +591,14 @@ def load_liger_dflash_kernels() -> DFlashKernels:
         return LigerRMSNorm(hidden_size, eps=eps)
 
     def make_mlp(config: Qwen3Config) -> nn.Module:
-        if resolve_folded_readout(config) is None:
+        if (
+            resolve_folded_readout(config) is None
+            and resolve_ffn_sharing(config) is None
+        ):
             return LigerSwiGLUMLP(config)
-        # Liger has no fused kernel for the folded readout, so keep the knob
-        # working by falling back to the portable PyTorch MLP.
+        # Liger has no fused kernel for the folded readout or the shared
+        # projections, so keep the knobs working by falling back to the
+        # portable PyTorch MLP.
         return _make_qwen3_mlp(config)
 
     return DFlashKernels(
