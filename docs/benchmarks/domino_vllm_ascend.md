@@ -83,6 +83,20 @@ The exported draft `config.json` must use:
   trained with the default already matches the service; only set `true` to run
   (and retrain) the causal variant
 * `dflash_config.qat_w_bit`: 4 (W4A8 bulk) with `qat_w4a4_layers`
+* `dflash_config.ffn_sharing` (optional): shared gate/up projections —
+  `{"pairing": "nested"|"outer", "gate_groups": G_g, "up_groups": G_u}`
+  where each side defaults to `intermediate_size` (no sharing). `nested` is
+  contiguous block grouping (pure gate sharing, pure up sharing or a
+  hierarchical mix); `outer` is the full `G_g x G_u` lattice over the down
+  channels (`G_g * G_u` must divide `intermediate_size`; 76x128 keeps the
+  35B-A3B draft's 9728 exactly, while 64x64 requires
+  `intermediate_size: 4096`). Composes with `ffn_readout` (the folded
+  readout stays the down projection). The service fuses the exported
+  separate `gate_proj`/`up_proj` tensors into one `gate_up_proj` (unequal
+  halves load as-is), and — like the folded readout — requires
+  `draft_tensor_parallel_size=1`: the channel gather reads gate/up channels
+  owned by other ranks once column-parallel sharding kicks in. See the
+  `qwen3.6-35b-a3b-domino-{gateshare-k2,upshare-k2,staggered-*}` configs.
 
 The target auxiliary hidden states are looked up under
 `model.language_model.embed_tokens.weight` in the exporter and service.
