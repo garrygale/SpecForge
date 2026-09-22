@@ -172,6 +172,9 @@ def _serving_readout(
     readout.granularity = granularity
     readout.folded_size = intermediate_size // branches
     readout.repeats = readout.folded_size // granularity
+    readout.fold_axis = "channel"
+    readout.gate_groups = None
+    readout.up_groups = None
     readout.tp_size = 1
     readout.tp_rank = 0
     readout.local_hidden_size = intermediate_size

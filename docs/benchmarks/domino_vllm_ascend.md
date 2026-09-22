@@ -95,7 +95,11 @@ The exported draft `config.json` must use:
   separate `gate_proj`/`up_proj` tensors into one `gate_up_proj` (unequal
   halves load as-is), and — like the folded readout — requires
   `draft_tensor_parallel_size=1`: the channel gather reads gate/up channels
-  owned by other ranks once column-parallel sharding kicks in. See the
+  owned by other ranks once column-parallel sharding kicks in. When composed
+  with `ffn_readout`, use `"fold_axis": "gate"` — the lattice-aligned fold
+  that pools products differing in gate; the default channel-axis fold under
+  `pairing='outer'` averages channels that share one gate (measured to cost
+  significant acceptance, both sides warn about it). See the
   `qwen3.6-35b-a3b-domino-{gateshare-k2,upshare-k2,staggered-*}` configs.
 
 The target auxiliary hidden states are looked up under

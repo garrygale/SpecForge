@@ -49,7 +49,8 @@ HIDDEN = 32
 INTERMEDIATE = 128
 
 # (pairing, gate_groups, up_groups, readout) against INTERMEDIATE=128.
-# readout=None is a dense down_proj; (4, 8) is the folded softmax readout.
+# readout=None is a dense down_proj; (4, 8) is the channel-axis folded
+# readout; (b, g, "gate") the lattice-aligned gate-axis fold (outer only).
 SHARING_LAYOUTS = (
     ("nested", 64, 128, None),  # pure gate sharing, k=2
     ("nested", 128, 64, None),  # pure up sharing, k=2
@@ -57,7 +58,9 @@ SHARING_LAYOUTS = (
     ("outer", 8, 16, None),  # exactly-once lattice 8 x 16 = 128
     ("outer", 8, 8, None),  # lattice with one repetition (m=2)
     ("nested", 64, 128, (4, 8)),  # pure gate sharing + folded readout
-    ("outer", 8, 16, (4, 8)),  # outer lattice + folded readout
+    ("outer", 8, 16, (4, 8)),  # outer lattice + channel-axis fold
+    ("outer", 8, 16, (4, 2, "gate")),  # gate-axis fold, fully untied slots
+    ("outer", 8, 16, (2, 4, "gate")),  # gate-axis fold, milder 2x cut
 )
 
 
@@ -187,11 +190,14 @@ def _load_vllm_sharing_classes():
 def _draft_config(sharing, readout):
     dflash_config = {"ffn_sharing": dict(sharing)}
     if readout is not None:
-        dflash_config["ffn_readout"] = {
+        entry = {
             "mode": "folded_softmax",
             "branches": readout[0],
             "granularity": readout[1],
         }
+        if len(readout) > 2:
+            entry["fold_axis"] = readout[2]
+        dflash_config["ffn_readout"] = entry
     return SimpleNamespace(
         hidden_size=HIDDEN,
         intermediate_size=INTERMEDIATE,
@@ -243,12 +249,20 @@ def _serving_mlp(
         with torch.no_grad():
             serving.down_proj.weight.copy_(training.down_proj.weight)
     else:
-        branches, granularity = readout
+        branches, granularity = readout[0], readout[1]
+        readout_kwargs = {}
+        if len(readout) > 2 and readout[2] == "gate":
+            readout_kwargs = {
+                "fold_axis": "gate",
+                "gate_groups": gate_groups,
+                "up_groups": up_groups,
+            }
         serving.down_proj = readout_cls(
             hidden_size=HIDDEN,
             intermediate_size=INTERMEDIATE,
             branches=branches,
             granularity=granularity,
+            **readout_kwargs,
         ).to(dtype)
         with torch.no_grad():
             serving.down_proj.proj.weight.copy_(training.down_proj.proj.weight)

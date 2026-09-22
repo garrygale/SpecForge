@@ -66,7 +66,13 @@ class TestResolveFoldedReadout(unittest.TestCase):
         # 128 / 32 == 4 branches, folded width 32, default granularity 16.
         self.assertEqual(
             resolve_folded_readout(_config(readout="folded_softmax")),
-            {"branches": 4, "granularity": 16},
+            {
+                "branches": 4,
+                "granularity": 16,
+                "fold_axis": "channel",
+                "gate_groups": None,
+                "up_groups": None,
+            },
         )
 
     def test_dict_overrides_branches_and_granularity(self):
@@ -74,7 +80,13 @@ class TestResolveFoldedReadout(unittest.TestCase):
             resolve_folded_readout(
                 _config(readout={"branches": 8, "granularity": 8})
             ),
-            {"branches": 8, "granularity": 8},
+            {
+                "branches": 8,
+                "granularity": 8,
+                "fold_axis": "channel",
+                "gate_groups": None,
+                "up_groups": None,
+            },
         )
 
     def test_fold_ratio_rounds_to_nearest_divisor(self):
@@ -87,7 +99,13 @@ class TestResolveFoldedReadout(unittest.TestCase):
                     readout="folded_softmax",
                 )
             ),
-            {"branches": 4, "granularity": 16},
+            {
+                "branches": 4,
+                "granularity": 16,
+                "fold_axis": "channel",
+                "gate_groups": None,
+                "up_groups": None,
+            },
         )
         # A 3N intermediate keeps the 3N -> N -> N shape of the design note.
         self.assertEqual(
@@ -98,7 +116,13 @@ class TestResolveFoldedReadout(unittest.TestCase):
                     readout="folded_softmax",
                 )
             ),
-            {"branches": 3, "granularity": 16},
+            {
+                "branches": 3,
+                "granularity": 16,
+                "fold_axis": "channel",
+                "gate_groups": None,
+                "up_groups": None,
+            },
         )
 
     def test_rejects_invalid_knobs(self):
@@ -132,7 +156,14 @@ class TestResolveFoldedReadout(unittest.TestCase):
             },
         )
         self.assertEqual(
-            resolve_folded_readout(config), {"branches": 4, "granularity": 16}
+            resolve_folded_readout(config),
+            {
+                "branches": 4,
+                "granularity": 16,
+                "fold_axis": "channel",
+                "gate_groups": None,
+                "up_groups": None,
+            },
         )
         # Analytic ledger per draft layer: gate/up keep 2NM, the folded path
         # costs N*(M/c) + M + c*K instead of N*M.

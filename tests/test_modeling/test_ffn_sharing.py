@@ -14,10 +14,29 @@ from specforge.modeling.draft.dflash_kernels import (
     FoldedSoftmaxReadout,
     SharedGLUMLP,
     resolve_ffn_sharing,
+    resolve_folded_readout,
 )
 
 HIDDEN = 32
 INTERMEDIATE = 128
+# Small outer lattice for the gate-axis fold: 12 gates x 4 ups = 48 channels.
+GATE_LATTICE = {"pairing": "outer", "gate_groups": 12, "up_groups": 4}
+GATE_FOLD = {"mode": "folded_softmax", "fold_axis": "gate", "branches": 4, "granularity": 3}
+
+
+def _compose_config(sharing, readout, intermediate_size=48):
+    config = Qwen3Config(
+        hidden_size=HIDDEN,
+        intermediate_size=intermediate_size,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=HIDDEN // 2,
+        vocab_size=64,
+        hidden_act="silu",
+    )
+    config.dflash_config = {"ffn_sharing": dict(sharing), "ffn_readout": dict(readout)}
+    return config
 
 # (pairing, gate_groups, up_groups) against INTERMEDIATE=128.  Covers pure
 # gate sharing, pure up sharing, a misaligned hierarchical mix, the exact
@@ -322,6 +341,171 @@ class TestSharedGLUMLP(unittest.TestCase):
         self.assertIn("gate_proj.weight", mlp.state_dict())
         self.assertNotIn("gate_idx", mlp.state_dict())
         self.assertNotIn("up_idx", mlp.state_dict())
+
+
+class TestGateAxisFold(unittest.TestCase):
+    """The lattice-aligned fold: convex mixture along the gate axis."""
+
+    def test_resolver_gate_axis(self):
+        resolved = resolve_folded_readout(_compose_config(GATE_LATTICE, GATE_FOLD))
+        self.assertEqual(
+            resolved,
+            {
+                "branches": 4,
+                "granularity": 3,
+                "fold_axis": "gate",
+                "gate_groups": 12,
+                "up_groups": 4,
+            },
+        )
+
+    def test_resolver_rejects_misaligned_gate_fold(self):
+        # No lattice: the gate axis does not exist without outer pairing.
+        with self.assertRaises(ValueError):
+            resolve_folded_readout(
+                _compose_config(
+                    {"gate_groups": 12},  # nested default, no lattice
+                    GATE_FOLD,
+                )
+            )
+        # Nested pairing carries no gate axis either.
+        with self.assertRaises(ValueError):
+            resolve_folded_readout(
+                _compose_config(
+                    {"pairing": "nested", "gate_groups": 12, "up_groups": 4},
+                    GATE_FOLD,
+                )
+            )
+        # Branches must divide the gate axis, not intermediate_size.
+        with self.assertRaises(ValueError):
+            resolve_folded_readout(
+                _compose_config(GATE_LATTICE, {**GATE_FOLD, "branches": 5})
+            )
+        # Granularity must divide the folded gate width (12/4 = 3).
+        with self.assertRaises(ValueError):
+            resolve_folded_readout(
+                _compose_config(GATE_LATTICE, {**GATE_FOLD, "granularity": 2})
+            )
+        # Lattice repetitions (m > 1) are not supported: I must equal G_g*G_u.
+        with self.assertRaises(ValueError):
+            resolve_folded_readout(
+                _compose_config(GATE_LATTICE, GATE_FOLD, intermediate_size=96)
+            )
+        with self.assertRaises(ValueError):
+            resolve_folded_readout(
+                _compose_config(GATE_LATTICE, {**GATE_FOLD, "fold_axis": "weave"})
+            )
+
+    def test_resolver_warns_on_channel_fold_over_outer(self):
+        with self.assertWarns(UserWarning):
+            resolve_folded_readout(
+                _compose_config(
+                    GATE_LATTICE,
+                    {"mode": "folded_softmax", "branches": 4, "granularity": 3},
+                )
+            )
+
+    def _reference(self, mlp, x):
+        gate = mlp.gate_proj(x)
+        up = mlp.up_proj(x)
+        hidden = mlp.act_fn(gate[..., mlp.gate_idx]) * up[..., mlp.up_idx]
+        readout = mlp.down_proj
+        folded_gate = readout.gate_groups // readout.branches
+        weights = torch.softmax(readout.fold_logits.float(), dim=0)
+        mixed = torch.zeros(*hidden.shape[:-1], readout.up_groups, folded_gate)
+        for c in range(readout.up_groups):
+            for rho in range(folded_gate):
+                for b in range(readout.branches):
+                    mixed[..., c, rho] += (
+                        weights[b, rho % readout.granularity]
+                        * hidden[..., c * readout.gate_groups + b * folded_gate + rho]
+                    )
+        return readout.proj(mixed.reshape(*hidden.shape[:-1], readout.folded_size))
+
+    def test_matches_reference_indices(self):
+        torch.manual_seed(6)
+        mlp = DEFAULT_DFLASH_KERNELS.make_mlp(
+            _compose_config(GATE_LATTICE, GATE_FOLD)
+        )
+        self.assertIsInstance(mlp, SharedGLUMLP)
+        self.assertIsInstance(mlp.down_proj, FoldedSoftmaxReadout)
+        self.assertEqual(mlp.down_proj.fold_axis, "gate")
+        # Lattice width 12 gates / 4 branches -> 3, x 4 ups = 12-wide readout.
+        self.assertEqual(mlp.down_proj.proj.weight.shape, (HIDDEN, 12))
+        with torch.no_grad():
+            mlp.down_proj.fold_logits.normal_(std=1.5)
+        x = torch.randn(2, 3, HIDDEN)
+        self.assertTrue(torch.allclose(mlp(x), self._reference(mlp, x), atol=1e-6))
+
+    def test_uniform_logits_are_the_branch_average(self):
+        torch.manual_seed(7)
+        mlp = DEFAULT_DFLASH_KERNELS.make_mlp(
+            _compose_config(GATE_LATTICE, GATE_FOLD)
+        )
+        x = torch.randn(5, HIDDEN)
+        out = mlp(x)
+        gate = mlp.act_fn(mlp.gate_proj(x)[..., mlp.gate_idx])
+        up = mlp.up_proj(x)[..., mlp.up_idx]
+        hidden = gate * up  # (5, 48)
+        averaged = hidden.reshape(5, 4, 4, 3).mean(dim=2).reshape(5, 12)
+        expected = torch.nn.functional.linear(
+            averaged, mlp.down_proj.proj.weight
+        )
+        self.assertTrue(torch.allclose(out, expected, atol=1e-6))
+
+    def test_legacy_dense_warm_start_folds_all_three_sides(self):
+        torch.manual_seed(8)
+        baseline = Qwen3MLP(_compose_config(GATE_LATTICE, {"mode": "dense"}))
+        composed = DEFAULT_DFLASH_KERNELS.make_mlp(
+            _compose_config(GATE_LATTICE, GATE_FOLD)
+        )
+        result = composed.load_state_dict(baseline.state_dict(), strict=False)
+        self.assertEqual(list(result.missing_keys), [])
+        self.assertEqual(list(result.unexpected_keys), [])
+        # Outer gate rows are strided: group r collects rows r, r+12, r+24, r+36.
+        expected_gate = baseline.gate_proj.weight.reshape(4, 12, HIDDEN).mean(dim=0)
+        self.assertTrue(
+            torch.allclose(composed.gate_proj.weight, expected_gate, atol=1e-6)
+        )
+        # Up groups are contiguous blocks of G_g = 12 rows.
+        expected_up = baseline.up_proj.weight.reshape(4, 12, HIDDEN).mean(dim=1)
+        self.assertTrue(
+            torch.allclose(composed.up_proj.weight, expected_up, atol=1e-6)
+        )
+        # Dense down folds along the gate axis: sum the branch chunks.
+        expected_down = baseline.down_proj.weight.reshape(HIDDEN, 4, 4, 3).sum(
+            dim=2
+        ).reshape(HIDDEN, 12)
+        self.assertTrue(
+            torch.allclose(composed.down_proj.proj.weight, expected_down)
+        )
+        self.assertFalse(bool(torch.any(composed.down_proj.fold_logits)))
+
+    def test_forward_rides_the_module_dtype(self):
+        mlp = DEFAULT_DFLASH_KERNELS.make_mlp(
+            _compose_config(GATE_LATTICE, GATE_FOLD)
+        ).to(torch.bfloat16)
+        x = torch.randn(4, HIDDEN, dtype=torch.bfloat16)
+        self.assertEqual(mlp(x).dtype, torch.bfloat16)
+
+    def test_qat_quantizes_only_the_dense_projection(self):
+        from specforge.layers.wxay import (
+            QuantizedLinear,
+            replace_linear_with_quantized,
+        )
+
+        mlp = DEFAULT_DFLASH_KERNELS.make_mlp(
+            _compose_config(GATE_LATTICE, GATE_FOLD)
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            replace_linear_with_quantized(mlp, w_bit=4, a_bit=8)
+        self.assertIsInstance(mlp.gate_proj, QuantizedLinear)
+        self.assertIsInstance(mlp.up_proj, QuantizedLinear)
+        self.assertIsInstance(mlp.down_proj.proj, QuantizedLinear)
+        self.assertIsInstance(mlp.down_proj.fold_logits, nn.Parameter)
+        self.assertIn("down_proj.proj.weight", mlp.state_dict())
+        self.assertIn("down_proj.fold_logits", mlp.state_dict())
 
 
 if __name__ == "__main__":
