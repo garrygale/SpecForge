@@ -24,8 +24,11 @@ Nested pairing is refused: only the outer lattice makes the intermediate a
 Kronecker product, so the tensor view (and this whole avenue) is exclusive to
 ``pairing: "outer"``.
 
-Run where the checkpoint lives (the R=2048 ALS sweeps take ~minutes on GPU,
-too slow on laptop CPUs)::
+Run where the checkpoint lives (the sweep prints a Tflops estimate, one
+progress line per completed (layer, rank) step with live ETA, and — under
+--verbose — per-iteration ALS heartbeats; the R=2048 sweeps take ~minutes on
+GPU, too slow on laptop CPUs.  --iters 15 gives a quicker first pass: the
+HOSVD init converges fast and the energy curve moves little)::
 
     python scripts/staggered_cp_spectrum.py --checkpoint exported-draft/ \
         [--ranks 128,256,512,1024,2048] [--iters 25] [--device cuda] [--layers all]
@@ -182,14 +185,40 @@ def _left_vectors(M: torch.Tensor, count: int, generator) -> torch.Tensor:
     return torch.cat([U, extra], dim=1)
 
 
-def cp_als(T: torch.Tensor, R: int, iters: int, seed: int = 0):
-    """CP-ALS with HOSVD init; returns factors (W, V, G)."""
+def init_factors(T: torch.Tensor, max_rank: int, seed: int = 0):
+    """HOSVD left bases (with normalized random padding up to ``max_rank``).
+
+    Built once per layer: the rank sweep truncates columns for each R instead
+    of re-running the three SVDs for every (layer, R) combination.
+    """
 
     d, Gu, Gg = T.shape
     generator = torch.Generator(device="cpu").manual_seed(seed)
-    W = _left_vectors(T.reshape(d, -1), R, generator)
-    V = _left_vectors(T.permute(1, 0, 2).reshape(Gu, -1), R, generator)
-    G = _left_vectors(T.permute(2, 0, 1).reshape(Gg, -1), R, generator)
+    return (
+        _left_vectors(T.reshape(d, -1), max_rank, generator),
+        _left_vectors(T.permute(1, 0, 2).reshape(Gu, -1), max_rank, generator),
+        _left_vectors(T.permute(2, 0, 1).reshape(Gg, -1), max_rank, generator),
+    )
+
+
+def cp_als(
+    T: torch.Tensor,
+    R: int,
+    iters: int,
+    bases=None,
+    seed: int = 0,
+    heartbeat=None,
+):
+    """CP-ALS with HOSVD init; returns factors (W, V, G).
+
+    ``bases`` reuses :func:`init_factors` output (truncated to R); pass a
+    ``heartbeat(iteration)`` callback for intra-run progress.
+    """
+
+    d, Gu, Gg = T.shape
+    if bases is None:
+        bases = init_factors(T, R, seed=seed)
+    W, V, G = (basis[:, :R].contiguous() for basis in bases)
     T1 = T.reshape(d, -1)
     T2 = T.permute(1, 0, 2).reshape(Gu, -1)
     T3 = T.permute(2, 0, 1).reshape(Gg, -1)
@@ -202,10 +231,12 @@ def cp_als(T: torch.Tensor, R: int, iters: int, seed: int = 0):
         ZtZ = ZtZ + ridge * torch.eye(ZtZ.shape[0], dtype=Z.dtype, device=Z.device)
         return unfolding @ Z @ torch.linalg.inv(ZtZ)
 
-    for _ in range(iters):
+    for iteration in range(iters):
         W = solve(T1, V, G)
         V = solve(T2, W, G)
         G = solve(T3, W, V)
+        if heartbeat is not None:
+            heartbeat(iteration)
     return W, V, G
 
 
@@ -275,26 +306,72 @@ def run_checkpoint(args) -> None:
     header = ["layer", "kind"] + [f"CP@{r}" for r in ranks]
     rows = [header]
     verdicts = []
+    def _fmt(seconds: float) -> str:
+        seconds = int(seconds)
+        if seconds < 60:
+            return f"{seconds}s"
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+
+    total_steps = len(layers) * len(ranks)
+    hidden = int(config["hidden_size"])
+    macs_per_rank_iter = (
+        hidden * intermediate  # mode-1 solve: d x I against I x R
+        + 2 * hidden * up_groups * gate_groups  # mode-2/3 solves (small)
+    )
+    total_macs = (
+        len(layers) * args.iters * sum(ranks) * macs_per_rank_iter
+    )
+    print(
+        f"sweep: {len(layers)} layers x {len(ranks)} ranks x {args.iters} ALS "
+        f"iters = {total_steps} steps, ~{2 * total_macs / 1e12:.0f} Tflops of "
+        "GEMM work (plus one SVD-basis build per layer)"
+    )
+    t_sweep = time.perf_counter()
+    done = 0
     for layer in layers:
         prefix = f"layers.{layer}.mlp"
         W_eff, kind = effective_readout(prefix, state, intermediate)
         W_eff = W_eff.to(device)
         T = outer_tensor(W_eff, gate_groups, up_groups)
+        t0 = time.perf_counter()
+        bases = init_factors(T, max(ranks), seed=layer * 1000 + max(ranks))
+        print(
+            f"[layer {layer}] {kind} readout reconstructed, HOSVD bases ready "
+            f"({_fmt(time.perf_counter() - t0)})",
+            flush=True,
+        )
         captures = []
         for R in ranks:
             t0 = time.perf_counter()
-            factors = cp_als(T, R, args.iters, seed=layer * 1000 + R)
+
+            def heartbeat(iteration, _t0=t0, _R=R):
+                stride = max(1, args.iters // 5)
+                if (iteration + 1) % stride == 0:
+                    print(
+                        f"    layer {layer} R={_R}: ALS iter {iteration + 1}/"
+                        f"{args.iters} ({time.perf_counter() - _t0:.1f}s)",
+                        flush=True,
+                    )
+
+            factors = cp_als(
+                T, R, args.iters, bases=bases, heartbeat=heartbeat if args.verbose else None
+            )
             captures.append(cp_captured_energy(T, factors))
-            if args.verbose:
-                print(
-                    f"  layer {layer} R={R}: {captures[-1]:.4f} "
-                    f"({time.perf_counter() - t0:.1f}s)"
-                )
+            done += 1
+            elapsed = time.perf_counter() - t_sweep
+            eta = elapsed / done * (total_steps - done)
+            print(
+                f"[{done}/{total_steps}] layer {layer} R={R}: captured "
+                f"{captures[-1]:.4f} ({time.perf_counter() - t0:.1f}s, elapsed "
+                f"{_fmt(elapsed)}, eta {_fmt(eta)})",
+                flush=True,
+            )
         svd_curve = svd_capture_curve(W_eff, ranks)
         rows.append(
             [str(layer), kind] + [f"{c:.3f}" for c in captures]
         )
         verdicts.append((layer, dict(zip(ranks, captures)), svd_curve))
+    print(f"sweep done in {_fmt(time.perf_counter() - t_sweep)}\n", flush=True)
 
     width = max(len(cell) for row in rows for cell in row)
     for row in rows:
