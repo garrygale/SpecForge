@@ -105,8 +105,10 @@ def build_fold_mixture_matrix(fold_logits: torch.Tensor, intermediate_size: int)
     weights = torch.softmax(fold_logits.float(), dim=0)  # (c, K)
     branches, granularity = weights.shape
     folded_size = intermediate_size // branches
-    A = torch.zeros(folded_size, intermediate_size, dtype=weights.dtype)
-    q = torch.arange(folded_size)
+    A = torch.zeros(
+        folded_size, intermediate_size, dtype=weights.dtype, device=weights.device
+    )
+    q = torch.arange(folded_size, device=weights.device)
     for branch in range(branches):
         A[q, branch * folded_size + q] = weights[branch, q % granularity]
     return A
@@ -171,10 +173,11 @@ def _left_vectors(M: torch.Tensor, count: int, generator) -> torch.Tensor:
         return U[:, :count]
     # R can exceed a mode's dimension (e.g. R=2048 > G_g=76), where an
     # orthonormal padding is impossible; normalized random columns suffice
-    # as an ALS init.
+    # as an ALS init.  The CPU generator keeps the seed reproducible across
+    # devices; move the sample to M's device before mixing it in.
     extra = torch.randn(
         M.shape[0], count - U.shape[1], generator=generator, dtype=M.dtype
-    )
+    ).to(M.device)
     extra = extra / extra.norm(dim=0, keepdim=True)
     return torch.cat([U, extra], dim=1)
 
