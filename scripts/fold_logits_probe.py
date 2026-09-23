@@ -61,6 +61,13 @@ def _normalize_keys(state: dict) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--logit-scale",
+        type=float,
+        default=1.0,
+        help="forward multiplier from ffn_readout.logit_scale, so the stats "
+        "reflect the effective (scaled) logits",
+    )
     args = parser.parse_args()
 
     state = _normalize_keys(_load_state_dict(args.checkpoint))
@@ -74,11 +81,14 @@ def main() -> None:
             "checkpoint's down_proj is dense or the ffn_readout knob was off"
         )
 
-    print(f"fold-logit probe on {args.checkpoint} ({len(keys)} layers)\n")
+    print(
+        f"fold-logit probe on {args.checkpoint} ({len(keys)} layers, "
+        f"logit_scale={args.logit_scale})"
+    )
     flat_layers = 0
     for key in keys:
         layer = key.split(".")[1]
-        logits = state[key].float()
+        logits = state[key].float() * args.logit_scale
         branches, granularity = logits.shape
         weights = torch.softmax(logits, dim=0)
         tv = 0.5 * (weights - 1.0 / branches).abs().sum(dim=0)

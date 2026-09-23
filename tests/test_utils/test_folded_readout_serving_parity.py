@@ -175,6 +175,7 @@ def _serving_readout(
     readout.fold_axis = "channel"
     readout.gate_groups = None
     readout.up_groups = None
+    readout.logit_scale = 1.0
     readout.tp_size = 1
     readout.tp_rank = 0
     readout.local_hidden_size = intermediate_size

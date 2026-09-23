@@ -88,16 +88,23 @@ def resolve_folded_readout(config) -> Optional[Dict[str, object]]:
     if raw is None or raw is False:
         return None
     if isinstance(raw, str):
-        mode, spec, fold_axis = raw, {}, "channel"
+        mode, spec, fold_axis, logit_scale = raw, {}, "channel", 1.0
     elif isinstance(raw, dict):
         spec = dict(raw)
         mode = spec.pop("mode", FOLDED_READOUT_MODE)
         fold_axis = spec.pop("fold_axis", "channel")
+        logit_scale = spec.pop("logit_scale", 1.0)
         unknown = sorted(set(spec) - {"branches", "granularity"})
         if unknown:
             raise ValueError(
                 f"unknown dflash_config.{FOLDED_READOUT_KEY} entries {unknown}; "
-                "expected 'mode', 'branches', 'granularity' and 'fold_axis'"
+                "expected 'mode', 'branches', 'granularity', 'fold_axis' and "
+                "'logit_scale'"
+            )
+        logit_scale = float(logit_scale)
+        if not logit_scale > 0:
+            raise ValueError(
+                f"logit_scale must be > 0, got {logit_scale}"
             )
     else:
         raise ValueError(
@@ -168,6 +175,7 @@ def resolve_folded_readout(config) -> Optional[Dict[str, object]]:
             "fold_axis": "gate",
             "gate_groups": gate_groups,
             "up_groups": up_groups,
+            "logit_scale": logit_scale,
         }
 
     if intermediate_size % branches:
@@ -201,6 +209,7 @@ def resolve_folded_readout(config) -> Optional[Dict[str, object]]:
         "fold_axis": "channel",
         "gate_groups": None,
         "up_groups": None,
+        "logit_scale": logit_scale,
     }
 
 
@@ -230,6 +239,7 @@ class FoldedSoftmaxReadout(nn.Module):
         fold_axis: str = "channel",
         gate_groups: Optional[int] = None,
         up_groups: Optional[int] = None,
+        logit_scale: float = 1.0,
         bias: bool = False,
         device=None,
         dtype=None,
@@ -237,6 +247,9 @@ class FoldedSoftmaxReadout(nn.Module):
         super().__init__()
         branches = int(branches)
         granularity = int(granularity)
+        logit_scale = float(logit_scale)
+        if not logit_scale > 0:
+            raise ValueError(f"logit_scale must be > 0, got {logit_scale}")
         if fold_axis not in ("channel", "gate"):
             raise ValueError(
                 f"fold_axis must be 'channel' or 'gate', got {fold_axis!r}"
@@ -287,6 +300,7 @@ class FoldedSoftmaxReadout(nn.Module):
         self.fold_axis = fold_axis
         self.gate_groups = gate_groups
         self.up_groups = up_groups
+        self.logit_scale = logit_scale
         self.folded_size = folded_size
         self.repeats = (
             (gate_groups // branches) // granularity
@@ -314,9 +328,14 @@ class FoldedSoftmaxReadout(nn.Module):
         weights (``torch.softmax(self.layer_fusion_weights, dim=1)``).  The
         logits ride the module dtype, so the mixture already matches the
         activations it multiplies — no fp32 round-trip, no cast back.
+        ``logit_scale`` is a SIREN-style sensitivity multiplier (fixed in the
+        forward, no param groups): under Adam's roughly constant per-step
+        parameter movement, a scale of ``c`` sharpens the mixture ``c`` times
+        faster and shrinks weight decay's pull on the mixture by ``c``.  The
+        zero init is unaffected.
         """
 
-        return torch.softmax(self.fold_logits, dim=0)
+        return torch.softmax(self.logit_scale * self.fold_logits, dim=0)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         lead = hidden_states.shape[:-1]
@@ -413,6 +432,7 @@ class FoldedSoftmaxMLP(nn.Module):
         *,
         branches: int,
         granularity: int = DEFAULT_FOLDED_GRANULARITY,
+        logit_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.config = config
@@ -425,6 +445,7 @@ class FoldedSoftmaxMLP(nn.Module):
             self.intermediate_size,
             branches=branches,
             granularity=granularity,
+            logit_scale=logit_scale,
         )
         self.act_fn = ACT2FN[getattr(config, "hidden_act", "silu")]
 
@@ -705,6 +726,7 @@ def _make_qwen3_mlp(config: Qwen3Config) -> nn.Module:
             config,
             branches=folded["branches"],
             granularity=folded["granularity"],
+            logit_scale=folded["logit_scale"],
         )
     return SharedGLUMLP(config, folded=folded, **sharing)
 

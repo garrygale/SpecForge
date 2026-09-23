@@ -356,7 +356,46 @@ class TestGateAxisFold(unittest.TestCase):
                 "fold_axis": "gate",
                 "gate_groups": 12,
                 "up_groups": 4,
+                "logit_scale": 1.0,
             },
+        )
+
+    def test_resolver_logit_scale_passthrough(self):
+        resolved = resolve_folded_readout(
+            _compose_config(
+                GATE_LATTICE, {**GATE_FOLD, "logit_scale": 10.0}
+            )
+        )
+        self.assertEqual(resolved["logit_scale"], 10.0)
+        with self.assertRaises(ValueError):
+            resolve_folded_readout(
+                _compose_config(GATE_LATTICE, {**GATE_FOLD, "logit_scale": 0})
+            )
+
+    def test_logit_scale_multiplies_the_mixture(self):
+        torch.manual_seed(9)
+        scaled = DEFAULT_DFLASH_KERNELS.make_mlp(
+            _compose_config(GATE_LATTICE, {**GATE_FOLD, "logit_scale": 5.0})
+        )
+        with torch.no_grad():
+            # Same raw logits everywhere; only the forward multiplier differs.
+            scaled.down_proj.fold_logits.normal_(std=1.0)
+        expected = torch.softmax(
+            5.0 * scaled.down_proj.fold_logits.detach(), dim=0
+        )
+        self.assertTrue(
+            torch.allclose(scaled.down_proj.fold_weights(), expected, atol=1e-6)
+        )
+        # Zero init: a scale changes nothing until the logits move.
+        fresh = DEFAULT_DFLASH_KERNELS.make_mlp(
+            _compose_config(GATE_LATTICE, {**GATE_FOLD, "logit_scale": 5.0})
+        )
+        self.assertTrue(
+            torch.allclose(
+                fresh.down_proj.fold_weights(),
+                torch.full((4, 3), 0.25),
+                atol=1e-6,
+            )
         )
 
     def test_resolver_rejects_misaligned_gate_fold(self):

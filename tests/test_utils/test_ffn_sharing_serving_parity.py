@@ -61,6 +61,8 @@ SHARING_LAYOUTS = (
     ("outer", 8, 16, (4, 8)),  # outer lattice + channel-axis fold
     ("outer", 8, 16, (4, 2, "gate")),  # gate-axis fold, fully untied slots
     ("outer", 8, 16, (2, 4, "gate")),  # gate-axis fold, milder 2x cut
+    # SIREN-style sensitivity multiplier on the mixture logits.
+    ("outer", 8, 16, (4, 2, "gate", 10.0)),
 )
 
 
@@ -197,6 +199,8 @@ def _draft_config(sharing, readout):
         }
         if len(readout) > 2:
             entry["fold_axis"] = readout[2]
+        if len(readout) > 3:
+            entry["logit_scale"] = readout[3]
         dflash_config["ffn_readout"] = entry
     return SimpleNamespace(
         hidden_size=HIDDEN,
@@ -257,6 +261,8 @@ def _serving_mlp(
                 "gate_groups": gate_groups,
                 "up_groups": up_groups,
             }
+        if len(readout) > 3:
+            readout_kwargs["logit_scale"] = readout[3]
         serving.down_proj = readout_cls(
             hidden_size=HIDDEN,
             intermediate_size=INTERMEDIATE,

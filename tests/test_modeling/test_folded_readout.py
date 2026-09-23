@@ -72,6 +72,7 @@ class TestResolveFoldedReadout(unittest.TestCase):
                 "fold_axis": "channel",
                 "gate_groups": None,
                 "up_groups": None,
+                "logit_scale": 1.0,
             },
         )
 
@@ -86,6 +87,7 @@ class TestResolveFoldedReadout(unittest.TestCase):
                 "fold_axis": "channel",
                 "gate_groups": None,
                 "up_groups": None,
+                "logit_scale": 1.0,
             },
         )
 
@@ -105,6 +107,7 @@ class TestResolveFoldedReadout(unittest.TestCase):
                 "fold_axis": "channel",
                 "gate_groups": None,
                 "up_groups": None,
+                "logit_scale": 1.0,
             },
         )
         # A 3N intermediate keeps the 3N -> N -> N shape of the design note.
@@ -122,6 +125,7 @@ class TestResolveFoldedReadout(unittest.TestCase):
                 "fold_axis": "channel",
                 "gate_groups": None,
                 "up_groups": None,
+                "logit_scale": 1.0,
             },
         )
 
@@ -163,6 +167,7 @@ class TestResolveFoldedReadout(unittest.TestCase):
                 "fold_axis": "channel",
                 "gate_groups": None,
                 "up_groups": None,
+                "logit_scale": 1.0,
             },
         )
         # Analytic ledger per draft layer: gate/up keep 2NM, the folded path
