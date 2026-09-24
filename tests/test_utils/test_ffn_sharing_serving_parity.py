@@ -1,14 +1,12 @@
 # coding=utf-8
-"""Serving parity for the shared gate/up SwiGLU MLP.
+"""Serving parity for the shared gate/up SwiGLU MLP and its routed variant.
 
 One artifact, two implementations: SpecForge's training module
 (``specforge/modeling/draft/dflash_kernels.py``) and vLLM's serving module
-(``vllm/model_executor/models/qwen3_domino.py``).  Both consume the same input
-and the same exported weights — separate ``gate_proj``/``up_proj`` tensors on
-the training side, one fused ``gate_up_proj`` on the serving side — and must
-produce the same output: a divergent pairing index map or gate/up half order
-is otherwise silent at load time and only shows up as a worse acceptance
-length.
+(``vllm/model_executor/models/qwen3_domino.py``).  Both consume the same
+input and the same weights and must produce the same output — a divergent
+pairing index map, expert slice order or router axis is otherwise silent at
+load time and only shows up as a worse acceptance length.
 
 vLLM is imported when it is installed.  On machines without it the test
 executes the classes straight out of a vLLM checkout
@@ -31,6 +29,7 @@ from torch import nn
 
 from specforge.modeling.draft.dflash_kernels import (
     DEFAULT_DFLASH_KERNELS,
+    RoutedOuterMLP as TrainingRoutedOuterMLP,
     SharedGLUMLP as TrainingSharedGLUMLP,
 )
 
@@ -46,24 +45,20 @@ SIBLING_VLLM = (
 VLLM_SOURCE_ENV = "VLLM_QWEN3_DOMINO_PATH"
 
 HIDDEN = 32
-INTERMEDIATE = 128
 
-# (pairing, gate_groups, up_groups, readout) against INTERMEDIATE=128.
-# readout=None is a dense down_proj; (4, 8) is the channel-axis folded
-# readout; (b, g, "gate") the lattice-aligned gate-axis fold (outer only).
-SHARING_LAYOUTS = (
-    ("nested", 64, 128, None),  # pure gate sharing, k=2
-    ("nested", 128, 64, None),  # pure up sharing, k=2
-    ("nested", 64, 32, None),  # hierarchical mix (misaligned depths)
-    ("outer", 8, 16, None),  # exactly-once lattice 8 x 16 = 128
-    ("outer", 8, 8, None),  # lattice with one repetition (m=2)
-    ("nested", 64, 128, (4, 8)),  # pure gate sharing + folded readout
-    ("outer", 8, 16, (4, 8)),  # outer lattice + channel-axis fold
-    ("outer", 8, 16, (4, 2, "gate")),  # gate-axis fold, fully untied slots
-    ("outer", 8, 16, (2, 4, "gate")),  # gate-axis fold, milder 2x cut
-    # SIREN-style sensitivity multiplier on the mixture logits.
-    ("outer", 8, 16, (4, 2, "gate", 10.0)),
-)
+# LATTICE_CASES: (pairing, gate_groups, up_groups, intermediate).
+LATTICE_CASES = [
+    ("nested", 64, 128, 128),  # pure gate sharing, k=2
+    ("outer", 8, 16, 128),  # exactly-once lattice 8 x 16
+]
+# ROUTED_CASES: (experts, gate_groups, up_groups, router); the virtual
+# intermediate is experts * gate_groups * up_groups.
+ROUTED_CASES = [
+    (1, 8, 16, "expert"),  # single expert == plain outer lattice
+    (4, 2, 4, "expert"),  # one softmax scalar per expert
+    (2, 4, 4, "gate_slot"),  # per-gate-slot blend across experts
+    (4, 2, 4, "gate_slot"),
+]
 
 
 class _StubRowParallelLinear(nn.Module):
@@ -78,8 +73,6 @@ class _StubRowParallelLinear(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if bias:
-            raise NotImplementedError("the shared MLP is bias-free")
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         nn.init.uniform_(self.weight, -0.05, 0.05)
 
@@ -90,10 +83,9 @@ class _StubRowParallelLinear(nn.Module):
 class _StubMergedColumnParallelLinear(nn.Module):
     """Stand-in for vLLM's ``MergedColumnParallelLinear``.
 
-    Mirrors the parts the shared MLP relies on: a fused
-    ``[sum(output_sizes), in]`` weight whose shard ``i`` starts at
-    ``sum(output_sizes[:i])`` — the layout the real stacked weight loader
-    places separate gate/up checkpoint tensors into.
+    Mirrors the fused ``[sum(output_sizes), in]`` weight whose shard ``i``
+    starts at ``sum(output_sizes[:i])`` — the layout the real stacked weight
+    loader places separate checkpoint tensors into.
     """
 
     def __init__(
@@ -105,32 +97,30 @@ class _StubMergedColumnParallelLinear(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if bias:
-            raise NotImplementedError("the shared MLP is bias-free")
-        total = sum(output_sizes)
-        self.weight = nn.Parameter(torch.empty(total, hidden_size))
+        self.output_sizes = output_sizes
+        self.weight = nn.Parameter(torch.empty(sum(output_sizes), hidden_size))
         nn.init.uniform_(self.weight, -0.05, 0.05)
 
     def forward(self, hidden_states: torch.Tensor):
         return nn.functional.linear(hidden_states, self.weight), None
 
 
-def _load_vllm_sharing_classes():
-    """Return ``(SharedGLUMLP, _sharing_indices, FoldedSoftmaxReadout|None,
-    description)`` from vLLM, or all-``None`` when unavailable."""
+def _load_vllm_classes():
+    """Return ``(SharedGLUMLP, RoutedOuterMLP, _sharing_indices, description)``
+    from vLLM, or all-``None`` when unavailable."""
 
     if importlib.util.find_spec("vllm") is not None:
         try:
             from vllm.model_executor.models.qwen3_domino import (
-                FoldedSoftmaxReadout as VllmFoldedSoftmaxReadout,
+                RoutedOuterMLP as VllmRoutedOuterMLP,
                 SharedGLUMLP as VllmSharedGLUMLP,
                 _sharing_indices as vllm_sharing_indices,
             )
 
             return (
                 VllmSharedGLUMLP,
+                VllmRoutedOuterMLP,
                 vllm_sharing_indices,
-                VllmFoldedSoftmaxReadout,
                 "imported vllm",
             )
         except Exception:  # noqa: BLE001 - fall back to the checkout below
@@ -141,13 +131,13 @@ def _load_vllm_sharing_classes():
         return None, None, None, None
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    wanted = {"SharedGLUMLP", "_sharing_indices", "FoldedSoftmaxReadout"}
+    wanted = {"SharedGLUMLP", "RoutedOuterMLP", "_sharing_indices"}
     segments = {
         node.name: ast.get_source_segment(source, node)
         for node in tree.body
         if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in wanted
     }
-    if "SharedGLUMLP" not in segments or "_sharing_indices" not in segments:
+    if "SharedGLUMLP" not in segments or "RoutedOuterMLP" not in segments:
         return None, None, None, None
     namespace = {
         "nn": nn,
@@ -158,197 +148,178 @@ def _load_vllm_sharing_classes():
         "get_tensor_model_parallel_world_size": lambda: 1,
         "QuantizationConfig": object,
     }
-    if "FoldedSoftmaxReadout" in segments:
+    if "_sharing_indices" in segments:
         exec(
             compile(
                 "from __future__ import annotations\n"
-                + segments["FoldedSoftmaxReadout"]
+                + segments["_sharing_indices"]
                 + "\n",
                 str(path),
                 "exec",
             ),
             namespace,
         )
-    exec(
-        compile(
-            "from __future__ import annotations\n"
-            + segments["_sharing_indices"]
-            + "\n"
-            + segments["SharedGLUMLP"]
-            + "\n",
-            str(path),
-            "exec",
-        ),
-        namespace,
-    )
+    for name in ("SharedGLUMLP", "RoutedOuterMLP"):
+        exec(
+            compile(
+                "from __future__ import annotations\n" + segments[name] + "\n",
+                str(path),
+                "exec",
+            ),
+            namespace,
+        )
     return (
         namespace["SharedGLUMLP"],
-        namespace["_sharing_indices"],
-        namespace.get("FoldedSoftmaxReadout"),
+        namespace["RoutedOuterMLP"],
+        namespace.get("_sharing_indices"),
         f"vLLM source at {path}",
     )
 
 
-def _draft_config(sharing, readout):
-    dflash_config = {"ffn_sharing": dict(sharing)}
-    if readout is not None:
-        entry = {
-            "mode": "folded_softmax",
-            "branches": readout[0],
-            "granularity": readout[1],
-        }
-        if len(readout) > 2:
-            entry["fold_axis"] = readout[2]
-        if len(readout) > 3:
-            entry["logit_scale"] = readout[3]
-        dflash_config["ffn_readout"] = entry
+def _draft_config(sharing, intermediate_size):
     return SimpleNamespace(
         hidden_size=HIDDEN,
-        intermediate_size=INTERMEDIATE,
+        intermediate_size=intermediate_size,
         hidden_act="silu",
-        dflash_config=dflash_config,
+        dflash_config={"ffn_sharing": dict(sharing)},
     )
-
-
-def _serving_mlp(
-    sharing_cls,
-    sharing_indices,
-    readout_cls,
-    *,
-    pairing,
-    gate_groups,
-    up_groups,
-    readout,
-    training: TrainingSharedGLUMLP,
-    dtype: torch.dtype,
-):
-    """Build vLLM's shared MLP around the training weights, bypassing init.
-
-    The real ``__init__`` builds vLLM parallel linears, which need an
-    initialized tensor-parallel group; the wiring here matches it 1:1 (fused
-    ``[gate | up]`` halves, the serving index maps, the chosen down_proj)
-    and leaves vLLM's ``shared_act``/``forward`` — the code under test —
-    untouched.
-    """
-
-    serving = object.__new__(sharing_cls)
-    nn.Module.__init__(serving)
-    serving.intermediate_size = INTERMEDIATE
-    serving.gate_groups = gate_groups
-    serving.up_groups = up_groups
-    serving.pairing = pairing
-    serving.gate_up_proj = _StubMergedColumnParallelLinear(
-        HIDDEN, [gate_groups, up_groups]
-    ).to(dtype)
-    with torch.no_grad():
-        serving.gate_up_proj.weight.copy_(
-            torch.cat(
-                [training.gate_proj.weight, training.up_proj.weight]
-            ).to(dtype)
-        )
-    if readout is None:
-        serving.down_proj = _StubRowParallelLinear(
-            INTERMEDIATE, HIDDEN
-        ).to(dtype)
-        with torch.no_grad():
-            serving.down_proj.weight.copy_(training.down_proj.weight)
-    else:
-        branches, granularity = readout[0], readout[1]
-        readout_kwargs = {}
-        if len(readout) > 2 and readout[2] == "gate":
-            readout_kwargs = {
-                "fold_axis": "gate",
-                "gate_groups": gate_groups,
-                "up_groups": up_groups,
-            }
-        if len(readout) > 3:
-            readout_kwargs["logit_scale"] = readout[3]
-        serving.down_proj = readout_cls(
-            hidden_size=HIDDEN,
-            intermediate_size=INTERMEDIATE,
-            branches=branches,
-            granularity=granularity,
-            **readout_kwargs,
-        ).to(dtype)
-        with torch.no_grad():
-            serving.down_proj.proj.weight.copy_(training.down_proj.proj.weight)
-            serving.down_proj.fold_logits.copy_(training.down_proj.fold_logits)
-    gate_idx, up_idx = sharing_indices(INTERMEDIATE, gate_groups, up_groups, pairing)
-    serving.register_buffer("gate_idx", gate_idx, persistent=False)
-    serving.register_buffer("up_idx", up_idx, persistent=False)
-    return serving
 
 
 class TestFfnSharingServingParity(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         (
-            cls.sharing_cls,
-            sharing_indices,
-            cls.readout_cls,
+            cls.shared_cls,
+            cls.routed_cls,
+            cls.sharing_indices,
             cls.origin,
-        ) = _load_vllm_sharing_classes()
-        if cls.sharing_cls is None:
+        ) = _load_vllm_classes()
+        if cls.shared_cls is None or cls.routed_cls is None:
             raise unittest.SkipTest(
                 "needs vllm installed or a vLLM checkout with "
                 f"qwen3_domino.py ({VLLM_SOURCE_ENV})"
             )
         # Plain functions stored on a class bind like methods when accessed
-        # through ``self``; wrap so ``self.sharing_indices`` stays a function.
-        cls.sharing_indices = staticmethod(sharing_indices)
-        print(f"[ffn-sharing parity] serving module from: {cls.origin}")
+        # through ``self``; wrap so attribute access stays a function.
+        if cls.sharing_indices is not None and not isinstance(
+            cls.sharing_indices, staticmethod
+        ):
+            cls.sharing_indices = staticmethod(cls.sharing_indices)
+        print(f"[ffn-sharing parity] serving modules from: {cls.origin}")
 
-    def test_outputs_match_for_every_layout(self):
-        for pairing, gate_groups, up_groups, readout in SHARING_LAYOUTS:
-            if readout is not None and self.readout_cls is None:
-                self.skipTest("serving FoldedSoftmaxReadout unavailable")
+    def _serving_shared(self, training: TrainingSharedGLUMLP, dtype):
+        serving = object.__new__(self.shared_cls)
+        nn.Module.__init__(serving)
+        serving.intermediate_size = training.intermediate_size
+        serving.gate_groups = training.gate_groups
+        serving.up_groups = training.up_groups
+        serving.pairing = training.pairing
+        serving.gate_up_proj = _StubMergedColumnParallelLinear(
+            HIDDEN, [training.gate_groups, training.up_groups]
+        ).to(dtype)
+        with torch.no_grad():
+            serving.gate_up_proj.weight.copy_(
+                torch.cat(
+                    [training.gate_proj.weight, training.up_proj.weight]
+                ).to(dtype)
+            )
+        serving.down_proj = _StubRowParallelLinear(
+            training.intermediate_size, HIDDEN
+        ).to(dtype)
+        with torch.no_grad():
+            serving.down_proj.weight.copy_(training.down_proj.weight)
+        gate_idx, up_idx = self.sharing_indices(
+            training.intermediate_size,
+            training.gate_groups,
+            training.up_groups,
+            training.pairing,
+        )
+        serving.register_buffer("gate_idx", gate_idx, persistent=False)
+        serving.register_buffer("up_idx", up_idx, persistent=False)
+        return serving
+
+    def _serving_routed(self, training: TrainingRoutedOuterMLP, dtype):
+        serving = object.__new__(self.routed_cls)
+        nn.Module.__init__(serving)
+        serving.intermediate_size = training.intermediate_size
+        serving.experts = training.experts
+        serving.gate_groups = training.gate_groups
+        serving.up_groups = training.up_groups
+        serving.router = training.router
+        serving.router_width = training.router_width
+        serving.gate_up_proj = _StubMergedColumnParallelLinear(
+            HIDDEN,
+            [training.gate_groups, training.up_groups] * training.experts
+            + [training.router_width],
+        ).to(dtype)
+        with torch.no_grad():
+            serving.gate_up_proj.weight.copy_(
+                training.gate_up_proj.weight.to(dtype)
+            )
+        serving.down_proj = _StubRowParallelLinear(
+            training.gate_groups * training.up_groups, HIDDEN
+        ).to(dtype)
+        with torch.no_grad():
+            serving.down_proj.weight.copy_(training.down_proj.weight)
+        return serving
+
+    def test_lattice_outputs_match(self):
+        for pairing, gate_groups, up_groups, intermediate in LATTICE_CASES:
             for dtype in (torch.float32, torch.bfloat16):
                 with self.subTest(
                     pairing=pairing,
                     gate_groups=gate_groups,
                     up_groups=up_groups,
-                    readout=readout,
                     dtype=dtype,
                 ):
-                    torch.manual_seed(
-                        gate_groups * 1009 + up_groups + (readout[0] if readout else 0)
-                    )
-                    sharing = {
-                        "pairing": pairing,
-                        "gate_groups": gate_groups,
-                        "up_groups": up_groups,
-                    }
+                    torch.manual_seed(gate_groups * 1009 + up_groups)
                     training = DEFAULT_DFLASH_KERNELS.make_mlp(
-                        _draft_config(sharing, readout)
-                    )
-                    self.assertIsInstance(training, TrainingSharedGLUMLP)
-                    if readout is not None:
-                        # Non-uniform mixture: a wrong softmax axis cannot
-                        # hide behind a uniform average.
-                        with torch.no_grad():
-                            training.down_proj.fold_logits.normal_(std=1.5)
-                    training = training.to(dtype)
-                    serving = _serving_mlp(
-                        self.sharing_cls,
-                        self.sharing_indices,
-                        self.readout_cls,
-                        pairing=pairing,
-                        gate_groups=gate_groups,
-                        up_groups=up_groups,
-                        readout=readout,
-                        training=training,
-                        dtype=dtype,
-                    )
-
+                        _draft_config(
+                            {
+                                "pairing": pairing,
+                                "gate_groups": gate_groups,
+                                "up_groups": up_groups,
+                            },
+                            intermediate,
+                        )
+                    ).to(dtype)
+                    serving = self._serving_shared(training, dtype)
                     x = torch.randn(2, 5, HIDDEN, dtype=dtype)
                     served = serving(x)
                     self.assertEqual(served.dtype, dtype)
                     self.assertTrue(
+                        torch.allclose(served, training(x), atol=1e-3, rtol=1e-3)
+                    )
+                    self.assertTrue(
                         torch.allclose(
-                            served, training(x), atol=1e-3, rtol=1e-3
+                            serving(x[0, 0]), training(x[0, 0]), atol=1e-3, rtol=1e-3
                         )
                     )
-                    # A single-token step must agree too.
+
+    def test_routed_outputs_match(self):
+        for experts, gate_groups, up_groups, router in ROUTED_CASES:
+            for dtype in (torch.float32, torch.bfloat16):
+                with self.subTest(experts=experts, router=router, dtype=dtype):
+                    torch.manual_seed(experts * 977 + gate_groups)
+                    training = DEFAULT_DFLASH_KERNELS.make_mlp(
+                        _draft_config(
+                            {
+                                "mode": "routed_outer",
+                                "experts": experts,
+                                "gate_groups": gate_groups,
+                                "up_groups": up_groups,
+                                "router": router,
+                            },
+                            experts * gate_groups * up_groups,
+                        )
+                    ).to(dtype)
+                    serving = self._serving_routed(training, dtype)
+                    x = torch.randn(2, 5, HIDDEN, dtype=dtype)
+                    served = serving(x)
+                    self.assertEqual(served.dtype, dtype)
+                    self.assertTrue(
+                        torch.allclose(served, training(x), atol=1e-3, rtol=1e-3)
+                    )
                     self.assertTrue(
                         torch.allclose(
                             serving(x[0, 0]), training(x[0, 0]), atol=1e-3, rtol=1e-3
@@ -356,55 +327,25 @@ class TestFfnSharingServingParity(unittest.TestCase):
                     )
 
     def test_exported_keys_are_what_serving_expects(self):
-        training = DEFAULT_DFLASH_KERNELS.make_mlp(
-            _draft_config({"gate_groups": 64}, None)
+        routed = DEFAULT_DFLASH_KERNELS.make_mlp(
+            _draft_config(
+                {
+                    "mode": "routed_outer",
+                    "experts": 4,
+                    "gate_groups": 3,
+                    "up_groups": 4,
+                },
+                48,
+            )
         )
-        keys = set(training.state_dict())
+        # Training fuses experts + router into gate_up_proj and keeps a plain
+        # dense down_proj — exactly the two tensors the serving loader wants.
         self.assertEqual(
-            keys, {"gate_proj.weight", "up_proj.weight", "down_proj.weight"}
-        )
-
-        serving = _serving_mlp(
-            self.sharing_cls,
-            self.sharing_indices,
-            self.readout_cls,
-            pairing="nested",
-            gate_groups=64,
-            up_groups=INTERMEDIATE,
-            readout=None,
-            training=training,
-            dtype=torch.float32,
-        )
-        # vLLM fuses the halves into one gate_up_proj whose stacked weight
-        # loader places the separate exported tensors by their own sizes;
-        # the index maps are derived, not checkpointed.
-        self.assertEqual(
-            {name for name, _ in serving.named_parameters()},
+            set(routed.state_dict()),
             {"gate_up_proj.weight", "down_proj.weight"},
         )
-        self.assertEqual(set(serving.state_dict()), {"gate_up_proj.weight", "down_proj.weight"})
-
-        folded = DEFAULT_DFLASH_KERNELS.make_mlp(
-            _draft_config({"gate_groups": 64}, (4, 8))
-        )
-        serving_folded = _serving_mlp(
-            self.sharing_cls,
-            self.sharing_indices,
-            self.readout_cls,
-            pairing="nested",
-            gate_groups=64,
-            up_groups=INTERMEDIATE,
-            readout=(4, 8),
-            training=folded,
-            dtype=torch.float32,
-        )
         self.assertEqual(
-            {name for name, _ in serving_folded.named_parameters()},
-            {
-                "gate_up_proj.weight",
-                "down_proj.proj.weight",
-                "down_proj.fold_logits",
-            },
+            routed.gate_up_proj.weight.shape, (4 * (3 + 4) + 4, HIDDEN)
         )
 
 

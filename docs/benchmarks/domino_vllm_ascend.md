@@ -83,24 +83,24 @@ The exported draft `config.json` must use:
   trained with the default already matches the service; only set `true` to run
   (and retrain) the causal variant
 * `dflash_config.qat_w_bit`: 4 (W4A8 bulk) with `qat_w4a4_layers`
-* `dflash_config.ffn_sharing` (optional): shared gate/up projections —
-  `{"pairing": "nested"|"outer", "gate_groups": G_g, "up_groups": G_u}`
-  where each side defaults to `intermediate_size` (no sharing). `nested` is
-  contiguous block grouping (pure gate sharing, pure up sharing or a
-  hierarchical mix); `outer` is the full `G_g x G_u` lattice over the down
-  channels (`G_g * G_u` must divide `intermediate_size`; 76x128 keeps the
-  35B-A3B draft's 9728 exactly, while 64x64 requires
-  `intermediate_size: 4096`). Composes with `ffn_readout` (the folded
-  readout stays the down projection). The service fuses the exported
-  separate `gate_proj`/`up_proj` tensors into one `gate_up_proj` (unequal
-  halves load as-is), and — like the folded readout — requires
-  `draft_tensor_parallel_size=1`: the channel gather reads gate/up channels
-  owned by other ranks once column-parallel sharding kicks in. When composed
-  with `ffn_readout`, use `"fold_axis": "gate"` — the lattice-aligned fold
-  that pools products differing in gate; the default channel-axis fold under
-  `pairing='outer'` averages channels that share one gate (measured to cost
-  significant acceptance, both sides warn about it). See the
-  `qwen3.6-35b-a3b-domino-{gateshare-k2,upshare-k2,staggered-*}` configs.
+* `dflash_config.ffn_sharing`: the draft FFN variant.  `mode: "lattice"`
+  (default when absent) shares the gate/up projections across channels
+  (`pairing: "nested"|"outer"`, `gate_groups`/`up_groups`, each defaulting
+  to `intermediate_size`); `mode: "routed_outer"` runs `experts`
+  independent outer lattices (`gate_groups` x `up_groups` each) blended by
+  a router (`router: "expert"|"gate_slot"`) before one shared dense
+  `down_proj`, with `intermediate_size == experts * gate_groups *
+  up_groups`.  The router rides the fused `gate_up_proj` GEMM
+  (zero-initialized, so training starts at the uniform expert average) and
+  `experts=1` is exactly the plain outer lattice.  The service fuses the
+  exported `gate_up_proj` (experts + router rows, stacked-shard loader
+  handles it unchanged) and, like the retired folded readout, requires
+  `draft_tensor_parallel_size=1`.  `dflash_config.ffn_readout` is RETIRED
+  (the static mixture measured inert — fold-2 == half lattice) and is
+  rejected with an actionable error; serve old checkpoints from the
+  `outer_ffn_fold` tag.  See the
+  `qwen3.6-35b-a3b-domino-routedouter-{e1,e2,e4,e4-gateslot}` configs for
+  the experts sweep.
 
 The target auxiliary hidden states are looked up under
 `model.language_model.embed_tokens.weight` in the exporter and service.

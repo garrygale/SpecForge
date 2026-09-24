@@ -413,7 +413,12 @@ def run_synthetic(args) -> None:
     """Validate the pipeline: exact mixture reconstruction + planted CP rank."""
 
     torch.manual_seed(0)
-    from specforge.modeling.draft.dflash_kernels import FoldedSoftmaxReadout
+    try:
+        from specforge.modeling.draft.dflash_kernels import FoldedSoftmaxReadout
+    except ImportError:
+        print("fold mixture check skipped (folded readout retired; tag-era "
+              "checkpoints still readable)")
+        FoldedSoftmaxReadout = None
 
     d, I = 32, 128
     readout = FoldedSoftmaxReadout(d, I, branches=4, granularity=8)

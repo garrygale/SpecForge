@@ -37,38 +37,30 @@
     "channel_balanced": false,
     "target_hidden_size": 2048,
     "ffn_sharing": {
-      "pairing": "outer",
-      "gate_groups": 64,
-      "up_groups": 64
+      "mode": "routed_outer",
+      "experts": 2,
+      "gate_groups": 48,
+      "up_groups": 48,
+      "router": "expert"
     },
-    "qat_w4a4_layers": [
-      "layers.0.self_attn.q_proj",
-      "layers.0.self_attn.k_proj",
-      "layers.0.self_attn.v_proj",
-      "layers.0.mlp.up_proj",
-      "layers.2.mlp.up_proj",
-      "layers.4.mlp.up_proj",
-      "layers.0.mlp.gate_proj",
-      "layers.2.mlp.gate_proj",
-      "layers.4.mlp.gate_proj"
-    ],
     "sliding_window": [
-      3072,
-      2048,
+      2040,
+      1024,
       512,
       512,
       1024,
       1024,
-      3072
-    ]
+      2040
+    ],
+    "qat_w4a4_layers": []
   },
   "dtype": "bfloat16",
   "eos_token_id": 248044,
   "head_dim": 128,
   "hidden_act": "silu",
-  "hidden_size": 2560,
+  "hidden_size": 1536,
   "initializer_range": 0.02,
-  "intermediate_size": 4096,
+  "intermediate_size": 4608,
   "layer_types": [
     "sliding_attention",
     "sliding_attention",

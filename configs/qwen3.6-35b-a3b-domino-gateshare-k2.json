@@ -11,7 +11,15 @@
   "bos_token_id": 248044,
   "dflash_config": {
     "mask_token_id": 248070,
-    "target_layer_ids": [1, 7, 13, 19, 25, 31, 37],
+    "target_layer_ids": [
+      1,
+      7,
+      13,
+      19,
+      25,
+      31,
+      37
+    ],
     "projector_type": "domino",
     "fusion_mode": "flare",
     "heterogeneous_kv": true,
@@ -23,11 +31,16 @@
     "hidden_proj_dim": 256,
     "qat_w_bit": 4,
     "qat_a_bit": 8,
-    "qat_exclude": ["embed_proj"],
+    "qat_exclude": [
+      "embed_proj"
+    ],
     "channel_balanced": false,
     "target_hidden_size": 2048,
-    "ffn_readout": {"mode": "folded_softmax", "branches": 4, "granularity": 32},
-    "ffn_sharing": {"pairing": "nested", "gate_groups": 4864, "up_groups": 9728},
+    "ffn_sharing": {
+      "pairing": "nested",
+      "gate_groups": 4864,
+      "up_groups": 9728
+    },
     "qat_w4a4_layers": [
       "layers.0.self_attn.q_proj",
       "layers.0.self_attn.k_proj",
@@ -39,7 +52,15 @@
       "layers.2.mlp.gate_proj",
       "layers.4.mlp.gate_proj"
     ],
-    "sliding_window": [3072, 2048, 512, 512, 1024, 1024, 3072]
+    "sliding_window": [
+      3072,
+      2048,
+      512,
+      512,
+      1024,
+      1024,
+      3072
+    ]
   },
   "dtype": "bfloat16",
   "eos_token_id": 248044,

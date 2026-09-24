@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
@@ -25,34 +24,46 @@ class DFlashKernels:
 
 
 # ---------------------------------------------------------------------------
-# Folded softmax FFN readout (opt-in through ``dflash_config.ffn_readout``)
+# Shared gate/up projections (``dflash_config.ffn_sharing``)
 # ---------------------------------------------------------------------------
 #
-# The dense ``down_proj`` (intermediate_size -> hidden_size) becomes
+# ``mode='lattice'`` (the default): ``gate_proj``/``up_proj`` shrink to
+# ``gate_groups``/``up_groups`` unique channels and intermediate channel ``j``
+# pairs them through precomputed index maps:
 #
-#     y[q] = sum_j softmax_j(logits[j, q % K]) * h[j * s + q]      s = M / c
-#     out  = W y,          W: hidden_size x s
+#     h_j = act( gate[gate_idx[j]] ) * up[up_idx[j]]
 #
-# i.e. the gated hidden is cut into ``c`` equal contiguous chunks of width
-# ``s``; every offset ``q`` is a *normalized* (convex) mixture over the ``c``
-# chunks at the same offset, and the mixture pattern only depends on ``q % K``,
-# so one shared pattern serves all ``s / K`` repetitions of a chunk.  Per token
-# the mixture costs ``c * s = M`` macs and the dense readout ``hidden_size * s``
-# (instead of ``hidden_size * M``), and the readout holds
-# ``hidden_size * s + c * K`` parameters instead of ``hidden_size * M``.
+#     nested:  gate_idx[j] = j // (M / G_g),   up_idx[j] = j // (M / G_u)
+#     outer:   gate_idx[j] = j % G_g,           up_idx[j] = (j // G_g) % G_u
 #
-# Under ``ffn_sharing`` with ``pairing='outer'`` the mixture can instead run
-# along the GATE axis (``fold_axis='gate'``): the gated hidden is viewed as
-# its lattice ``(G_u, G_g)`` and the ``c`` chunks cut the gate axis, so the
-# convex average pools products that differ in gate (the nonlinear side).
-# Mixing along the flat channel axis there would average channels that share
-# one gate and differ only in the (linear) up channel — a static low-pass on
-# the only diverse axis, measured to cost significant acceptance length.
+# ``down_proj`` stays dense.  TP > 1 is rejected (the gather reads channels
+# owned by other ranks).
+#
+# ``mode='routed_outer'``: ``experts`` independent outer lattices (G_g x G_u
+# each), blended by a router before one shared dense ``down_proj``:
+#
+#     H(x) = sum_e w_e(x) * act(W_g^e x) (W_u^e x)^T        rank <= experts
+#     y    = W_down vec(H)
+#
+# Each expert has its OWN up view — the multi-value-view break the single
+# lattice cannot express.  The router rides the fused ``gate_up_proj`` GEMM
+# (zero-initialized: training starts at the uniform expert average) and its
+# granularity is a config knob: ``expert`` (one softmax scalar per expert) or
+# ``gate_slot`` (a per-gate-slot blend across experts — mixing stays on the
+# nonlinear side, per the fold-era lesson).  ``experts=1`` is exactly the
+# plain outer lattice.  The low-rank structure is TRAINED IN, sidestepping
+# the post-hoc CP decomposability that measured absent.
+#
+# The folded readout (``dflash_config.ffn_readout``) is RETIRED: the static
+# convex mixture measured equivalent to shrinking the lattice (fold-2 ==
+# half lattice).  Old checkpoints live under the ``outer_ffn_fold`` tag.
 
-FOLDED_READOUT_KEY = "ffn_readout"
-FOLDED_READOUT_MODE = "folded_softmax"
-FOLDED_READOUT_MODES = frozenset({"folded", "folded_softmax", "softmax_fold"})
-DEFAULT_FOLDED_GRANULARITY = 16
+FOLDED_READOUT_KEY = "ffn_readout"  # retired; kept only for the guard below
+
+SHARING_KEY = "ffn_sharing"
+SHARING_MODES = frozenset({"lattice", "routed_outer"})
+SHARING_PAIRINGS = frozenset({"nested", "outer"})
+ROUTER_GRANULARITIES = frozenset({"expert", "gate_slot"})
 
 
 def _divisors(value: int, limit: int = 1024) -> list:
@@ -61,427 +72,22 @@ def _divisors(value: int, limit: int = 1024) -> list:
     return [d for d in range(2, min(value, limit) + 1) if value % d == 0]
 
 
-def _nearest_divisor(value: int, target: int) -> Optional[int]:
-    divisors = _divisors(value)
-    if not divisors:
-        return None
-    return min(divisors, key=lambda d: (abs(d - target), d))
+def _reject_retired_fold(config) -> None:
+    """Refuse retired ``ffn_readout`` entries with an actionable message."""
 
-
-def resolve_folded_readout(config) -> Optional[Dict[str, object]]:
-    """Resolve ``dflash_config.ffn_readout`` for one draft config.
-
-    Returns ``{"branches": c, "granularity": K, "fold_axis": axis,
-    "gate_groups": G_g, "up_groups": G_u}`` when the folded readout is
-    enabled (gate/up groups only under ``fold_axis='gate'``) and ``None``
-    for the plain dense ``down_proj`` (the default).
-
-    ``c`` defaults to the fold ratio ``intermediate_size / hidden_size`` rounded
-    to the nearest divisor of ``intermediate_size``: ``c = 3`` reproduces the
-    ``3N -> N -> N`` case, while the 35B-A3B draft (9728 / 2560 = 3.8) resolves
-    to ``c = 4`` and a folded width of 2432.  ``K`` defaults to
-    ``DEFAULT_FOLDED_GRANULARITY`` and must divide ``intermediate_size / c``.
-    """
-
-    dflash_config = getattr(config, "dflash_config", None) or {}
-    raw = dflash_config.get(FOLDED_READOUT_KEY)
+    raw = (getattr(config, "dflash_config", None) or {}).get(FOLDED_READOUT_KEY)
     if raw is None or raw is False:
-        return None
-    if isinstance(raw, str):
-        mode, spec, fold_axis, logit_scale = raw, {}, "channel", 1.0
-    elif isinstance(raw, dict):
-        spec = dict(raw)
-        mode = spec.pop("mode", FOLDED_READOUT_MODE)
-        fold_axis = spec.pop("fold_axis", "channel")
-        logit_scale = spec.pop("logit_scale", 1.0)
-        unknown = sorted(set(spec) - {"branches", "granularity"})
-        if unknown:
-            raise ValueError(
-                f"unknown dflash_config.{FOLDED_READOUT_KEY} entries {unknown}; "
-                "expected 'mode', 'branches', 'granularity', 'fold_axis' and "
-                "'logit_scale'"
-            )
-        logit_scale = float(logit_scale)
-        if not logit_scale > 0:
-            raise ValueError(
-                f"logit_scale must be > 0, got {logit_scale}"
-            )
-    else:
-        raise ValueError(
-            f"dflash_config.{FOLDED_READOUT_KEY} must be a mode string or a "
-            f"dict, got {type(raw).__name__}"
-        )
-    if fold_axis not in ("channel", "gate"):
-        raise ValueError(
-            f"dflash_config.{FOLDED_READOUT_KEY}.fold_axis must be 'channel' "
-            f"or 'gate', got {fold_axis!r}"
-        )
-    if mode in {"dense", "off", "none"}:
-        return None
-    if mode not in FOLDED_READOUT_MODES:
-        raise ValueError(
-            f"unknown dflash_config.{FOLDED_READOUT_KEY} mode {mode!r}; expected "
-            f"one of {sorted(FOLDED_READOUT_MODES)} or 'dense'"
-        )
-
-    hidden_size = int(getattr(config, "hidden_size", 0) or 0)
-    intermediate_size = int(getattr(config, "intermediate_size", 0) or 0)
-    if hidden_size <= 0 or intermediate_size <= 0:
-        raise ValueError(
-            "folded readout needs positive hidden_size and intermediate_size"
-        )
-
-    if "branches" in spec:
-        branches = int(spec["branches"])
-    else:
-        ratio = max(2, int(round(intermediate_size / hidden_size)))
-        branches = _nearest_divisor(intermediate_size, ratio) or 1
-    if branches < 1:
-        raise ValueError(f"folded readout branches must be >= 1, got {branches}")
-
-    if fold_axis == "gate":
-        sharing = resolve_ffn_sharing(config)
-        if sharing is None or sharing["pairing"] != "outer":
-            raise ValueError(
-                "fold_axis='gate' needs dflash_config.ffn_sharing with "
-                "pairing='outer' (the gate axis only exists on the lattice)"
-            )
-        gate_groups = sharing["gate_groups"]
-        up_groups = sharing["up_groups"]
-        if intermediate_size != gate_groups * up_groups:
-            raise ValueError(
-                "gate-axis folding needs intermediate_size == gate_groups * "
-                f"up_groups (no lattice repetitions), got {intermediate_size} "
-                f"vs {gate_groups} * {up_groups}"
-            )
-        if gate_groups % branches:
-            raise ValueError(
-                f"gate-axis branches={branches} must divide gate_groups="
-                f"{gate_groups}; nearby divisors are "
-                f"{_divisors(gate_groups)[:12]}"
-            )
-        folded_gate = gate_groups // branches
-        granularity = int(spec.get("granularity", DEFAULT_FOLDED_GRANULARITY))
-        if granularity < 1 or folded_gate % granularity:
-            raise ValueError(
-                f"gate-axis granularity={granularity} must divide the folded "
-                f"gate width gate_groups / branches = {gate_groups} / "
-                f"{branches} = {folded_gate}; nearby divisors are "
-                f"{_divisors(folded_gate)[:12]}"
-            )
-        return {
-            "branches": branches,
-            "granularity": granularity,
-            "fold_axis": "gate",
-            "gate_groups": gate_groups,
-            "up_groups": up_groups,
-            "logit_scale": logit_scale,
-        }
-
-    if intermediate_size % branches:
-        raise ValueError(
-            f"folded readout branches={branches} must divide "
-            f"intermediate_size={intermediate_size}; nearby divisors are "
-            f"{_divisors(intermediate_size)[:12]}"
-        )
-
-    folded_size = intermediate_size // branches
-    granularity = int(spec.get("granularity", DEFAULT_FOLDED_GRANULARITY))
-    if granularity < 1 or folded_size % granularity:
-        raise ValueError(
-            f"folded readout granularity={granularity} must divide the folded "
-            f"width intermediate_size / branches = {intermediate_size} / "
-            f"{branches} = {folded_size}; nearby divisors are "
-            f"{_divisors(folded_size)[:12]}"
-        )
-    sharing = resolve_ffn_sharing(config)
-    if sharing is not None and sharing["pairing"] == "outer":
-        warnings.warn(
-            "fold_axis='channel' under pairing='outer' averages channels "
-            "that share one gate and differ only in the linear up "
-            "channel; this combination measurably costs acceptance "
-            "length — fold_axis='gate' is the lattice-aligned variant",
-            stacklevel=2,
-        )
-    return {
-        "branches": branches,
-        "granularity": granularity,
-        "fold_axis": "channel",
-        "gate_groups": None,
-        "up_groups": None,
-        "logit_scale": logit_scale,
-    }
-
-
-class FoldedSoftmaxReadout(nn.Module):
-    """Normalized folded mixture followed by a dense ``folded -> hidden`` map.
-
-    The mixture itself is weight-free apart from ``branches * granularity``
-    logits and stays in the activation dtype — it is a vector product plus a
-    sum.  Only ``self.proj`` is a plain ``nn.Linear``, so QAT
-    (``replace_linear_with_quantized``) quantizes it exactly like the dense
-    ``down_proj`` it replaces while the mixture stays unquantized.
-
-    A baseline checkpoint that still holds a dense
-    ``[hidden_size, intermediate_size]`` ``down_proj.weight`` is folded on
-    load: the dense matrix is summed over its ``branches`` chunks, which is the
-    least-squares projection of that dense readout onto this family for a
-    uniform mixture, and the mixture logits stay at their uniform init.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        *,
-        branches: int = 4,
-        granularity: int = DEFAULT_FOLDED_GRANULARITY,
-        fold_axis: str = "channel",
-        gate_groups: Optional[int] = None,
-        up_groups: Optional[int] = None,
-        logit_scale: float = 1.0,
-        bias: bool = False,
-        device=None,
-        dtype=None,
-    ) -> None:
-        super().__init__()
-        branches = int(branches)
-        granularity = int(granularity)
-        logit_scale = float(logit_scale)
-        if not logit_scale > 0:
-            raise ValueError(f"logit_scale must be > 0, got {logit_scale}")
-        if fold_axis not in ("channel", "gate"):
-            raise ValueError(
-                f"fold_axis must be 'channel' or 'gate', got {fold_axis!r}"
-            )
-        if fold_axis == "gate":
-            if not (isinstance(gate_groups, int) and isinstance(up_groups, int)):
-                raise ValueError(
-                    "fold_axis='gate' needs the outer lattice's gate_groups "
-                    "and up_groups"
-                )
-            if intermediate_size != gate_groups * up_groups:
-                raise ValueError(
-                    "gate-axis folding needs intermediate_size == "
-                    f"gate_groups * up_groups, got {intermediate_size} vs "
-                    f"{gate_groups} * {up_groups}"
-                )
-            if branches < 1 or gate_groups % branches:
-                raise ValueError(
-                    f"branches={branches} must divide gate_groups="
-                    f"{gate_groups}"
-                )
-            folded_gate = gate_groups // branches
-            if granularity < 1 or folded_gate % granularity:
-                raise ValueError(
-                    f"granularity={granularity} must divide the folded gate "
-                    f"width gate_groups / branches = {folded_gate}"
-                )
-            folded_size = up_groups * folded_gate
-        else:
-            if branches < 1:
-                raise ValueError(f"branches must be >= 1, got {branches}")
-            if intermediate_size % branches:
-                raise ValueError(
-                    f"branches={branches} must divide intermediate_size="
-                    f"{intermediate_size}"
-                )
-            folded_size = intermediate_size // branches
-            if granularity < 1 or folded_size % granularity:
-                raise ValueError(
-                    f"granularity={granularity} must divide the folded width "
-                    f"intermediate_size / branches = {folded_size}"
-                )
-
-        self.hidden_size = int(hidden_size)
-        self.intermediate_size = intermediate_size
-        self.branches = branches
-        self.granularity = granularity
-        self.fold_axis = fold_axis
-        self.gate_groups = gate_groups
-        self.up_groups = up_groups
-        self.logit_scale = logit_scale
-        self.folded_size = folded_size
-        self.repeats = (
-            (gate_groups // branches) // granularity
-            if fold_axis == "gate"
-            else folded_size // granularity
-        )
-
-        factory_kwargs = {"device": device, "dtype": dtype}
-        self.proj = nn.Linear(folded_size, hidden_size, bias=bias, **factory_kwargs)
-        self.fold_logits = nn.Parameter(
-            torch.zeros(branches, granularity, **factory_kwargs)
-        )
-
-    def reset_parameters(self) -> None:
-        # nn.Linear's own init keeps a fresh folded readout comparable to a
-        # dense one; the mixture starts uniform (a plain chunk average).
-        self.proj.reset_parameters()
-        with torch.no_grad():
-            self.fold_logits.zero_()
-
-    def fold_weights(self) -> torch.Tensor:
-        """Current convex mixture, shape ``[branches, granularity]``.
-
-        The softmax runs in the logits' own dtype, mirroring the flare fusion
-        weights (``torch.softmax(self.layer_fusion_weights, dim=1)``).  The
-        logits ride the module dtype, so the mixture already matches the
-        activations it multiplies — no fp32 round-trip, no cast back.
-        ``logit_scale`` is a SIREN-style sensitivity multiplier (fixed in the
-        forward, no param groups): under Adam's roughly constant per-step
-        parameter movement, a scale of ``c`` sharpens the mixture ``c`` times
-        faster and shrinks weight decay's pull on the mixture by ``c``.  The
-        zero init is unaffected.
-        """
-
-        return torch.softmax(self.logit_scale * self.fold_logits, dim=0)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        lead = hidden_states.shape[:-1]
-        if self.fold_axis == "gate":
-            # Lattice view (..., G_u, G_g) of the outer-ordered channels,
-            # then the same convex chunk mixture along the GATE axis: the
-            # pooled slots hold products that differ in gate (the nonlinear
-            # side), not the shared-up linear side.
-            chunks = hidden_states.reshape(
-                *lead,
-                self.up_groups,
-                self.branches,
-                self.repeats,
-                self.granularity,
-            )
-            weights = self.fold_weights().reshape(
-                *([1] * len(lead)), 1, self.branches, 1, self.granularity
-            )
-            mixed = (chunks * weights).sum(dim=-3)
-            mixed = mixed.reshape(*lead, self.folded_size)
-            return self.proj(mixed)
-        chunks = hidden_states.reshape(
-            *lead, self.branches, self.repeats, self.granularity
-        )
-        weights = self.fold_weights().reshape(
-            *([1] * len(lead)), self.branches, 1, self.granularity
-        )
-        mixed = (chunks * weights).sum(dim=-3)
-        mixed = mixed.reshape(*lead, self.folded_size)
-        return self.proj(mixed)
-
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ) -> None:
-        legacy_key = prefix + "weight"
-        proj_key = prefix + "proj.weight"
-        logits_key = prefix + "fold_logits"
-        legacy_weight = state_dict.get(legacy_key)
-        legacy_dense = (
-            torch.is_tensor(legacy_weight)
-            and legacy_weight.dim() == 2
-            and legacy_weight.shape[-1] == self.intermediate_size
-        )
-        if legacy_dense:
-            # Baseline dense down_proj: project it onto the folded family under
-            # a uniform mixture (least squares) and keep the logits uniform.
-            state_dict.pop(legacy_key, None)
-            if self.fold_axis == "gate":
-                state_dict[proj_key] = legacy_weight.reshape(
-                    legacy_weight.shape[0],
-                    self.up_groups,
-                    self.branches,
-                    self.gate_groups // self.branches,
-                ).sum(dim=2).reshape(
-                    legacy_weight.shape[0], self.folded_size
-                )
-            else:
-                state_dict[proj_key] = legacy_weight.reshape(
-                    legacy_weight.shape[0], self.branches, self.folded_size
-                ).sum(dim=1)
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
-        )
-        if legacy_dense and logits_key in missing_keys:
-            # Absent logits on a legacy checkpoint are intentional, not a gap
-            # the caller has to fill in.
-            missing_keys.remove(logits_key)
-
-
-class FoldedSoftmaxMLP(nn.Module):
-    """``Qwen3MLP``-compatible SwiGLU MLP with a folded softmax readout.
-
-    ``gate_proj``/``up_proj``/``act_fn`` are unchanged, ``down_proj`` is a
-    :class:`FoldedSoftmaxReadout`, so a baseline checkpoint warm-starts into
-    this module and only the readout is re-parameterized.
-    """
-
-    def __init__(
-        self,
-        config: Qwen3Config,
-        *,
-        branches: int,
-        granularity: int = DEFAULT_FOLDED_GRANULARITY,
-        logit_scale: float = 1.0,
-    ) -> None:
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = FoldedSoftmaxReadout(
-            self.hidden_size,
-            self.intermediate_size,
-            branches=branches,
-            granularity=granularity,
-            logit_scale=logit_scale,
-        )
-        self.act_fn = ACT2FN[getattr(config, "hidden_act", "silu")]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
-
-# ---------------------------------------------------------------------------
-# Shared gate/up projections (opt-in through ``dflash_config.ffn_sharing``)
-# ---------------------------------------------------------------------------
-#
-# The SwiGLU channel ``j`` becomes
-#
-#     h_j = act( gate[gate_idx[j]] ) * up[up_idx[j]]      j < intermediate_size
-#
-# where ``gate`` is the ``G_g``-wide ``gate_proj`` output and ``up`` the
-# ``G_u``-wide ``up_proj`` output, so the two projections hold
-# ``hidden * (G_g + G_u)`` weights instead of ``2 * hidden * M`` while
-# ``down_proj`` keeps its ``hidden * M`` shape.  The index maps pick the
-# pairing structure:
-#
-#     nested:  gate_idx[j] = j // (M / G_g),   up_idx[j] = j // (M / G_u)
-#              contiguous block grouping — pure gate sharing (``G_u = M``),
-#              pure up sharing (``G_g = M``) and hierarchical mixes.
-#     outer:   gate_idx[j] = j % G_g,           up_idx[j] = (j // G_g) % G_u
-#              the full ``G_g x G_u`` lattice spread over the ``M`` down
-#              channels; each (gate, up) combo repeats ``M / (G_g * G_u)``
-#              times with distinct down columns (``G_g * G_u = M`` is the
-#              exactly-once lattice).
-#
-# A baseline dense checkpoint warm-starts by scatter-averaging its ``[M, hidden]``
-# gate/up rows per shared group — the uniform-mixture least-squares analogue
-# of the folded readout's chunk sum.
-
-SHARING_KEY = "ffn_sharing"
-SHARING_PAIRINGS = frozenset({"nested", "outer"})
+        return
+    if isinstance(raw, str) and raw in {"dense", "off", "none"}:
+        return
+    if isinstance(raw, dict) and raw.get("mode") in {"dense", "off", "none"}:
+        return
+    raise ValueError(
+        "dflash_config.ffn_readout is retired: the folded readout measured "
+        "equivalent to shrinking the gate lattice (the static mixture is "
+        "inert). Drop the key, or serve old checkpoints from the "
+        "outer_ffn_fold tag."
+    )
 
 
 def _sharing_indices(
@@ -502,14 +108,11 @@ def _sharing_indices(
 def resolve_ffn_sharing(config) -> Optional[Dict[str, object]]:
     """Resolve ``dflash_config.ffn_sharing`` for one draft config.
 
-    Returns ``{"pairing": p, "gate_groups": G_g, "up_groups": G_u}`` when
-    sharing is enabled and ``None`` for the plain ``Qwen3MLP`` (the default).
-    ``gate_groups``/``up_groups`` default to ``intermediate_size``, i.e. no
-    sharing on that side, so ``{"gate_groups": 4864}`` alone is pure gate
-    sharing with ``k = 2`` on the 35B-A3B draft (9728 = 512 * 19 has no
-    factor 3).  ``pairing='outer'`` needs ``G_g * G_u`` to divide
-    ``intermediate_size``: 76 x 128 keeps 9728 exactly, while a 64 x 64
-    lattice requires switching ``intermediate_size`` to 4096.
+    Returns ``None`` for the plain ``Qwen3MLP`` (the default).  ``mode``
+    defaults to ``"lattice"`` and returns ``{"mode", "pairing", "gate_groups",
+    "up_groups"}``; ``"routed_outer"`` returns ``{"mode", "experts",
+    "gate_groups", "up_groups", "router"}`` with ``intermediate_size`` equal
+    to ``experts * gate_groups * up_groups`` (the virtual channel count).
     """
 
     dflash_config = getattr(config, "dflash_config", None) or {}
@@ -518,17 +121,64 @@ def resolve_ffn_sharing(config) -> Optional[Dict[str, object]]:
         return None
     if not isinstance(raw, dict):
         raise ValueError(
-            f"dflash_config.{SHARING_KEY} must be a dict with 'pairing', "
-            f"'gate_groups' and 'up_groups', got {type(raw).__name__}"
+            f"dflash_config.{SHARING_KEY} must be a dict, got "
+            f"{type(raw).__name__}"
         )
     spec = dict(raw)
+    mode = spec.pop("mode", "lattice")
+    if mode not in SHARING_MODES:
+        raise ValueError(
+            f"unknown dflash_config.{SHARING_KEY} mode {mode!r}; expected "
+            f"one of {sorted(SHARING_MODES)}"
+        )
+
+    if mode == "routed_outer":
+        unknown = sorted(set(spec) - {"experts", "gate_groups", "up_groups", "router"})
+        if unknown:
+            raise ValueError(
+                f"unknown dflash_config.{SHARING_KEY} entries {unknown}; "
+                "expected 'experts', 'gate_groups', 'up_groups' and 'router'"
+            )
+        router = spec.get("router", "expert")
+        if router not in ROUTER_GRANULARITIES:
+            raise ValueError(
+                f"dflash_config.{SHARING_KEY}.router={router!r} must be one "
+                f"of {sorted(ROUTER_GRANULARITIES)}"
+            )
+        experts = int(spec.get("experts", 1))
+        gate_groups = int(spec.get("gate_groups", 0) or 0)
+        up_groups = int(spec.get("up_groups", 0) or 0)
+        if min(experts, gate_groups, up_groups) < 1:
+            raise ValueError(
+                f"routed_outer needs experts/gate_groups/up_groups >= 1, got "
+                f"{experts}/{gate_groups}/{up_groups}"
+            )
+        if experts == 1 and router == "gate_slot":
+            raise ValueError(
+                "router='gate_slot' needs experts >= 2 (with one expert the "
+                "blend is identically 1)"
+            )
+        intermediate_size = int(getattr(config, "intermediate_size", 0) or 0)
+        if intermediate_size != experts * gate_groups * up_groups:
+            raise ValueError(
+                f"routed_outer needs intermediate_size == experts * "
+                f"gate_groups * up_groups, got {intermediate_size} vs "
+                f"{experts} * {gate_groups} * {up_groups}"
+            )
+        return {
+            "mode": "routed_outer",
+            "experts": experts,
+            "gate_groups": gate_groups,
+            "up_groups": up_groups,
+            "router": router,
+        }
+
     unknown = sorted(set(spec) - {"pairing", "gate_groups", "up_groups"})
     if unknown:
         raise ValueError(
             f"unknown dflash_config.{SHARING_KEY} entries {unknown}; expected "
-            "'pairing', 'gate_groups' and 'up_groups'"
+            "'mode', 'pairing', 'gate_groups' and 'up_groups'"
         )
-
     pairing = spec.get("pairing", "nested")
     if pairing not in SHARING_PAIRINGS:
         raise ValueError(
@@ -547,7 +197,6 @@ def resolve_ffn_sharing(config) -> Optional[Dict[str, object]]:
                 f"dflash_config.{SHARING_KEY}.{name}={groups} must be between 1 "
                 f"and intermediate_size={intermediate_size}"
             )
-
     if pairing == "nested":
         for name, groups in (("gate_groups", gate_groups), ("up_groups", up_groups)):
             if intermediate_size % groups:
@@ -569,12 +218,17 @@ def resolve_ffn_sharing(config) -> Optional[Dict[str, object]]:
             f"outer sharing needs gate_groups * up_groups to divide "
             f"intermediate_size, got {gate_groups} * {up_groups} = "
             f"{gate_groups * up_groups} with intermediate_size="
-            f"{intermediate_size}; either pick a factorization of "
+            f"{intermediate_size}; pick a factorization of "
             f"{intermediate_size} (most balanced: "
             f"{', '.join(f'{d}x{q}' for d, q in pairs)}) or change "
             f"intermediate_size to {gate_groups * up_groups}"
         )
-    return {"pairing": pairing, "gate_groups": gate_groups, "up_groups": up_groups}
+    return {
+        "mode": "lattice",
+        "pairing": pairing,
+        "gate_groups": gate_groups,
+        "up_groups": up_groups,
+    }
 
 
 class SharedGLUMLP(nn.Module):
@@ -582,11 +236,10 @@ class SharedGLUMLP(nn.Module):
 
     ``gate_proj`` outputs ``gate_groups`` channels and ``up_proj`` outputs
     ``up_groups`` channels; intermediate channel ``j`` pairs them through the
-    precomputed ``gate_idx``/``up_idx`` maps (see the module note above).
-    ``down_proj`` is either a plain ``nn.Linear`` or a
-    :class:`FoldedSoftmaxReadout` when ``ffn_readout`` is also enabled.  The
-    index maps live as non-persistent buffers: derived from the config,
-    invisible to checkpoints and untouched by the QAT/NPU linear walkers.
+    precomputed ``gate_idx``/``up_idx`` maps (see the module note above), and
+    ``down_proj`` stays dense.  The index maps live as non-persistent
+    buffers: derived from the config, invisible to checkpoints and untouched
+    by the QAT/NPU linear walkers.
 
     A baseline checkpoint holding dense ``[intermediate_size, hidden]``
     ``gate_proj``/``up_proj`` weights warm-starts by scatter-averaging the
@@ -600,7 +253,6 @@ class SharedGLUMLP(nn.Module):
         pairing: str = "nested",
         gate_groups: int,
         up_groups: int,
-        folded: Optional[Dict[str, int]] = None,
     ) -> None:
         super().__init__()
         gate_groups = int(gate_groups)
@@ -645,12 +297,7 @@ class SharedGLUMLP(nn.Module):
 
         self.gate_proj = nn.Linear(hidden_size, gate_groups, bias=False)
         self.up_proj = nn.Linear(hidden_size, up_groups, bias=False)
-        if folded is None:
-            self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-        else:
-            self.down_proj = FoldedSoftmaxReadout(
-                hidden_size, intermediate_size, **folded
-            )
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
         gate_idx, up_idx = _sharing_indices(
             intermediate_size, gate_groups, up_groups, pairing
         )
@@ -712,23 +359,122 @@ class SharedGLUMLP(nn.Module):
         )
 
 
+class RoutedOuterMLP(nn.Module):
+    """``experts`` independent outer-product FFNs blended by a router.
+
+    Every expert holds its own ``gate_groups`` gate channels and
+    ``up_groups`` up channels, fused expert-major into one ``gate_up_proj``
+    linear whose trailing ``router_width`` rows produce the routing logits
+    (zero-initialized: training starts at the uniform expert average).  The
+    per-token computation is
+
+        H(x) = sum_e w_e(x) * act(W_g^e x) (W_u^e x)^T     rank <= experts
+        y    = down_proj(vec(H))
+
+    ``router='expert'`` blends with one softmax scalar per expert;
+    ``router='gate_slot'`` gives every gate slot its own per-expert blend
+    (the mixture stays on the gate/nonlinear side, per the fold-era lesson).
+    ``experts=1`` degenerates to the plain outer lattice with a dense
+    ``down_proj``, so the E-sweep carries its own baseline.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3Config,
+        *,
+        experts: int,
+        gate_groups: int,
+        up_groups: int,
+        router: str = "expert",
+    ) -> None:
+        super().__init__()
+        experts = int(experts)
+        gate_groups = int(gate_groups)
+        up_groups = int(up_groups)
+        if min(experts, gate_groups, up_groups) < 1:
+            raise ValueError(
+                f"routed_outer needs experts/gate_groups/up_groups >= 1, got "
+                f"{experts}/{gate_groups}/{up_groups}"
+            )
+        if router not in ROUTER_GRANULARITIES:
+            raise ValueError(
+                f"router must be one of {sorted(ROUTER_GRANULARITIES)}, got "
+                f"{router!r}"
+            )
+        if experts == 1 and router == "gate_slot":
+            raise ValueError(
+                "router='gate_slot' needs experts >= 2 (with one expert the "
+                "blend is identically 1)"
+            )
+        intermediate_size = int(config.intermediate_size)
+        if intermediate_size != experts * gate_groups * up_groups:
+            raise ValueError(
+                f"routed_outer needs intermediate_size == experts * "
+                f"gate_groups * up_groups, got {intermediate_size} vs "
+                f"{experts} * {gate_groups} * {up_groups}"
+            )
+
+        self.config = config
+        self.hidden_size = int(config.hidden_size)
+        self.intermediate_size = intermediate_size
+        self.experts = experts
+        self.gate_groups = gate_groups
+        self.up_groups = up_groups
+        self.router = router
+        self.router_width = experts if router == "expert" else experts * gate_groups
+
+        self.gate_up_proj = nn.Linear(
+            self.hidden_size,
+            experts * (gate_groups + up_groups) + self.router_width,
+            bias=False,
+        )
+        with torch.no_grad():
+            # Zero-init router rows: softmax(0) is the uniform blend.
+            self.gate_up_proj.weight[experts * (gate_groups + up_groups):].zero_()
+        self.down_proj = nn.Linear(
+            gate_groups * up_groups, self.hidden_size, bias=False
+        )
+        self.act_fn = ACT2FN[getattr(config, "hidden_act", "silu")]
+
+    def combine(self, fused: torch.Tensor) -> torch.Tensor:
+        """Post-GEMM computation: slice experts + router, blend outer products.
+
+        Split out so the Ascend fused norm+quant path can reuse the exact
+        post-GEMM computation over the fused projection output.
+        """
+
+        lead = fused.shape[:-1]
+        E, G, U = self.experts, self.gate_groups, self.up_groups
+        feats = fused[..., : E * (G + U)].reshape(*lead, E, G + U)
+        gate = self.act_fn(feats[..., :G])
+        up = feats[..., G:]
+        route = fused[..., E * (G + U):]
+        if self.router == "expert":
+            gate = gate * torch.softmax(route, dim=-1).unsqueeze(-1)
+        else:
+            delta = torch.softmax(route.reshape(*lead, G, E), dim=-1)
+            gate = gate * delta.transpose(-1, -2)
+        hidden = (gate.unsqueeze(-1) * up.unsqueeze(-2)).sum(dim=-3)
+        return self.down_proj(hidden.reshape(*lead, G * U))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.combine(self.gate_up_proj(x))
+
+
 def _make_qwen3_rms_norm(hidden_size: int, eps: float) -> nn.Module:
     return Qwen3RMSNorm(hidden_size, eps=eps)
 
 
 def _make_qwen3_mlp(config: Qwen3Config) -> nn.Module:
-    folded = resolve_folded_readout(config)
+    _reject_retired_fold(config)
     sharing = resolve_ffn_sharing(config)
     if sharing is None:
-        if folded is None:
-            return Qwen3MLP(config)
-        return FoldedSoftmaxMLP(
-            config,
-            branches=folded["branches"],
-            granularity=folded["granularity"],
-            logit_scale=folded["logit_scale"],
-        )
-    return SharedGLUMLP(config, folded=folded, **sharing)
+        return Qwen3MLP(config)
+    spec = dict(sharing)
+    spec.pop("mode")
+    if sharing["mode"] == "routed_outer":
+        return RoutedOuterMLP(config, **spec)
+    return SharedGLUMLP(config, **spec)
 
 
 DEFAULT_DFLASH_KERNELS = DFlashKernels(
@@ -755,14 +501,10 @@ def load_liger_dflash_kernels() -> DFlashKernels:
         return LigerRMSNorm(hidden_size, eps=eps)
 
     def make_mlp(config: Qwen3Config) -> nn.Module:
-        if (
-            resolve_folded_readout(config) is None
-            and resolve_ffn_sharing(config) is None
-        ):
+        if resolve_ffn_sharing(config) is None:
             return LigerSwiGLUMLP(config)
-        # Liger has no fused kernel for the folded readout or the shared
-        # projections, so keep the knobs working by falling back to the
-        # portable PyTorch MLP.
+        # Liger has no fused kernel for the shared or routed projections, so
+        # keep the knob working by falling back to the portable PyTorch MLP.
         return _make_qwen3_mlp(config)
 
     return DFlashKernels(

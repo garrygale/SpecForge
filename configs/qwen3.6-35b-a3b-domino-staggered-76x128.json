@@ -36,11 +36,6 @@
     ],
     "channel_balanced": false,
     "target_hidden_size": 2048,
-    "ffn_readout": {
-      "mode": "folded_softmax",
-      "branches": 4,
-      "granularity": 32
-    },
     "ffn_sharing": {
       "pairing": "outer",
       "gate_groups": 76,
