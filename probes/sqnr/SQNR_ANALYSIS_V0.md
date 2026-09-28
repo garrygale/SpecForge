@@ -545,27 +545,83 @@ instance of it.
 
 ## The caveat that keeps this honest
 
-Those starved taps contribute very little **energy** to the fc output (the deep
-tap is 52x larger), which is why every energy-weighted aggregate in this document
--- energy SQNR, energy-weighted destroyed fraction -- looks healthy while 81% of
-the column energy sits on 0-bit pathways. "81% of column energy" and "0.3% of
-output energy" are both true and measure different things: what the model wanted
-to read versus how much energy it got. Any acceptance-length metric should be
-fitted against the **pathway** metrics (`min_pi_weighted_effective_bits`,
-per-tap functional SNR), not the energy ones.
+Those starved taps contribute little **energy** to the fc output (the deep tap is
+52x larger), which is why every energy-weighted aggregate in this document --
+energy SQNR, energy-weighted destroyed fraction -- looks healthy while 81% of the
+column energy sits on 0-bit pathways. With the measured Qwen3-8B profile the
+split is: the three starved taps (L1, L9, L17) contribute **7.3%** of the fc
+output energy and L33 alone contributes **67.1%**. "81% of column energy" and
+"7.3% of output energy" are both true and measure different things: what the
+model wanted to read versus how much energy it got. Any acceptance-length metric
+should be fitted against the **pathway** metrics
+(`min_pi_weighted_effective_bits`, per-tap functional SNR), not the energy ones.
 
 Absolute 52x is from a 0.6B proxy (28 layers vs the 8B's 36); the shape (monotone
 growth plus an early massive-activation onset) is what transfers. Confirming the
 number on Qwen3-8B is one forward pass with `output_hidden_states=True`.
 
+## CONFIRMED on Qwen3-8B (real target, `--device npu`)
+
+Ran on the server against the real Qwen3-8B. The proxy prediction held:
+
+| | Qwen3-0.6B proxy | **Qwen3-8B (real)** |
+|---|---|---|
+| tap RMS medians (L1/9/17/25/33) | 0.343 / 0.803 / 1.644 / 4.531 / 18.00 | **0.268 / 0.931 / 1.556 / 4.338 / 13.98** |
+| per-token across-tap disparity (median) | 54.6x | **58.5x** |
+| `b_eff` @8-bit | -1.63 / -0.40 / 0.63 / 2.09 / 4.08 | **-1.62 / 0.17 / 0.91 / 2.39 / 4.08** |
+| `pi` on taps with ``b_eff <= 1`` | 0.812 | **0.812** |
+
+So on the real model, with one shared per-token scale over the fc input:
+**three of the five taps have at most one effective bit at a nominal 8, and those
+three carry 81.2% of the trained `fc`'s column energy.** L1 (pi = 0.373) sits at
+-1.62 bits, inside the dead zone. Even the loudest tap only reaches 4.08 bits,
+which is exactly the spikiness tax `8 - log2(rho)` with `rho ~ 15` -- the
+spikiness tax is paid by everyone, the disparity tax only by the quiet taps.
+
+Note the `pi` row is identical in both runs by construction (it is a property of
+the same `fc.weight`), so it is not evidence; the evidence is the RMS profile and
+the resulting `b_eff`.
+
+## The next experiment: separate annihilation from noise, in BF16
+
+`b_eff` predicts that the quantizer annihilates content. It does not yet show
+that the annihilation costs acceptance -- the starved taps are also the
+low-energy ones. Two PTQ-level ablations (no retraining) settle it, both on the
+fc-mode draft:
+
+1. **Annihilation ablation.** In BF16, zero the taps with `b_eff <= 1`
+   (L1, L9, L17) in the concat. If acceptance barely moves, the content of those
+   taps is not needed and the concat is not the acceptance killer; if it
+   collapses, the 0-bit pathways are exactly the damage.
+2. **Noise-only ablation.** Keep all taps, but quantize *only* those three blocks
+   with the shared per-token scale (i.e. inject the quantization error without
+   removing the signal elsewhere). This isolates "the shared scale's noise"
+   from "the lost content".
+
+Prediction from this analysis: (1) removes 7.3% of the fc output energy, so it
+costs whatever that content is worth -- bounded, but not obviously negligible;
+(2) costs more, because the noise those blocks inject is scaled by the *loudest*
+tap's step rather than their own. If both come out harmless, the concat is
+exonerated as the acceptance cause and the remaining suspect is the graph the fc
+mode forces (shared KV vs dedicated, single shared feature vs per-layer routing).
+
 ## Actionable consequence
 
 Give each tap (each concat block) its own activation scale -- group-wise
-activation quantization with the group equal to one target layer. Then the
-shallow taps go from -1.6 bits back to ~6 bits at 8-bit nominal, with **no
-retraining**. This is the cheapest test of the whole diagnosis; the alternative
-(RMSNorm each tap before concatenating) changes the architecture and needs a
-retrain.
+activation quantization with the group equal to one target layer. With per-tap
+scales every tap lands at `~8 - log2(rho_tap) ~ 4.09` effective bits, so:
+
+| | L1 | L9 | L17 | L25 | L33 | pi-weighted |
+|---|---|---|---|---|---|---|
+| b_eff now | -1.62 | 0.17 | 0.91 | 2.39 | 4.08 | **0.171** |
+| b_eff with per-tap scales | 4.09 | 4.09 | 4.09 | 4.09 | 4.09 | **4.093** |
+| gain | +5.71 | +3.92 | +3.18 | +1.70 | +0.01 | **+3.92 bits (~+23.6 dB)** |
+
+with **no retraining**. Note it does NOT reach 8 bits: per-tap scales remove the
+*disparity* tax, while the *spikiness* tax (~3.9 bits at `rho = 15`) remains for
+every tap. The alternative (RMSNorm each tap before concatenating) attacks both
+but changes the architecture and needs a retrain.
+
 
 
 
