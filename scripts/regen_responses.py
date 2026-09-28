@@ -31,24 +31,25 @@ the partial reasoning becomes the message content so the sample still counts
 as a success.
 
 Use ``--retry-over-tokens N`` to raise the cap later without redoing
-everything: a sample is regenerated only when its existing response looks at
-risk -- any assistant turn whose saved tokens (``reasoning_content`` +
-``content``) exceed N, or a ``"truncated"`` flag, or no previous response
-(old errors included). Everything else is copied from the previous output
-file (``--prev-output``, defaults to the output path) into the new output.
-Counts come from the server's ``POST /tokenize`` endpoint, so the served
-model's own tokenizer is used. vLLM's ``max_tokens`` caps generated tokens
-only -- prompt and chat-template tokens are charged to the context window
-instead -- so N compares against the completion budget alone, minus slack
-for the handful of <think>/</think>/EOS tokens the text count misses (e.g.
-8000 for a previous 8192 cap). Default -1 regenerates every sample.
+everything: feed the previous run's output back as ``--input`` and a sample
+is regenerated only when the responses already in the file look at risk --
+any assistant turn whose tokens (``reasoning_content`` + ``content``)
+exceed N, a ``"truncated"`` flag, or a user turn without a response behind
+it (freshly converted inputs qualify here). Everything else is written to
+the new output unchanged, responses and all. Counts come from the server's
+``POST /tokenize`` endpoint, so the served model's own tokenizer is used.
+vLLM's ``max_tokens`` caps generated tokens only -- prompt and
+chat-template tokens are charged to the context window instead -- so N
+compares against the completion budget alone, minus slack for the handful
+of <think>/</think>/EOS tokens the text count misses (e.g. 8000 for a
+previous 8192 cap). Default -1 regenerates every sample.
 
 Usage::
 
     python scripts/regen_responses.py
     python scripts/regen_responses.py --input ./subsets/CodeInstruct.jsonl --temperature 0.9 --top-k 50 --top-p 0.95 --enable-reasoning --reasoning-effort high --max-reasoning-tokens 2048 --num-workers 64
     python scripts/regen_responses.py --enable-reasoning --feed-reasoning
-    python scripts/regen_responses.py --max-tokens 16384 --retry-over-tokens 8000
+    python scripts/regen_responses.py --input ./regenerated/CodeInstruct_regen.jsonl --max-tokens 16384 --retry-over-tokens 8000
 
 Edit the defaults in the ``Configuration`` block at the top of this file,
 or override them via CLI arguments.
@@ -71,7 +72,6 @@ MAX_TOKENS = 4096
 NUM_WORKERS = 32
 OUTPUT_DIR = "./regenerated"
 RETRY_OVER_TOKENS = -1          # >0: only regenerate samples whose saved response exceeds this many tokens
-PREV_OUTPUT = None              # previous regenerated JSONL to read existing responses from
 # ----------------------------------------------------------------------------
 
 import argparse
@@ -80,7 +80,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import httpx
 from openai import OpenAI
@@ -186,22 +186,14 @@ def parse_args():
         type=int,
         default=RETRY_OVER_TOKENS,
         help=(
-            "Only regenerate samples whose existing response is at risk of "
-            "truncation: any assistant turn (reasoning_content + content) "
-            "over this many tokens, a truncated flag, or no previous "
-            "response. Other samples are copied from --prev-output into the "
-            "new output. vLLM max_tokens caps generated tokens only (the "
-            "chat template does not count), so leave slack for special "
-            f"tokens (default: {RETRY_OVER_TOKENS} = regenerate all)"
-        ),
-    )
-    parser.add_argument(
-        "--prev-output",
-        type=str,
-        default=PREV_OUTPUT,
-        help=(
-            "Previous regenerated JSONL to read existing responses from when "
-            "--retry-over-tokens is set (default: the output file itself)"
+            "Only regenerate samples whose existing responses are at risk "
+            "of truncation: any assistant turn (reasoning_content + content) "
+            "over this many tokens, a truncated flag, or a user turn "
+            "without a response. Other samples are written to the output "
+            "unchanged, keeping the responses already in the input file. "
+            "vLLM max_tokens caps generated tokens only (the chat template "
+            "does not count), so leave slack for special tokens "
+            f"(default: {RETRY_OVER_TOKENS} = regenerate all)"
         ),
     )
     parser.add_argument(
@@ -399,22 +391,19 @@ def _to_openai_messages(
     return openai_messages
 
 
-def _sample_key(sample: Dict[str, Any]) -> Any:
-    return sample.get("idx", sample.get("id"))
-
-
-def _load_prev_records(path: str) -> Dict[Any, Dict[str, Any]]:
-    records: Dict[Any, Dict[str, Any]] = {}
-    with open(path, "r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            key = _sample_key(rec)
-            if key is not None and key not in records:
-                records[key] = rec
-    return records
+def _has_complete_responses(conversations: List[Dict[str, Any]]) -> bool:
+    """True when every user turn has an assistant response with text."""
+    n_user = 0
+    n_resp = 0
+    for msg in conversations:
+        role = msg.get("role")
+        if role == "user":
+            n_user += 1
+        elif role == "assistant" and (
+            msg.get("content") or msg.get("reasoning_content")
+        ):
+            n_resp += 1
+    return n_user > 0 and n_resp >= n_user
 
 
 def _server_root(vllm_url: str) -> str:
@@ -438,16 +427,17 @@ def _tokenize_count(server_root: str, model: str, text: str) -> Optional[int]:
         return None
 
 
-def _count_record_tokens(
-    server_root: str, model: str, rec: Dict[str, Any]
+def _count_sample_tokens(
+    server_root: str, model: str, sample: Dict[str, Any]
 ) -> Optional[int]:
-    """Max per-turn token count of a regenerated record; None on failure.
+    """Max per-turn token count of a sample's existing responses; None on
+    failure.
 
     Each assistant turn got its own max_tokens budget, so only the longest
     turn decides whether the sample could have been cut short.
     """
     max_turn = 0
-    for msg in rec.get("conversations", []):
+    for msg in sample.get("conversations", []):
         if msg.get("role") != "assistant":
             continue
         turn = 0
@@ -535,49 +525,43 @@ def main():
             f"Failed to connect to vLLM at {args.vllm_url}: {e}"
         ) from e
 
-    # --- Retry selection: keep samples whose saved response is safely short ---
+    # --- Retry selection: keep samples whose existing responses are safely short ---
     kept_records: List[Dict[str, Any]] = []
     if args.retry_over_tokens >= 0:
-        prev_path = args.prev_output or output_path
-        if not os.path.exists(prev_path):
-            raise FileNotFoundError(
-                f"--retry-over-tokens needs the previous output at {prev_path}; "
-                "pass --prev-output if it lives elsewhere"
-            )
         server_root = _server_root(args.vllm_url)
         if _tokenize_count(server_root, args.model, "hello") is None:
             raise ConnectionError(f"/tokenize endpoint not usable at {server_root}")
-        prev_by_key = _load_prev_records(prev_path)
-        print(f"Loaded {len(prev_by_key)} previous records from {prev_path}")
 
         selected: List[Dict[str, Any]] = []
-        pending: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        pending: List[Dict[str, Any]] = []
         n_missing = n_trunc = 0
         for sample in samples:
-            rec = prev_by_key.get(_sample_key(sample))
-            if rec is None or rec.get("status") != "success":
+            conversations = sample.get("conversations", [])
+            if not _has_complete_responses(conversations):
                 n_missing += 1
                 selected.append(sample)
             elif any(
-                msg.get("truncated") for msg in rec.get("conversations", [])
+                msg.get("truncated")
+                for msg in conversations
+                if msg.get("role") == "assistant"
             ):
                 n_trunc += 1
                 selected.append(sample)
             else:
-                pending.append((sample, rec))
+                pending.append(sample)
 
         n_over = n_count_fail = 0
         with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
             futures = {}
-            for sample, rec in pending:
+            for sample in pending:
                 fut = executor.submit(
-                    _count_record_tokens, server_root, args.model, rec
+                    _count_sample_tokens, server_root, args.model, sample
                 )
-                futures[fut] = (sample, rec)
+                futures[fut] = sample
             for f in tqdm(
                 as_completed(futures), total=len(futures), desc="Counting tokens"
             ):
-                sample, rec = futures[f]
+                sample = futures[f]
                 max_turn = f.result()
                 if max_turn is None:
                     n_count_fail += 1
@@ -586,14 +570,16 @@ def main():
                     n_over += 1
                     selected.append(sample)
                 else:
-                    kept_records.append(rec)
+                    kept = dict(sample)
+                    kept["status"] = "success"
+                    kept_records.append(kept)
 
         samples = selected
         total = len(samples)
         print(
             f"Retry > {args.retry_over_tokens} tokens: regenerating {total} "
             f"(over threshold: {n_over}, truncated flag: {n_trunc}, "
-            f"no previous response: {n_missing}, counting failed: {n_count_fail}); "
+            f"incomplete responses: {n_missing}, counting failed: {n_count_fail}); "
             f"keeping {len(kept_records)}"
         )
 
@@ -632,8 +618,9 @@ def main():
         open(error_path, "a" if args.resume and skip_lines > 0 else "w", encoding="utf-8") as error_fh,
         ThreadPoolExecutor(max_workers=args.num_workers) as executor,
     ):
-        # Carried-over samples are written first so the output is complete
-        # even if the run dies mid-way through regeneration.
+        # Kept samples (responses already in the input) are written first so
+        # the output is complete even if the run dies mid-way through
+        # regeneration.
         for rec in kept_records:
             output_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             if any(
