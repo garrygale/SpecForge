@@ -41,6 +41,11 @@ import _blas_env  # noqa: F401  (must precede torch: OpenBLAS thread workaround)
 
 import torch
 
+try:  # Ascend NPU backend (optional; only needed for --device npu)
+    import torch_npu  # noqa: F401
+except ImportError:
+    torch_npu = None
+
 
 DEFAULT_TARGET = "Qwen/Qwen3-8B"
 DEFAULT_DRAFT = "z-lab/Qwen3-8B-DFlash-b16"
@@ -69,6 +74,8 @@ def pick_device(name: str) -> str:
         return name
     if torch.cuda.is_available():
         return "cuda"
+    if torch_npu is not None and torch.npu.is_available():
+        return "npu"
     return "cpu"
 
 
@@ -197,8 +204,11 @@ def load_fc_weight(draft: str, cache_dir: str):
 
 def per_layer_curve(hs, mask):
     rows = []
+    mask_c = mask.cpu()
     for k, h in enumerate(hs):
-        h = h.float()[mask]
+        # per-layer move to CPU: quantile/median are not guaranteed on NPU, and
+        # one layer of statistics is small.
+        h = h.float().cpu()[mask_c]
         r = h.pow(2).mean(dim=-1).sqrt()
         mx = h.abs().amax(dim=-1)
         rows.append({
@@ -228,8 +238,9 @@ def tap_stats(hs, mask, taps, map_from_layers=None):
                for t in taps]
     else:
         idx = [min(max(int(t), 0), n_layers) for t in taps]
+    mask_c = mask.cpu()
     R = torch.stack([
-        hs[L + 1].float().pow(2).mean(dim=-1).sqrt()[mask] for L in idx], dim=1)
+        hs[L + 1].float().cpu().pow(2).mean(dim=-1).sqrt()[mask_c] for L in idx], dim=1)
     disp = R.max(dim=1).values / R.min(dim=1).values.clamp(min=1e-12)
     med = R.median(dim=0).values
     return {
@@ -292,7 +303,7 @@ def main():
                     help="one text per line; default built-in prompts")
     ap.add_argument("--max-len", type=int, default=128)
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp32", "fp16"])
-    ap.add_argument("--device", default="auto", help="auto | cpu | cuda")
+    ap.add_argument("--device", default="auto", help="auto | cpu | cuda | npu")
     ap.add_argument("--rho", type=float, default=15.0,
                     help="assumed max_t/rms_loudest for the effective-bits table (default 15)")
     ap.add_argument("--bits", default="8,4")
