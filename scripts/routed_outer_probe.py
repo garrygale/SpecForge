@@ -281,10 +281,11 @@ try:
             ).to(tl.float32)
             a = gate / (1.0 + tl.exp(-gate)) * w
             up = tl.load(
-                fused_ptr + t * TOTAL + e * (G + U) + G + offs_n,
-                mask=mask_n, other=0.0, care_padding=False,
+                fused_ptr + t[:, None] * TOTAL + e * (G + U) + G + offs_n[None, :],
+                mask=mask_m[:, None] & mask_n[None, :], other=0.0,
+                care_padding=False,
             ).to(tl.float32)
-            acc += a[:, None] * up[None, :]
+            acc += a[:, None] * up
         tl.store(
             out_ptr + offs_m[:, None] * U + offs_n[None, :],
             acc.to(out_ptr.dtype.element_ty),
