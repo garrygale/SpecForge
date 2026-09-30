@@ -37,16 +37,11 @@
     "channel_balanced": false,
     "target_hidden_size": 2048,
     "ffn_sharing": {
-      "pairing": "outer",
-      "gate_groups": 64,
-      "up_groups": 96
-    },
-    "ffn_readout": {
-      "mode": "folded_softmax",
-      "fold_axis": "gate",
-      "branches": 4,
-      "granularity": 16,
-      "logit_scale": 10.0
+      "mode": "routed_outer",
+      "experts": 4,
+      "gate_groups": 48,
+      "up_groups": 48,
+      "router": "expert"
     },
     "sliding_window": [
       2040,
@@ -56,7 +51,8 @@
       1024,
       1024,
       2040
-    ]
+    ],
+    "qat_w4a4_layers": []
   },
   "dtype": "bfloat16",
   "eos_token_id": 248044,
@@ -64,7 +60,7 @@
   "hidden_act": "silu",
   "hidden_size": 1536,
   "initializer_range": 0.02,
-  "intermediate_size": 6144,
+  "intermediate_size": 9216,
   "layer_types": [
     "sliding_attention",
     "sliding_attention",
