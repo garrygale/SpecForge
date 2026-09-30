@@ -362,6 +362,26 @@ def _device_label(device):
     return str(device)
 
 
+def _time_graph(fn, iters, device):
+    """Time graph replay only: capture once (NPU graph, the serving regime),
+    then min over replays.  Eager per-op dispatch is exactly what this
+    excludes — that overhead is the prime suspect when every compressed
+    variant loses to dense on small batches."""
+    graph = torch.npu.NPUGraph()
+    stream = torch.npu.Stream()
+    with torch.npu.graph(graph, stream=stream, capture_error_mode="global"):
+        fn()
+    graph.replay()
+    _sync(device)
+    times = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        graph.replay()
+        _sync(device)
+        times.append(time.perf_counter() - t0)
+    return min(times) * 1e3
+
+
 def _time(fn, iters, warmup, device):
     for _ in range(warmup):
         fn()
@@ -396,6 +416,7 @@ CONFIG = dict(
     warmup=10,
     device="auto",
     dtype="bf16",
+    graph=True,                    # NPU graph-capture timing column (replay-only)
 )
 
 
@@ -424,6 +445,9 @@ def main():
     parser.add_argument("--warmup", type=int, default=CONFIG["warmup"])
     parser.add_argument("--device", default=CONFIG["device"])
     parser.add_argument("--dtype", default=CONFIG["dtype"], choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--graph", action=argparse.BooleanOptionalAction, default=CONFIG["graph"],
+                        help="add an NPU graph-capture timing column (replay-only; eager "
+                             "dispatch overhead is what this hides — the serving regime)")
     args = parser.parse_args()
 
     d, E, G, U = args.hidden_size, args.experts, args.gate_groups, args.up_groups
@@ -507,24 +531,48 @@ def main():
     fast_gains = []
     for batch in batches:
         x = torch.randn(batch, d, device=device, dtype=dtype)
+        use_graph = (
+            args.graph
+            and device.type == "npu"
+            and hasattr(torch.npu, "NPUGraph")
+        )
         rows = []
         with torch.inference_mode():
             for name, mlp, _, _, _ in variants:
                 mlp = mlp.to(device=device, dtype=dtype)
                 ms = _time(lambda mlp=mlp: mlp(x), args.iters, args.warmup, device)
-                rows.append((name, ms))
+                gms = None
+                if use_graph:
+                    try:
+                        gms = _time_graph(lambda mlp=mlp: mlp(x), args.iters, device)
+                    except Exception as exc:  # noqa: BLE001 - report, keep going
+                        print(f"  graph capture failed for {name}: {type(exc).__name__}: {exc}")
+                rows.append((name, ms, gms))
         dense_ms = rows[0][1]
+        dense_gms = rows[0][2]
         dense_name = rows[0][0]
         print(f"batch={batch:>6} tok")
-        print(f"  {'variant':<28}{'ms/call':>10}{'vs dense':>10}{'us/tok':>10}{'GB/s(w)':>10}")
+        header = f"  {'variant':<28}{'ms/call':>10}{'vs dense':>10}"
+        if use_graph:
+            header += f"{'graph ms':>10}{'graph vs':>10}{'ovh':>7}"
+        header += f"{'us/tok':>10}{'GB/s(w)':>10}"
+        print(header)
         params_by_name = {
             name: sum(p.numel() for p in mlp.parameters()) for name, mlp, _, _, _ in variants
         }
-        ms_by_name = dict(rows)
-        for name, ms in rows:
+        ms_by_name = {name: ms for name, ms, _ in rows}
+        for name, ms, gms in rows:
             gb_s = params_by_name[name] * bytes_per / 1e9 / (ms / 1e3)
             tag = "" if name == dense_name else f"{dense_ms / ms:>9.2f}x"
-            print(f"  {name:<28}{ms:>10.3f}{tag:>10}{ms * 1e3 / batch:>10.2f}{gb_s:>10.1f}")
+            line = f"  {name:<28}{ms:>10.3f}{tag:>10}"
+            if use_graph:
+                if gms is not None:
+                    gtag = "" if name == dense_name else f"{dense_gms / gms:>9.2f}x"
+                    line += f"{gms:>10.3f}{gtag:>10}{ms / gms:>6.1f}x"
+                else:
+                    line += f"{'n/a':>10}{'n/a':>10}{'n/a':>7}"
+            line += f"{ms * 1e3 / batch:>10.2f}{gb_s:>10.1f}"
+            print(line)
             if name != dense_name:
                 speedups[name].append(dense_ms / ms)
         for router in routers:
