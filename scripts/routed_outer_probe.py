@@ -432,7 +432,7 @@ def main():
     parser.add_argument("--dense-intermediate", type=int, default=CONFIG["dense_intermediate"],
                         help="dense baseline width (default experts*G*U; pass the "
                              "old draft's width, e.g. 6144, for a vs-production row)")
-    parser.add_argument("--no-lattice", action=argparse.BooleanOptionalAction, default=CONFIG["no_lattice"],
+    parser.add_argument("--no-lattice", action="store_true", default=CONFIG["no_lattice"],
                         help="drop the single-lattice rows (routed vs dense only)")
     parser.add_argument("--fused", action=argparse.BooleanOptionalAction, default=CONFIG["fused"],
                         help="add the single-kernel numba fusion rows (fp32 + cuda only)")
