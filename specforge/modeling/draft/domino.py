@@ -59,7 +59,14 @@ class DominoDraftModel(DFlashDraftModel):
             batch_first=True,
             bias=False,
         )
-        in_dim = self.target_hidden_size + self.gru_hidden_dim
+        # The GRU runs over target-width embeddings; z_n carries the returned
+        # final hidden, which is draft-width under out_proj_after_norm.
+        z_dim = (
+            config.hidden_size
+            if self.out_proj_after_norm
+            else self.target_hidden_size
+        )
+        in_dim = z_dim + self.gru_hidden_dim
         use_embed = dflash_config.get("use_embed_proj", True)
         use_hidden = bool(dflash_config.get("use_hidden_proj", False))
         if use_embed:
@@ -110,7 +117,7 @@ class DominoDraftModel(DFlashDraftModel):
         """Sample a block while causally applying Domino's GRU correction."""
         target_embed = _target_embed_tokens(target)
         target_lm_head = _target_lm_head(target)
-        base_logits = target_lm_head(draft_hidden)
+        base_logits = target_lm_head(self.head_hidden(draft_hidden))
         completed_ids = block_output_ids.clone()
         base_logits4d = base_logits.unsqueeze(1)
         hidden_states4d = draft_hidden.unsqueeze(1)

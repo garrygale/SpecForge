@@ -1124,8 +1124,17 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.target_hidden_size = int(
             dflash_config.get("target_hidden_size", config.hidden_size)
         )
+        # True: final norm runs at draft width, output_proj moves after it and
+        # serving can fold it into the frozen target lm_head. vLLM reads the
+        # same dflash_config key.
+        self.out_proj_after_norm = bool(
+            dflash_config.get("out_proj_after_norm", False)
+        )
         self.norm = kernels.make_rms_norm(
-            self.target_hidden_size, config.rms_norm_eps
+            config.hidden_size
+            if self.out_proj_after_norm
+            else self.target_hidden_size,
+            config.rms_norm_eps,
         )
         self.rotary_emb = Qwen3RotaryEmbedding(
             _rope_config(config, self.attention_mode)
@@ -1383,7 +1392,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
         k_draft = block_size
         prefix_len = int(getattr(self, "pure_draft_prefix_len", 0))
-        base_logits = target_lm_head(full_hidden)
+        base_logits = target_lm_head(self.head_hidden(full_hidden))
 
         verify_ids = torch.full(
             (1, k_draft + 1),
@@ -1448,7 +1457,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         """
         del block_output_ids
         draft_logits = _target_lm_head(target)(
-            draft_hidden[:, -self.block_size + 1 :, :]
+            self.head_hidden(draft_hidden[:, -self.block_size + 1 :, :])
         )
         return sample(draft_logits)
 
@@ -1525,9 +1534,17 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+        if self.out_proj_after_norm:
+            return self.norm(hidden_states)
         if self.output_proj is not None:
             hidden_states = self.output_proj(hidden_states)
         return self.norm(hidden_states)
+
+    def head_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        output_proj = getattr(self, "output_proj", None)
+        if getattr(self, "out_proj_after_norm", False) and output_proj is not None:
+            return output_proj(hidden_states)
+        return hidden_states
 
     @torch.inference_mode()
     def spec_generate(

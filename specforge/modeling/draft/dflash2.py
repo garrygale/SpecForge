@@ -391,7 +391,9 @@ class DFlash2DraftModel(DFlashDraftModel):
         block_output_ids: torch.LongTensor,
     ) -> torch.LongTensor:
         hidden = draft_hidden[:, -self.block_size + 1 :, :]
-        unary_logits = self.transform_unary_logits(target.lm_head(hidden))
+        unary_logits = self.transform_unary_logits(
+            target.lm_head(self.head_hidden(hidden))
+        )
         unary_topk, candidate_ids = unary_logits.topk(
             self.candidate_selector.top_k,
             dim=-1,

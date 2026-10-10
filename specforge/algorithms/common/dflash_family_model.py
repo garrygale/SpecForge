@@ -630,6 +630,12 @@ class OnlineDFlashModel(nn.Module):
             covered_num=covered_num,
         )
 
+    def _head_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
+        head_hidden = getattr(self.draft_model, "head_hidden", None)
+        if head_hidden is None:
+            return hidden
+        return head_hidden(hidden)
+
     def _dflash_objective_chunk_terms(
         self,
         hidden: torch.Tensor,
@@ -639,9 +645,11 @@ class OnlineDFlashModel(nn.Module):
     ) -> DFlashObjectiveTerms:
         """Return a flat tuple of additive objective and metric tensors."""
 
-        batch_size, num_blocks, block_size, hidden_size = hidden.shape
+        batch_size, num_blocks, block_size = hidden.shape[:3]
         logits = self.lm_head(
-            hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
+            self._head_hidden(hidden).reshape(
+                batch_size, num_blocks * block_size, -1
+            )
         ).reshape(batch_size, num_blocks, block_size, -1)
         candidate_selector = getattr(self.draft_model, "candidate_selector", None)
         objective_logits = (
@@ -972,9 +980,11 @@ class OnlineDominoModel(OnlineDFlashModel):
         """Return additive Domino loss and telemetry terms for one block slice."""
         from specforge.core.domino_loss import domino_weighted_cross_entropy
 
-        batch_size, num_blocks, block_size, hidden_size = hidden.shape
+        batch_size, num_blocks, block_size = hidden.shape[:3]
         base_logits = self.lm_head(
-            hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
+            self._head_hidden(hidden).reshape(
+                batch_size, num_blocks * block_size, -1
+            )
         ).reshape(batch_size, num_blocks, block_size, -1)
         head_token_ids = prev_ids if self.shift_label else target_ids
         head_token_embeddings = self.embed_tokens(head_token_ids)
@@ -1372,9 +1382,11 @@ class OnlineDSparkModel(OnlineDFlashModel):
     ) -> Tuple[torch.Tensor, ...]:
         """Return additive loss and telemetry numerators for one block slice."""
 
-        batch_size, num_blocks, block_size, hidden_size = hidden.shape
+        batch_size, num_blocks, block_size = hidden.shape[:3]
         base_logits = self.lm_head(
-            hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
+            self._head_hidden(hidden).reshape(
+                batch_size, num_blocks * block_size, -1
+            )
         ).reshape(batch_size, num_blocks, block_size, -1)
         draft_logits = self.draft_model.apply_logits_head(
             base_logits,
@@ -1408,7 +1420,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                     aligned_target_hidden.reshape(
                         batch_size,
                         num_blocks * block_size,
-                        hidden_size,
+                        -1,
                     )
                 ).reshape_as(draft_logits)
                 target_probabilities = torch.softmax(target_logits.float(), dim=-1)

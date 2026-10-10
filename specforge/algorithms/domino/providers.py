@@ -96,6 +96,11 @@ def resume_contract(config, draft_model, training_model):
         "domino_sliding_draft_causal": bool(sliding_draft_causal),
         "domino_pure_draft_prefix_len": int(draft_model.pure_draft_prefix_len),
         "domino_target_hidden_size": int(draft_model.target_hidden_size),
+        "domino_out_proj_after_norm": bool(
+            getattr(draft_model.config, "dflash_config", {}).get(
+                "out_proj_after_norm", False
+            )
+        ),
         "domino_fusion_mode": str(
             getattr(draft_model.config, "dflash_config", {}).get("fusion_mode", "")
         ),

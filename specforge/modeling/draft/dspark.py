@@ -326,7 +326,7 @@ class DSparkDraftModel(DFlashDraftModel):
         """Generate a block with the same Markov correction used in training."""
 
         proposal_hidden = draft_hidden[:, -self.block_size + 1 :, :]
-        base_logits = target.lm_head(proposal_hidden)
+        base_logits = target.lm_head(self.head_hidden(proposal_hidden))
         if self.markov_head is None:
             return _sample(base_logits)
         sampled_tokens, _ = self.markov_head.sample_block_tokens(
