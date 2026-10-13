@@ -307,6 +307,7 @@ def build_layer_masks(wrapper, anchors, keep, seq_len, device):
         "S": seq_len,
         "block_size": block_size,
         "device": device,
+        "num_sinks": getattr(wrapper.draft_model, "num_sinks", 0),
     }
     full = create_dflash_sdpa_mask(**args)
     windows = getattr(wrapper.draft_model, "layer_sliding_windows", None)
@@ -360,7 +361,15 @@ def _forward_with_impl(wrapper, impl, input_ids, hidden_states, anchors, seq_len
 
 
 class LayerStats:
-    KEYS = ("p_block", "p_anchor", "p_edge", "edge_ratio", "h_ctx", "support")
+    KEYS = (
+        "p_block",
+        "p_anchor",
+        "p_edge",
+        "edge_ratio",
+        "h_ctx",
+        "support",
+        "p_sink",
+    )
 
     def __init__(self):
         self.rows = []  # dict of [H, Q] tensors per chunk
@@ -426,6 +435,8 @@ def chunk_metrics(attn, mask, anchors, seq_len, block_size, window, edge_k):
     p_norm = p_ctx / p_ctx.sum(-1).clamp_min(1e-9).unsqueeze(-1)
     h_ctx = -(p_norm * torch.nan_to_num(p_norm.log())).sum(-1)
 
+    p_sink = w[..., seq_len + anchors.shape[1] * block_size :].sum(-1)
+
     return {
         "p_block": p_block,
         "p_anchor": p_anchor,
@@ -433,6 +444,7 @@ def chunk_metrics(attn, mask, anchors, seq_len, block_size, window, edge_k):
         "edge_ratio": edge_ratio,
         "h_ctx": h_ctx,
         "support": h_ctx.exp(),
+        "p_sink": p_sink,
     }
 
 
@@ -717,7 +729,7 @@ def summarize(stats, windows, block_size, num_layers, args):
     emit("=" * 76)
     header = (
         f"{'L':>2} {'W':>5} {'P_blk':>7} {'P_anch':>8} {'anch/blk':>8} "
-        f"{'edgeR':>7} {'H_ctx':>7}  {'top1 anch/blk/edge/mid %':>26}"
+        f"{'edgeR':>7} {'H_ctx':>7} {'P_sink':>7}  {'top1 anch/blk/edge/mid %':>26}"
     )
     emit(header)
     emit("-" * len(header))
@@ -754,6 +766,7 @@ def summarize(stats, windows, block_size, num_layers, args):
             "anchor_share_of_block": share,
             "edge_ratio": edge_ratio.mean().item(),
             "h_ctx": h_ctx.mean().item(),
+            "p_sink": st.cat("p_sink").mean().item(),
             "err_rate": err_h.mean().item(),
             "top1_pct": {
                 k: st.top1.get(k, 0) / max(top_total, 1) for k in st.top1
@@ -765,7 +778,7 @@ def summarize(stats, windows, block_size, num_layers, args):
         emit(
             f"{layer:>2} {str(windows[layer]):>5} {row['p_block']:>7.3f} "
             f"{row['p_anchor']:>8.3f} {share:>8.3f} {row['edge_ratio']:>7.2f} "
-            f"{row['h_ctx']:>7.2f}  {top_str:>26}"
+            f"{row['h_ctx']:>7.2f} {row['p_sink']:>7.4f}  {top_str:>26}"
         )
 
     emit()
