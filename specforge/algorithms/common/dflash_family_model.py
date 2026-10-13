@@ -99,6 +99,7 @@ def create_dflash_sdpa_mask(
     device,
     sliding_window: Optional[int] = None,
     sliding_draft_causal: bool = False,
+    num_sinks: int = 0,
 ):
     """Construct a full or sliding dense boolean DFlash mask.
 
@@ -111,13 +112,17 @@ def create_dflash_sdpa_mask(
     ``W >= block_size`` it is identical to the historical causal mask.
     ``OnlineDFlashModel`` sets this from ``dflash_config.causal`` — the same
     field vLLM / vLLM-Ascend read — via ``resolve_sliding_draft_causal``.
+
+    ``num_sinks`` appends always-visible trailing KV columns for the learned
+    attention sinks, still gated by ``block_keep_mask`` so fully-masked query
+    rows stay fully masked (their post-attention zeroing relies on it).
     """
 
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError("sliding_window must be > 0")
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
-    KV_LEN = S + N * block_size
+    KV_LEN = S + N * block_size + num_sinks
 
     q_indices = torch.arange(Q_LEN, device=device).view(1, 1, -1, 1)  # (1, 1, Q_LEN, 1)
     kv_indices = torch.arange(KV_LEN, device=device).view(
@@ -159,7 +164,10 @@ def create_dflash_sdpa_mask(
 
     valid_block = block_keep_mask.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
 
-    final_mask = (mask_context | mask_draft) & valid_block
+    row_mask = mask_context | mask_draft
+    if num_sinks:
+        row_mask = row_mask | (kv_indices >= S + N * block_size)
+    final_mask = row_mask & valid_block
     return final_mask
 
 
@@ -172,15 +180,19 @@ def create_dflash_block_mask(
     flex_block_size=None,
     sliding_window: Optional[int] = None,
     sliding_draft_causal: bool = False,
+    num_sinks: int = 0,
 ):
     """Construct a full or sliding Flex Attention mask for DFlash training.
 
     ``sliding_draft_causal`` mirrors :func:`create_dflash_sdpa_mask` and is set
-    from ``dflash_config.causal``.
+    from ``dflash_config.causal``. ``num_sinks`` mirrors the dense builder's
+    always-visible trailing columns.
     """
 
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError("sliding_window must be > 0")
+    B, N = anchor_positions.shape
+    base_kv_len = S + N * block_size
 
     def dflash_mask_mod(b, h, q_idx, kv_idx):
         q_block_id = q_idx // block_size
@@ -212,13 +224,13 @@ def create_dflash_block_mask(
                 & (kv_block_offset <= draft_forward_reach)
             )
 
+        is_sink = num_sinks > 0 and kv_idx >= base_kv_len
         is_valid_block = block_keep_mask[b, safe_q_block_id]
         in_bounds = q_block_id < N
-        return (mask_context | mask_draft) & is_valid_block & in_bounds
+        return (mask_context | mask_draft | is_sink) & is_valid_block & in_bounds
 
-    B, N = anchor_positions.shape
     Q_LEN = N * block_size
-    KV_LEN = S + N * block_size
+    KV_LEN = S + N * block_size + num_sinks
 
     kwargs = {}
     if flex_block_size is not None:
@@ -495,6 +507,7 @@ class OnlineDFlashModel(nn.Module):
             "S": seq_len,
             "block_size": self.block_size,
             "device": device,
+            "num_sinks": getattr(self.draft_model, "num_sinks", 0),
         }
         if (
             self.attention_backend == "flex_attention"

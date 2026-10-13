@@ -568,6 +568,11 @@ class Qwen3DFlashAttentionBase(nn.Module):
             ), "DFlash FlexAttention requires attention_dropout=0.0"
         self.is_causal = False
         self.sliding_window = get_layer_sliding_window(config, layer_idx)
+        self.num_sinks = int(_dflash_method_config(config).get("attn_sink", 0) or 0)
+        if self.num_sinks < 0:
+            raise ValueError(
+                f"dflash_config.attn_sink must be >= 0, got {self.num_sinks}"
+            )
         self._init_projections(config, kernels)
         for attribute in ("scaling", "num_key_value_groups", "o_proj"):
             assert hasattr(
@@ -598,9 +603,21 @@ class Qwen3DFlashAttentionBase(nn.Module):
         bsz, q_len = hidden_states.shape[:-1]
         q, k, v = self._compute_qkv(hidden_states, target_hidden, position_embeddings)
         if past_key_values is not None:
+            # The DynamicCache must never hold sink rows: get_seq_length() and
+            # crop() feed position arithmetic in the generate paths. Strip the
+            # trailing sink rows, update, then re-append for this call only.
+            tail_k = tail_v = None
+            if self.num_sinks:
+                tail_k = k[..., -self.num_sinks :, :]
+                tail_v = v[..., -self.num_sinks :, :]
+                k = k[..., : -self.num_sinks, :]
+                v = v[..., : -self.num_sinks, :]
             cos, sin = position_embeddings
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+            if tail_k is not None:
+                k = torch.cat([k, tail_k], dim=2)
+                v = torch.cat([v, tail_v], dim=2)
         valid_queries = None
         attn_implementation = getattr(
             self.config, "_attn_implementation", None
@@ -702,6 +719,19 @@ class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
             )
         self.q_norm = kernels.make_rms_norm(self.head_dim, config.rms_norm_eps)
         self.k_norm = kernels.make_rms_norm(self.head_dim, config.rms_norm_eps)
+        if self.num_sinks:
+            # Raw learned sinks: no k_norm, no RoPE, no input dependence. The
+            # training masks expose them as always-visible trailing KV columns.
+            self.sink_k = nn.Parameter(
+                torch.zeros(
+                    self.num_sinks, config.num_key_value_heads, self.head_dim
+                )
+            )
+            self.sink_v = nn.Parameter(
+                torch.zeros(
+                    self.num_sinks, config.num_key_value_heads, self.head_dim
+                )
+            )
 
     def _compute_qkv(
         self,
@@ -732,6 +762,23 @@ class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
         v = v.transpose(1, 2)
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if self.num_sinks:
+            # Appended after RoPE so the sink stays un-rotated; [n, nkv, hd]
+            # -> [bsz, nkv, n, hd].
+            sink_k = (
+                self.sink_k.to(k.dtype)
+                .permute(1, 0, 2)
+                .unsqueeze(0)
+                .expand(k.shape[0], -1, -1, -1)
+            )
+            sink_v = (
+                self.sink_v.to(v.dtype)
+                .permute(1, 0, 2)
+                .unsqueeze(0)
+                .expand(v.shape[0], -1, -1, -1)
+            )
+            k = torch.cat([k, sink_k], dim=2)
+            v = torch.cat([v, sink_v], dim=2)
         return q, k, v
 
 
@@ -746,6 +793,12 @@ class Qwen3DFlashMLAAttention(Qwen3DFlashAttentionBase):
     """
 
     def _init_projections(self, config: Qwen3Config, kernels: DFlashKernels) -> None:
+        if self.num_sinks:
+            raise ValueError(
+                "dflash_config.attn_sink is not supported with "
+                "attention_mode='mla' (v1); the latent KV parameterization "
+                "would need a full sink triple"
+            )
         self.num_heads = int(config.num_attention_heads)
         self.num_key_value_groups = 1
         self.q_lora_rank = (
@@ -1111,12 +1164,20 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 "config.block_size or config.dflash_config.block_size"
             )
         self.block_size = block_size
+        self.num_sinks = int(dflash_config.get("attn_sink", 0) or 0)
         self.layers = nn.ModuleList(
             [
                 self._build_decoder_layer(config, layer_idx, kernels)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
+        if self.num_sinks:
+            layer_sinks = {layer.self_attn.num_sinks for layer in self.layers}
+            if layer_sinks != {self.num_sinks}:
+                raise ValueError(
+                    "all draft layers must share dflash_config.attn_sink; "
+                    f"model={self.num_sinks}, layers={sorted(layer_sinks)}"
+                )
         self.target_layer_ids = dflash_config.get(
             "target_layer_ids",
             build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
