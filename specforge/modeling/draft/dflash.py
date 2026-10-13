@@ -1158,6 +1158,13 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         block_size = getattr(config, "block_size", None)
         if block_size is None:
             block_size = dflash_config.get("block_size")
+            if block_size is not None:
+                # config.block_size is the canonical entry; every shipped
+                # config uses it. dflash_config.block_size is legacy-only.
+                print(
+                    "WARNING: dflash_config.block_size is deprecated; move it "
+                    "to top-level config.block_size"
+                )
         if not isinstance(block_size, int) or isinstance(block_size, bool):
             raise ValueError(
                 "DFlash config must define an integer block_size either at "

@@ -16,6 +16,7 @@ try:
         eagerGRU,
         sample,
     )
+    from .dflash2 import DFlashGroupedConv, Qwen3DFlash2DecoderLayer
     from .registry import register_draft
 except ImportError:  # exported top-level remote-code layout
     from dflash import (
@@ -25,6 +26,7 @@ except ImportError:  # exported top-level remote-code layout
         eagerGRU,
         sample,
     )
+    from dflash2 import DFlashGroupedConv, Qwen3DFlash2DecoderLayer
     from registry import register_draft
 
 
@@ -45,6 +47,45 @@ class DominoDraftModel(DFlashDraftModel):
                 "DominoDraftModel requires " "dflash_config.projector_type='domino'."
             )
         super().__init__(config)
+
+    def _build_decoder_layer(self, config, layer_idx, kernels):
+        method_config = dict(getattr(config, "dflash_config", None) or {})
+        taps = method_config.get("conv_kernel_size")
+        group_size = method_config.get("conv_group_size")
+        if taps is None and group_size is None:
+            return super()._build_decoder_layer(config, layer_idx, kernels)
+        if not isinstance(taps, int) or isinstance(taps, bool):
+            raise ValueError(
+                "domino conv requires an integer dflash_config.conv_kernel_size"
+            )
+        if not isinstance(group_size, int) or isinstance(group_size, bool):
+            raise ValueError(
+                "domino conv requires an integer dflash_config.conv_group_size"
+            )
+
+        def grouped_conv() -> DFlashGroupedConv:
+            return DFlashGroupedConv(
+                hidden_size=int(config.hidden_size),
+                block_size=self.block_size,
+                taps=taps,
+                group_size=group_size,
+            )
+
+        return Qwen3DFlash2DecoderLayer(
+            config,
+            layer_idx,
+            kernels,
+            attention_conv=grouped_conv(),
+            mlp_conv=grouped_conv(),
+        )
+
+    @torch.no_grad()
+    def _init_weights(self, module: nn.Module) -> None:
+        super()._init_weights(module)
+        if isinstance(module, DFlashGroupedConv):
+            # post_init() reinitializes child Linears; restore the dynamic
+            # branch to an exact no-op so a fresh conv is the identity.
+            nn.init.zeros_(module.kernel_projection.weight)
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         self.emb_dim = int(dflash_config["emb_dim"])
