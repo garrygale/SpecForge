@@ -2,7 +2,7 @@
 """Stage-0 probe: decompose DFlash-family draft attention mass by KV origin.
 
 Replays the training forward (sdpa mask builder + eager attention, weights
-captured per layer via forward hooks) over disaggregated capture shards:
+captured per layer via forward hooks) over target hidden states:
 
   H1  anchor column absorbs most within-block mass (emergent sink)
   H2  mask-column mass is positional smoothing, not content addressing
@@ -12,14 +12,29 @@ captured per layer via forward hooks) over disaggregated capture shards:
   H5  rows whose band reaches position 0 (anchor < W) lean less on
       anchor/edge than rows with anchor >> W
 
-Run on A3 from the SpecForge repo root:
+Two data sources:
 
-  python probes/attention_sink/probe_attn_mass.py \
-      --draft-checkpoint /path/to/draft_ckpt \
-      --target-checkpoint /path/to/target_hf_dir \
-      --data /path/to/capture_shards --out attn_mass_out
+* HF capture (no sglang needed): load the target with transformers, run the
+  prompts jsonl through it, and take hidden_states[target_layer_ids + 1].
+  The +1 is the same convention the sglang capture patch uses ("capture
+  before layer i" -> HF-style output of layer k captured at k+1), so the
+  layers are identical to what online disaggregated training consumed.
 
-Local smoke test (no data needed):
+    python probes/attention_sink/probe_attn_mass.py \
+        --draft-checkpoint /path/to/draft_ckpt \
+        --target-model-path /path/to/target_hf_dir \
+        --prompts /path/to/train.jsonl --chat-template qwen3.5 \
+        --prompt-max-length 8192 --out attn_mass_out
+
+* Offline shards: a directory of precomputed .ckpt feature files, as produced
+  by scripts/prepare_hidden_states.py and consumed by offline training.
+
+    python probes/attention_sink/probe_attn_mass.py \
+        --draft-checkpoint /path/to/draft_ckpt \
+        --target-checkpoint /path/to/target_hf_dir \
+        --data /path/to/capture_shards --out attn_mass_out
+
+Local smoke test (no data needed, exercises both modes):
 
   python probes/attention_sink/probe_attn_mass.py --selftest
 """
@@ -124,6 +139,121 @@ def load_shard(path: str):
         with gzip.open(path, "rb") as f:
             return torch.load(io.BytesIO(f.read()), weights_only=False)
     return torch.load(path, weights_only=False, mmap=True)
+
+
+# ---------------------------------------------------------------------------
+# HF target capture (bypasses sglang entirely)
+# ---------------------------------------------------------------------------
+
+
+def capture_samples_hf(args, draft):
+    """Run the prompts jsonl through the HF target and concat capture layers.
+
+    The draft config's target_layer_ids are HF-style 0-based decoder-layer
+    output ids; hidden_states[k + 1] matches the sglang capture convention.
+    Returns materialized samples on CPU so the target can be freed before the
+    draft replay starts.
+    """
+    from specforge.data.prompt_builder import prepare_prompt_tasks
+
+    layer_ids = draft.target_layer_ids
+    if layer_ids and isinstance(layer_ids[0], (list, tuple)):
+        raise RuntimeError(
+            "per-layer (nested) target_layer_ids are not supported by the HF "
+            "capture path; flatten them or precompute .ckpt shards"
+        )
+
+    tokenizer = None
+    if args.chat_template is not None:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.target_model_path, trust_remote_code=True
+        )
+    prompts = prepare_prompt_tasks(
+        args.prompts,
+        tokenizer,
+        chat_template=args.chat_template,
+        max_length=args.prompt_max_length,
+        is_preformatted=False,
+        train_only_last_turn=False,
+        cache_dir=None,
+        cache_key=None,
+        num_proc=None,
+        min_loss_tokens=2,
+        max_prompts=args.max_samples,
+    )
+    prompts = list(prompts)[: args.max_samples]
+    if not prompts:
+        raise RuntimeError(f"no usable prompts in {args.prompts}")
+
+    from transformers import AutoModelForCausalLM
+
+    print(
+        f"[probe] HF capture: {len(prompts)} prompts, target="
+        f"{args.target_model_path}, layers={[k + 1 for k in layer_ids]}"
+    )
+    try:
+        target = AutoModelForCausalLM.from_pretrained(
+            args.target_model_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            device_map="auto",
+        )
+    except Exception as exc:  # no accelerate / single-device envs
+        print(f"[probe] device_map=auto failed ({exc}); falling back to .to(device)")
+        target = AutoModelForCausalLM.from_pretrained(
+            args.target_model_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        ).to(pick_device(args.device))
+    target.eval()
+    num_target_layers = target.config.num_hidden_layers
+    if max(layer_ids) >= num_target_layers:
+        raise RuntimeError(
+            f"target_layer_ids {layer_ids} exceed target depth "
+            f"{num_target_layers}"
+        )
+
+    samples = []
+    with torch.inference_mode():
+        for idx, prompt in enumerate(prompts):
+            input_ids = torch.tensor(
+                prompt["payload"]["input_ids"], dtype=torch.long
+            ).unsqueeze(0)
+            loss_mask = torch.tensor(
+                prompt["payload"]["loss_mask"], dtype=torch.float
+            ).unsqueeze(0)
+            length = input_ids.shape[1]
+            out = target(
+                input_ids.to(target.device), output_hidden_states=True, use_cache=False
+            )
+            selected = [out.hidden_states[k + 1] for k in layer_ids]
+            hidden = torch.cat(selected, dim=-1)[
+                :, : args.max_length
+            ].to("cpu", torch.bfloat16)
+            input_ids = input_ids[:, : args.max_length]
+            loss_mask = loss_mask[:, : args.max_length]
+            del out, selected
+            if hidden.shape[1] != input_ids.shape[1]:
+                raise RuntimeError("prompt truncation mismatch")
+            print(
+                f"[probe] captured prompt {idx}: S={input_ids.shape[1]}, "
+                f"loss_tokens={int(loss_mask.sum())}, width={hidden.shape[-1]}"
+            )
+            samples.append(
+                (
+                    f"prompt_{idx:04d}",
+                    {"input_ids": input_ids, "loss_mask": loss_mask,
+                     "hidden_states": hidden},
+                )
+            )
+    del target
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.empty_cache()
+    return samples
 
 
 # ---------------------------------------------------------------------------
@@ -400,14 +530,6 @@ def run_probe(args):
     dtype = torch.float32 if device.type == "cpu" else torch.bfloat16
     torch.manual_seed(args.seed)
 
-    if args.selftest:
-        args.draft_checkpoint, args.target_checkpoint, args.data = (
-            make_selftest_artifacts()
-        )
-        args.max_samples = 1
-        args.max_anchors = 24
-        args.chunk_blocks = 8
-
     print(f"[probe] device={device} dtype={dtype}")
     draft = AutoDraftModel.from_pretrained(args.draft_checkpoint, torch_dtype=dtype)
     draft = draft.to(device).eval()
@@ -442,10 +564,16 @@ def run_probe(args):
         num_anchors=args.max_anchors,
     )
 
-    shards = find_shards(args.data)
-    if not shards:
-        raise RuntimeError(f"no capture shards under {args.data}")
-    print(f"[probe] {len(shards)} shards, using up to {args.max_samples}")
+    if getattr(args, "hf_mode", False):
+        samples = capture_samples_hf(args, draft)
+    else:
+        shards = find_shards(args.data)
+        if not shards:
+            raise RuntimeError(f"no capture shards under {args.data}")
+        print(f"[probe] {len(shards)} shards, using up to {args.max_samples}")
+        samples = [
+            (os.path.basename(s), load_shard(s)) for s in shards[: args.max_samples]
+        ]
 
     capture = AttnCapture(draft)
     stats = [LayerStats() for _ in range(num_layers)]
@@ -453,29 +581,30 @@ def run_probe(args):
     n_samples = 0
 
     with torch.inference_mode():
-        for shard in shards[: args.max_samples]:
-            raw = load_shard(shard)
-            sample = normalize_offline_sample(raw, args.max_length)
+        for name, raw in samples:
+            if getattr(args, "hf_mode", False):
+                sample = raw
+            else:
+                sample = normalize_offline_sample(raw, args.max_length)
             input_ids = sample["input_ids"].to(device)
             hidden_states = sample["hidden_states"].to(device, dtype)
             seq_len = input_ids.shape[1]
             expected = capture_width(draft)
             if hidden_states.shape[-1] != expected:
                 raise RuntimeError(
-                    f"capture width {hidden_states.shape[-1]} != T*H="
-                    f"{draft.num_target_layers}*{draft.target_hidden_size}"
+                    f"capture width {hidden_states.shape[-1]} != expected "
+                    f"{expected} from the draft config"
                 )
 
             anchors_all = select_anchors(
                 sample["loss_mask"], seq_len, block_size, args.max_anchors
             ).to(device)
             if anchors_all.numel() == 0:
-                print(f"[probe] {os.path.basename(shard)}: no valid anchors, skipped")
+                print(f"[probe] {name}: no valid anchors, skipped")
                 continue
             n_samples += 1
             print(
-                f"[probe] {os.path.basename(shard)}: S={seq_len}, "
-                f"anchors={anchors_all.numel()}"
+                f"[probe] {name}: S={seq_len}, anchors={anchors_all.numel()}"
             )
 
             for start in range(0, anchors_all.numel(), args.chunk_blocks):
@@ -896,12 +1025,59 @@ def make_selftest_artifacts():
     return draft_dir, target_dir, data_dir
 
 
+def make_hf_selftest_artifacts():
+    """Tiny HF target + pre-tokenized prompts for the HF capture selftest."""
+    draft_dir, _target, _data = make_selftest_artifacts()
+    tmp = os.path.dirname(draft_dir)
+
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+
+    hf_dir = os.path.join(tmp, "hf_target")
+    cfg = Qwen3Config(
+        hidden_size=32,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        num_hidden_layers=4,
+        vocab_size=64,
+        max_position_embeddings=256,
+        tie_word_embeddings=False,
+    )
+    Qwen3ForCausalLM(cfg).save_pretrained(hf_dir)
+
+    seq = 96
+    prompts_path = os.path.join(tmp, "prompts.jsonl")
+    with open(prompts_path, "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "input_ids": torch.randint(0, 64, (seq,)).tolist(),
+                    "loss_mask": [1] * seq,
+                }
+            )
+            + "\n"
+        )
+    return draft_dir, hf_dir, prompts_path
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     has_selftest = "--selftest" in sys.argv
     parser.add_argument("--draft-checkpoint", required=not has_selftest)
-    parser.add_argument("--target-checkpoint", required=not has_selftest)
-    parser.add_argument("--data", required=not has_selftest)
+    parser.add_argument(
+        "--target-checkpoint",
+        help="HF dir for embed_tokens/lm_head; defaults to --target-model-path "
+        "in HF capture mode",
+    )
+    parser.add_argument("--data", help="directory of offline .ckpt feature shards")
+    parser.add_argument(
+        "--target-model-path",
+        help="HF target dir; with --prompts enables HF capture mode (no sglang)",
+    )
+    parser.add_argument("--prompts", help="prompts jsonl for HF capture mode")
+    parser.add_argument("--chat-template", default=None)
+    parser.add_argument("--prompt-max-length", type=int, default=8192)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--max-samples", type=int, default=6)
     parser.add_argument("--max-length", type=int, default=8192)
@@ -912,6 +1088,64 @@ def main():
     parser.add_argument("--out", default="attn_mass_out")
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args()
+
+    if args.selftest:
+        draft_dir, target_dir, data_dir = make_selftest_artifacts()
+        base = dict(
+            max_samples=1,
+            max_anchors=24,
+            chunk_blocks=8,
+            edge_k=16,
+            device=args.device,
+            seed=args.seed,
+        )
+        ckpt_args = argparse.Namespace(
+            draft_checkpoint=draft_dir,
+            target_checkpoint=target_dir,
+            data=data_dir,
+            hf_mode=False,
+            out=args.out + "_ckpt",
+            max_length=512,
+            **base,
+        )
+        hf_draft, hf_target, hf_prompts = make_hf_selftest_artifacts()
+        hf_args = argparse.Namespace(
+            draft_checkpoint=hf_draft,
+            target_checkpoint=hf_target,
+            target_model_path=hf_target,
+            prompts=hf_prompts,
+            data=None,
+            hf_mode=True,
+            chat_template=None,
+            prompt_max_length=512,
+            out=args.out + "_hf",
+            max_length=512,
+            **base,
+        )
+        print("=== selftest mode 1/2: offline ckpt shards ===")
+        run_probe(ckpt_args)
+        print("\n=== selftest mode 2/2: HF target capture ===")
+        run_probe(hf_args)
+        return
+
+    if args.target_model_path or args.prompts:
+        missing = [
+            name
+            for name in ("target_model_path", "prompts", "draft_checkpoint")
+            if not getattr(args, name)
+        ]
+        if missing:
+            raise SystemExit(f"HF capture mode requires --{', --'.join(missing)}")
+        args.hf_mode = True
+        if args.target_checkpoint is None:
+            args.target_checkpoint = args.target_model_path
+    else:
+        args.hf_mode = False
+        if not args.data:
+            raise SystemExit(
+                "pass either --data (offline shards) or --target-model-path + "
+                "--prompts (HF capture)"
+            )
     run_probe(args)
 
 
