@@ -212,6 +212,47 @@ dflash_config.causal not set -> Domino default false
 
 The `eager`, `sdpa`, and `flex_attention` backends support both layouts.
 
+##### Per-tap target normalization
+
+The draft's target conditioning is the concatenation of the captured target
+layers, and those taps differ by up to ~50x in RMS on a real target (Qwen3-8B
+tap medians `0.27 / 0.93 / 1.56 / 4.34 / 13.98` for taps `1/9/17/25/33`). A
+single per-token quantization scale over that concat spends itself on the
+loudest tap and leaves the quiet taps at or below one effective bit — while the
+trained `fc` draws most of its column energy from exactly those quiet taps.
+
+`dflash_config.target_tap_norm: true` RMSNorms each captured tap before the
+fusion in every branch, so the fusion sees unit-RMS taps:
+
+* `fc`: `hidden_norm(fc(cat([norm_i(h_i)])))`
+* `flare`: `hidden_norm(sum_i softmax(w_i) * norm_i(h_i))`
+* per-layer: the tap stack is normalized once in capture order
+  (`capture_layer_ids`, sorted unique) before each draft layer gathers its own
+  subset into `fcs[i]`
+
+The parameters are one `[target_hidden_size]` gain per captured tap
+(`aux_hidden_norms.{i}.weight`, initialized to ones by `post_init`) — the layout
+the Laguna DFlash drafts serve in vLLM (`laguna_dflash.combine_hidden_states`)
+and SGLang (`DFlashLagunaForCausalLM.project_target_hidden`), so an exported
+checkpoint loads there unchanged. The flag is off by default, adds no
+state-dict keys when absent, and leaves every fusion width untouched, so no
+captured feature data has to be regenerated.
+
+Warm-start compatibility is explicit: enabling the flag requires a checkpoint
+that carries the `aux_hidden_norms.*` tensors (a Laguna draft, or a draft
+trained with the flag), and such a checkpoint cannot be loaded into a model with
+the flag off. `warm_start_draft_model` raises with the mismatching keys instead
+of silently initializing them.
+
+The Qwen3 Domino and DFlash serving classes in vLLM read the same
+`dflash_config.target_tap_norm` flag and apply the same per-tap norm inside
+`combine_hidden_states`, before `fc` (DFlash) or the flare fusion (Domino), so
+the quantized activation sees normalized taps; the vLLM-Ascend draft paths
+inherit that fusion and the on-the-fly quantizer only rewrites `LinearBase`
+modules, so the norms survive. SGLang's `DFlashDraftModel` does not implement
+the op yet — enable the flag only for checkpoints served by a runtime that
+mirrors it.
+
 ### DFlash2
 
 DFlash2 is a draft-architecture variant of DFlash, not a separate capture

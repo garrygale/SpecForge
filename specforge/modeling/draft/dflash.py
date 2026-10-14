@@ -1294,6 +1294,28 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             self.fcs = None
             self.hidden_norms = None
 
+        # Per-tap RMSNorm on the captured target states, applied before the
+        # fusion in every branch. On a real target the taps of the concatenated
+        # feature differ by ~50x in RMS, so one shared per-token quantization
+        # scale starves the quiet taps; normalizing each tap first removes that
+        # disparity. The layout (``aux_hidden_norms.{i}.weight``, one
+        # [target_hidden_size] vector per captured tap, initialized to ones by
+        # ``post_init``) matches the Laguna DFlash drafts served by vLLM and
+        # SGLang, so an exported checkpoint stays servable and a Laguna
+        # checkpoint can warm-start this model.
+        self.target_tap_norm = bool(dflash_config.get("target_tap_norm", False))
+        if self.target_tap_norm:
+            self.aux_hidden_norms = nn.ModuleList(
+                [
+                    kernels.make_rms_norm(
+                        self.target_hidden_size, config.rms_norm_eps
+                    )
+                    for _ in range(len(self.capture_layer_ids))
+                ]
+            )
+        else:
+            self.aux_hidden_norms = None
+
         if self.target_hidden_size != config.hidden_size:
             self.input_proj = nn.Linear(
                 self.target_hidden_size, config.hidden_size, bias=False
@@ -1529,6 +1551,28 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         )
         return sample(draft_logits)
 
+    def _normalize_target_taps(self, target_hidden: torch.Tensor) -> torch.Tensor:
+        """RMSNorm each captured target tap, then re-concatenate.
+
+        ``target_hidden`` is the ``[..., len(capture_layer_ids) * H]``
+        concatenation produced by ``extract_context_feature`` (training feeds
+        the same layout). The taps stay in ``capture_layer_ids`` order, which is
+        also the order ``_per_layer_gather`` indexes in per-layer mode. Mirrors
+        the served Laguna fusion, which slices the same way and writes each
+        normalized tap into a preallocated buffer.
+        """
+        num_taps = len(self.capture_layer_ids)
+        batch, seq_len = target_hidden.shape[:2]
+        taps = target_hidden.reshape(
+            batch, seq_len, num_taps, self.target_hidden_size
+        )
+        normed = torch.empty_like(taps)
+        for index, norm in enumerate(self.aux_hidden_norms):
+            normed[:, :, index, :] = norm(taps[:, :, index, :])
+        return normed.reshape(
+            batch, seq_len, num_taps * self.target_hidden_size
+        )
+
     def forward(
         self,
         position_ids: torch.LongTensor,
@@ -1542,6 +1586,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         hidden_states = noise_embedding
         if self.input_proj is not None:
             hidden_states = self.input_proj(hidden_states)
+
+        if self.aux_hidden_norms is not None:
+            target_hidden = self._normalize_target_taps(target_hidden)
 
         if self._flare:
             B, S, _ = target_hidden.shape

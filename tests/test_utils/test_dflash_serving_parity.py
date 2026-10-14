@@ -27,6 +27,7 @@ from specforge.algorithms.common.dflash_family_model import (
     create_dflash_sdpa_mask,
 )
 from specforge.modeling.draft.dflash import (
+    DFlashDraftModel,
     describe_sliding_draft_causal,
     resolve_sliding_draft_causal,
 )
@@ -378,6 +379,147 @@ class TestWrapperPlumbsSlidingDraftCausal(unittest.TestCase):
         wrapper, builder = self._run(sliding_draft_causal=True)
         self.assertTrue(wrapper.sliding_draft_causal)
         self.assertTrue(builder.call_args_list[1].kwargs["sliding_draft_causal"])
+
+
+def _tiny_tap_norm_config(*, tap_norm, fusion=None):
+    """Tiny DFlash config with the per-tap target norm flag."""
+    dflash_config = {
+        "mask_token_id": 63,
+        "target_layer_ids": [1, 3, 5],
+        "target_hidden_size": 32,
+        "target_tap_norm": tap_norm,
+    }
+    if fusion == "flare":
+        dflash_config["fusion_mode"] = "flare"
+        dflash_config["heterogeneous_kv"] = True
+    payload = {
+        "architectures": ["DFlashDraftModel"],
+        "model_type": "qwen3",
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "num_hidden_layers": 1,
+        "layer_types": ["full_attention"],
+        "num_target_layers": 8,
+        "target_hidden_size": 32,
+        "block_size": 4,
+        "vocab_size": 64,
+        "max_position_embeddings": 32,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000,
+        "sliding_window": None,
+        "use_sliding_window": False,
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "tie_word_embeddings": False,
+        "use_cache": True,
+        "dflash_config": dflash_config,
+    }
+    torch.manual_seed(0)
+    model = DFlashDraftModel(Qwen3Config.from_dict(payload))
+    model.eval()
+    return model
+
+
+def _served_laguna_fusion(model, target_hidden):
+    """Served fc fusion: vLLM ``laguna_dflash.combine_hidden_states``.
+
+    Slice the concatenated target features, RMSNorm each slice, re-concatenate,
+    project with ``fc`` and normalize -- the order SGLang's
+    ``DFlashLagunaForCausalLM.project_target_hidden`` uses too.
+    """
+    num_slices = len(model.capture_layer_ids)
+    slice_size = model.target_hidden_size
+    flat = target_hidden.reshape(-1, num_slices * slice_size)
+    slices = flat.view(flat.shape[0], num_slices, slice_size)
+    normed = torch.empty_like(slices)
+    for index, norm in enumerate(model.aux_hidden_norms):
+        normed[:, index, :] = norm(slices[:, index, :])
+    projected = model.fc(normed.reshape(flat.shape[0], -1))
+    result = model.hidden_norm(projected)
+    return result.reshape(*target_hidden.shape[:-1], result.shape[-1])
+
+
+def _served_domino_fusion(model, target_hidden):
+    """Served flare fusion: vLLM ``qwen3_domino.combine_hidden_states``."""
+    features = model.num_target_layers
+    width = model.target_hidden_size
+    layers = model.config.num_hidden_layers
+    flat = target_hidden.reshape(-1, features * width)
+    target = flat.view(-1, features, width)
+    normed = torch.empty_like(target)
+    for index, norm in enumerate(model.aux_hidden_norms):
+        normed[:, index, :] = norm(target[:, index, :])
+    fusion = torch.softmax(model.layer_fusion_weights, dim=1)
+    fused = torch.matmul(fusion, normed).reshape(-1, layers * width)
+    result = model.hidden_norm(fused)
+    return result.reshape(*target_hidden.shape[:-1], result.shape[-1])
+
+
+def _training_fusion(model, target_hidden):
+    """The tensor the training-side fusion hands to the draft layers."""
+    captured = {}
+    handle = model.hidden_norm.register_forward_hook(
+        lambda _module, _inputs, output: captured.setdefault("x", output)
+    )
+    seq_len = target_hidden.shape[1]
+    try:
+        with torch.no_grad():
+            model(
+                noise_embedding=torch.randn(1, seq_len, model.config.hidden_size),
+                target_hidden=target_hidden,
+                position_ids=torch.arange(2 * seq_len).unsqueeze(0),
+            )
+    finally:
+        handle.remove()
+    return captured["x"]
+
+
+class TestTargetTapNormServingParity(unittest.TestCase):
+    """``target_tap_norm`` must reproduce the served Laguna/Domino fusion."""
+
+    def test_tap_norm_keys_match_the_served_laguna_layout(self):
+        model = _tiny_tap_norm_config(tap_norm=True)
+        keys = {k for k in model.state_dict() if "aux_hidden_norms" in k}
+        self.assertEqual(
+            keys,
+            {f"aux_hidden_norms.{i}.weight" for i in range(3)},
+        )
+        self.assertFalse(
+            [
+                k
+                for k in _tiny_tap_norm_config(tap_norm=False).state_dict()
+                if "aux_hidden_norms" in k
+            ]
+        )
+
+    def test_tap_norm_fc_fusion_matches_served_laguna_path(self):
+        model = _tiny_tap_norm_config(tap_norm=True)
+        with torch.no_grad():
+            for index, norm in enumerate(model.aux_hidden_norms):
+                norm.weight.fill_(0.5 + index)
+        target = torch.randn(1, 6, 3 * 32)
+        torch.testing.assert_close(
+            _training_fusion(model, target),
+            _served_laguna_fusion(model, target),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+    def test_tap_norm_flare_fusion_matches_served_domino_path(self):
+        model = _tiny_tap_norm_config(tap_norm=True, fusion="flare")
+        with torch.no_grad():
+            for index, norm in enumerate(model.aux_hidden_norms):
+                norm.weight.fill_(0.5 + index)
+        target = torch.randn(1, 6, 3 * 32)
+        torch.testing.assert_close(
+            _training_fusion(model, target),
+            _served_domino_fusion(model, target),
+            rtol=1e-5,
+            atol=1e-6,
+        )
 
 
 if __name__ == "__main__":
