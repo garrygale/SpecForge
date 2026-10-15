@@ -26,6 +26,21 @@ except ImportError:  # exported top-level remote-code layout
     from dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
 
 try:
+    from .vha import (
+        apply_vha_postmix,
+        apply_vha_premix,
+        init_vha_params,
+        resolve_vha_config,
+    )
+except ImportError:  # exported top-level remote-code layout
+    from vha import (
+        apply_vha_postmix,
+        apply_vha_premix,
+        init_vha_params,
+        resolve_vha_config,
+    )
+
+try:
     from .registry import register_draft
 except ImportError:  # exported top-level remote-code layout
     from registry import register_draft
@@ -466,6 +481,7 @@ def validate_dflash_attention_config(config: Qwen3Config) -> str:
     """Validate the selected attention parameterization and return its mode."""
 
     attention_mode = resolve_dflash_attention_mode(config)
+    resolve_vha_config(config)
     if attention_mode == "mha" and int(config.num_key_value_heads) != int(
         config.num_attention_heads
     ):
@@ -590,6 +606,9 @@ class Qwen3DFlashAttentionBase(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
+    def _pre_output_mix(self, attn_output: torch.Tensor) -> torch.Tensor:
+        return attn_output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -661,6 +680,7 @@ class Qwen3DFlashAttentionBase(nn.Module):
             if valid_queries is not None and attn_weights is not None:
                 attn_weights = attn_weights.masked_fill(~valid_queries, 0)
         attn_output = attn_output.reshape(bsz, q_len, -1)
+        attn_output = self._pre_output_mix(attn_output)
         attn_output = self.o_proj(attn_output)
         if valid_queries is not None:
             attn_output = attn_output.masked_fill(
@@ -682,9 +702,11 @@ class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
             config.num_attention_heads // config.num_key_value_heads
         )
         self.scaling = self.head_dim**-0.5
+        self.vha = resolve_vha_config(config)
+        q_heads = self.vha["physical_q_heads"] if self.vha else config.num_attention_heads
         self.q_proj = nn.Linear(
             config.hidden_size,
-            config.num_attention_heads * self.head_dim,
+            q_heads * self.head_dim,
             bias=config.attention_bias,
         )
         self.k_proj = nn.Linear(
@@ -702,6 +724,15 @@ class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
             config.hidden_size,
             bias=config.attention_bias,
         )
+        if self.vha:
+            params = init_vha_params(
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                self.head_dim,
+                self.vha,
+            )
+            for name, tensor in params.items():
+                setattr(self, name, nn.Parameter(tensor))
         self.heterogeneous_kv = bool(method_config.get("heterogeneous_kv", False))
         self.target_hidden_size = int(
             method_config.get("target_hidden_size", config.hidden_size)
@@ -743,6 +774,8 @@ class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
         ctx_len = target_hidden.shape[1]
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
+        if self.vha:
+            q = apply_vha_premix(q, self.vha_premix)
         q = self.q_norm(q).transpose(1, 2)
         if self.heterogeneous_kv:
             k_ctx = self.k_proj_target(target_hidden)
@@ -780,6 +813,11 @@ class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
             k = torch.cat([k, sink_k], dim=2)
             v = torch.cat([v, sink_v], dim=2)
         return q, k, v
+
+    def _pre_output_mix(self, attn_output: torch.Tensor) -> torch.Tensor:
+        if self.vha is None:
+            return attn_output
+        return apply_vha_postmix(attn_output, self.vha_postmix_u, self.vha_postmix_v)
 
 
 class Qwen3DFlashMLAAttention(Qwen3DFlashAttentionBase):
