@@ -100,6 +100,48 @@ class DominoDraftModel(DFlashDraftModel):
             batch_first=True,
             bias=False,
         )
+        # shared_emb_readout: base and correction share one emb-width
+        # bottleneck plus the frozen target lm_head:
+        #   base       = lm_head @ W_up @ W_down @ z
+        #   correction = lm_head @ W_up @ W_s @ gru(s)
+        # Both paths are linear through W_up, so serving adds them in emb
+        # space and folds lm_head @ W_up into a single [V, emb] GEMM per
+        # correction step. The correction input drops z (W_down already
+        # carries it) and the SiLU (any nonlinearity between W_down and the
+        # lm_head would break the emb-space add).
+        self.shared_emb_readout = bool(
+            dflash_config.get("shared_emb_readout", False)
+        )
+        if self.shared_emb_readout:
+            if not self.out_proj_after_norm:
+                raise ValueError(
+                    "shared_emb_readout requires out_proj_after_norm=true "
+                    "(the final norm must run at draft width before the "
+                    "head bottleneck)"
+                )
+            if not dflash_config.get("use_embed_proj", True):
+                raise ValueError(
+                    "shared_emb_readout requires use_embed_proj=true"
+                )
+            if dflash_config.get("use_hidden_proj", False):
+                raise ValueError(
+                    "shared_emb_readout is not compatible with "
+                    "use_hidden_proj"
+                )
+            self.head_down_proj = nn.Linear(
+                config.hidden_size, self.emb_dim, bias=False
+            )
+            self.head_up_proj = nn.Linear(
+                self.emb_dim, self.target_hidden_size, bias=False
+            )
+            self.embed_proj = nn.Linear(
+                self.gru_hidden_dim, self.emb_dim, bias=False
+            )
+            self.hidden_proj = None
+            # output_proj built by the base class is dead under the flag.
+            self.output_proj = None
+            return
+
         # The GRU runs over target-width embeddings; z_n carries the returned
         # final hidden, which is draft-width under out_proj_after_norm.
         z_dim = (
@@ -149,6 +191,12 @@ class DominoDraftModel(DFlashDraftModel):
     def _run_gru(self, gru_inputs: torch.Tensor) -> torch.Tensor:
         return self.prefix_gru(gru_inputs)[0]
 
+    def head_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # getattr: bare/stub drafts bypass _init_draft_head.
+        if getattr(self, "shared_emb_readout", False):
+            return self.head_up_proj(self.head_down_proj(hidden_states))
+        return super().head_hidden(hidden_states)
+
     def _sample_draft_tokens(
         self,
         target: nn.Module,
@@ -169,6 +217,7 @@ class DominoDraftModel(DFlashDraftModel):
                 base_logits4d,
                 prev_token_embeddings=previous_embeddings,
                 hidden_states=hidden_states4d,
+                lm_head=target_lm_head,
             )
             head_position = token_position - 1 if self.shift_label else token_position
             next_token_logits = final_logits[:, 0, head_position, :].unsqueeze(1)
@@ -180,14 +229,16 @@ class DominoDraftModel(DFlashDraftModel):
         self,
         base_logits: torch.Tensor,
         *,
-        prev_token_ids: Optional[torch.Tensor] = None,
+        prev_token_ids: Optional[torch.LongTensor] = None,
         prev_token_embeddings: Optional[torch.Tensor] = None,
         hidden_states: torch.Tensor,
+        lm_head: Optional[nn.Module] = None,
     ) -> torch.Tensor:
         del prev_token_ids
         correction_logits = self.compute_correction_logits(
             prev_token_embeddings=prev_token_embeddings,
             hidden_states=hidden_states,
+            lm_head=lm_head,
         )
         prefix_logits = base_logits[:, :, : self.suffix_start, :]
         suffix_logits = base_logits[:, :, self.suffix_start :, :] + correction_logits
@@ -198,6 +249,7 @@ class DominoDraftModel(DFlashDraftModel):
         *,
         prev_token_embeddings: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
+        lm_head: Optional[nn.Module] = None,
     ) -> torch.Tensor:
         """Return suffix-only Domino logits without materializing final logits."""
         if prev_token_embeddings is None:
@@ -216,6 +268,14 @@ class DominoDraftModel(DFlashDraftModel):
             gru_out = self._run_gru(gru_inputs)
             gru_out = gru_out.reshape(bsz, n_blocks, block_size - 1, -1)
             prefix_states = gru_out[:, :, self.suffix_start - 1 :, :]
+
+        if getattr(self, "shared_emb_readout", False):
+            if lm_head is None:
+                raise ValueError(
+                    "shared_emb_readout needs the target lm_head to lift the "
+                    "correction through the shared W_up"
+                )
+            return lm_head(self.head_up_proj(self.embed_proj(prefix_states)))
 
         z_n = hidden_states[:, :, self.suffix_start :, :]
         concat_features = torch.cat([z_n, prefix_states], dim=-1)

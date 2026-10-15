@@ -1541,12 +1541,17 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         for i in range(prefix_len, k_draft):
             z_i = full_hidden[:, i : i + 1]
             s_i = gru_hidden.transpose(0, 1)
-            concat = torch.cat([z_i, s_i], dim=-1)
             logits_i = base_logits[:, i : i + 1]
-            if self.embed_proj is not None:
-                logits_i = logits_i + self.embed_proj(concat)
-            if self.hidden_proj is not None:
-                logits_i = logits_i + target_lm_head(self.hidden_proj(concat))
+            if getattr(self, "shared_emb_readout", False):
+                logits_i = logits_i + target_lm_head(
+                    self.head_up_proj(self.embed_proj(s_i))
+                )
+            else:
+                concat = torch.cat([z_i, s_i], dim=-1)
+                if self.embed_proj is not None:
+                    logits_i = logits_i + self.embed_proj(concat)
+                if self.hidden_proj is not None:
+                    logits_i = logits_i + target_lm_head(self.hidden_proj(concat))
             current_token_id = sample(logits_i, temperature)
             verify_ids[:, i + 1 : i + 2] = current_token_id
             if i + 1 < k_draft:

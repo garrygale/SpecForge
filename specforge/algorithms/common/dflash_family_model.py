@@ -1004,6 +1004,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         correction_logits = self.draft_model.compute_correction_logits(
             hidden_states=hidden,
             prev_token_embeddings=head_token_embeddings,
+            lm_head=self.lm_head,
         )
         final_num, base_num, predicted_ids, base_predicted_ids = (
             domino_weighted_cross_entropy(

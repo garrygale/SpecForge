@@ -101,6 +101,11 @@ def resume_contract(config, draft_model, training_model):
                 "out_proj_after_norm", False
             )
         ),
+        "domino_shared_emb_readout": bool(
+            getattr(draft_model.config, "dflash_config", {}).get(
+                "shared_emb_readout", False
+            )
+        ),
         "domino_fusion_mode": str(
             getattr(draft_model.config, "dflash_config", {}).get("fusion_mode", "")
         ),
