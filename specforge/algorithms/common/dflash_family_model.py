@@ -592,7 +592,12 @@ class OnlineDFlashModel(nn.Module):
                 raise ValueError(
                     "DFlash-family mining requires supervised tokens"
                 )
-            start = max(spans[0][0] - 1, 0)
+            # Serving anchors each turn's first block at the turn's first
+            # token (the prefill-sampled token feeds the anchor row), never
+            # at the preceding context token — so the chain starts at the
+            # span itself and the turn's first token is an anchor input, not
+            # a label, exactly like the random sampler's validity rule.
+            start = spans[0][0]
             n_cand = seq_len - start
             stop = torch.zeros(
                 n_cand, block_size, dtype=torch.bool, device=device
@@ -629,9 +634,10 @@ class OnlineDFlashModel(nn.Module):
                 stop[c0:c1] = stop_chunk
                 anchorable[c0:c1] = ~censored[:, first_slot]
 
-            # One chain per supervised span: each turn is a fresh restart
-            # boundary in serving, and the span limit keeps a fully-accepted
-            # block from jumping a short unsupervised gap into the next turn.
+            # One chain per supervised span: each turn restarts with a fresh
+            # prefill whose sampled token anchors the first block, and the
+            # span limit keeps a fully-accepted block from jumping a short
+            # unsupervised gap into the next turn.
             stop_cpu = stop.cpu()
             anchorable_cpu = anchorable.cpu()
             chain: List[int] = []
@@ -640,7 +646,7 @@ class OnlineDFlashModel(nn.Module):
                 span_chain, span_full = walk_anchor_chain(
                     stop_cpu,
                     anchorable_cpu,
-                    max(span_start - 1, 0),
+                    span_start,
                     start,
                     shift,
                     limit=span_end - 1,

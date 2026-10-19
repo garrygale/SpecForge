@@ -231,26 +231,26 @@ class TestBaseMining(unittest.TestCase):
         ids, hidden = self._ids()
         model, mask = self._setup(ids, hidden, num_anchors=64)
         _, _, kept = self._kept(model, ids, hidden, mask)
-        expected = _manual_chain({}, ids, mask, self.prompt - 1, self.block, 0)
+        expected = _manual_chain({}, ids, mask, self.prompt, self.block, 0)
         self.assertEqual(kept, expected)
-        self.assertEqual(len(expected), self.seq_len - self.prompt)
+        self.assertEqual(expected, list(range(self.prompt, self.seq_len - 1)))
 
     def test_matches_manual_walk_with_jumps(self):
         ids, hidden = self._ids()
         script = {
-            (4, 1): int(ids[0, 5]),
-            (4, 2): int(ids[0, 6]),
-            (7, 1): int(ids[0, 8]),
-            (7, 2): int(ids[0, 9]),
-            (7, 3): int(ids[0, 10]),
+            (5, 1): int(ids[0, 6]),
+            (5, 2): int(ids[0, 7]),
+            (8, 1): int(ids[0, 9]),
+            (8, 2): int(ids[0, 10]),
+            (8, 3): int(ids[0, 11]),
         }
         model, mask = self._setup(ids, hidden, script=script, num_anchors=64)
         _, _, kept = self._kept(model, ids, hidden, mask)
         expected = _manual_chain(
-            script, ids, mask, self.prompt - 1, self.block, 0
+            script, ids, mask, self.prompt, self.block, 0
         )
         self.assertEqual(kept, expected)
-        self.assertEqual(expected[:3], [4, 7, 11])
+        self.assertEqual(expected[:3], [5, 8, 12])
 
     def test_chunk_size_invariance(self):
         ids, hidden = self._ids()
@@ -265,7 +265,7 @@ class TestBaseMining(unittest.TestCase):
         ids, hidden = self._ids()
         model, mask = self._setup(ids, hidden, num_anchors=5)
         anchors, keep, kept = self._kept(model, ids, hidden, mask)
-        expected = _manual_chain({}, ids, mask, self.prompt - 1, self.block, 0)
+        expected = _manual_chain({}, ids, mask, self.prompt, self.block, 0)
         self.assertEqual(len(kept), 5)
         self.assertEqual(kept[0], expected[0])
         self.assertEqual(kept[-1], expected[-1])
@@ -277,7 +277,7 @@ class TestBaseMining(unittest.TestCase):
         ids, hidden = self._ids()
         model, mask = self._setup(ids, hidden, num_anchors=64)
         anchors, keep, kept = self._kept(model, ids, hidden, mask)
-        expected = _manual_chain({}, ids, mask, self.prompt - 1, self.block, 0)
+        expected = _manual_chain({}, ids, mask, self.prompt, self.block, 0)
         self.assertLess(len(expected), 64)
         self.assertEqual(kept, expected)
         self.assertTrue(bool((anchors[0][len(expected) :] == 0).all()))
@@ -314,7 +314,7 @@ class TestBaseMining(unittest.TestCase):
         ids, hidden = self._ids()
         model, mask = self._setup(ids, hidden, num_anchors=64)
         _, _, metrics = model(ids, hidden, mask)
-        expected = _manual_chain({}, ids, mask, self.prompt - 1, self.block, 0)
+        expected = _manual_chain({}, ids, mask, self.prompt, self.block, 0)
         count = metrics["ratio_metrics"]["mined_anchor_count"]
         self.assertAlmostEqual(
             float(count[0] / count[1]), float(len(expected)), places=5
@@ -357,12 +357,12 @@ class TestBaseMining(unittest.TestCase):
                                   num_anchors=64)
         _, _, kept = self._kept(model, ids, hidden, mask)
         expected = _manual_chain(
-            script, ids, mask, self.prompt - 1, self.block, 0, limit=11
+            script, ids, mask, self.prompt, self.block, 0, limit=11
         ) + _manual_chain(
-            script, ids, mask, 13, self.block, 0, limit=19
+            script, ids, mask, 14, self.block, 0, limit=19
         )
         self.assertEqual(kept, expected)
-        self.assertEqual(expected, [4, 5, 6, 7, 8, 9, 13, 14, 15, 16, 17, 18])
+        self.assertEqual(expected, [5, 6, 7, 8, 9, 14, 15, 16, 17, 18])
 
     def test_head_chunk_slice_invariance(self):
         ids, hidden = self._ids()
@@ -409,25 +409,25 @@ class TestDominoMining(unittest.TestCase):
     def test_shifted_axis_matches_manual_walk(self):
         torch.manual_seed(3)
         ids = torch.randint(1, self.vocab, (1, self.seq_len))
-        ids[0, 5] = 3
+        ids[0, 6] = 3
         mask = torch.zeros(1, self.seq_len)
         mask[0, self.prompt :] = 1.0
         hidden = torch.randn(1, self.seq_len, 8)
         script = {
-            (4, 1): int(ids[0, 6]),
-            (4, 2): int(ids[0, 7]),
-            (4, 3): int(ids[0, 8]),
-            (10, 1): int(ids[0, 11]),
+            (5, 1): int(ids[0, 7]),
+            (5, 2): int(ids[0, 8]),
+            (5, 3): int(ids[0, 9]),
+            (11, 1): int(ids[0, 12]),
         }
         model = self._model(script)
         anchors, keep = model._mine_anchor_positions(ids, hidden, mask)
         kept = anchors[0][keep[0]].tolist()
         expected = _manual_chain(
-            script, ids, mask, self.prompt - 1, self.block, 1, prefix_token=3
+            script, ids, mask, self.prompt, self.block, 1, prefix_token=3
         )
         self.assertEqual(kept, expected)
-        self.assertEqual(expected[0], 4)
-        self.assertIn(9, kept)
+        self.assertEqual(expected[0], 5)
+        self.assertIn(10, kept)
 
     def test_domino_full_accept_advances_block_plus_one(self):
         ids = torch.full((1, self.seq_len), 3, dtype=torch.long)
@@ -435,20 +435,20 @@ class TestDominoMining(unittest.TestCase):
         mask[0, self.prompt :] = 1.0
         hidden = torch.randn(1, self.seq_len, 8)
         script = {
-            (4, 1): 3,
-            (4, 2): 3,
-            (4, 3): 3,
-            (9, 1): 3,
-            (9, 2): 3,
-            (9, 3): 3,
-            (14, 1): 3,
-            (14, 2): 3,
-            (14, 3): 3,
+            (5, 1): 3,
+            (5, 2): 3,
+            (5, 3): 3,
+            (10, 1): 3,
+            (10, 2): 3,
+            (10, 3): 3,
+            (15, 1): 3,
+            (15, 2): 3,
+            (15, 3): 3,
         }
         model = self._model(script)
         anchors, keep = model._mine_anchor_positions(ids, hidden, mask)
         kept = anchors[0][keep[0]].tolist()
-        self.assertEqual(kept, [4, 9, 14])
+        self.assertEqual(kept, [5, 10, 15])
 
 
 if __name__ == "__main__":
