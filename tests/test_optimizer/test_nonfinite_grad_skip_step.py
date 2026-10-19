@@ -1,6 +1,11 @@
+import math
+import os
+import tempfile
 import unittest
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from specforge.optimizer import BF16Optimizer
 
@@ -65,6 +70,75 @@ class TestNonFiniteGradSkipStep(unittest.TestCase):
         for master in optimizer.fp32_params:
             # 0 * inf would have turned these into NaN
             self.assertTrue(torch.isinf(master.grad).all())
+
+
+def _skip_worker(rank, world_size, init_file, results, enabled, poison_ranks):
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        model, optimizer = _make_optimizer()
+        optimizer.configure_grad_norm_reduction(enabled=enabled)
+        weight_before = model.weight.detach().clone()
+
+        grad = torch.full_like(model.weight, 0.1)
+        if rank in poison_ranks:
+            grad[0, 0] = float("inf")
+        model.weight.grad = grad
+
+        norm = optimizer.step()
+        results[f"norm-{rank}"] = norm.item()
+        results[f"unchanged-{rank}"] = bool(torch.equal(model.weight, weight_before))
+        results[f"grad-cleared-{rank}"] = model.weight.grad is None
+        results[f"adam-empty-{rank}"] = len(optimizer.optimizer.state) == 0
+
+        model.weight.grad = torch.full_like(model.weight, 0.2)
+        results[f"clean-{rank}"] = optimizer.step().item()
+        results[f"final-{rank}"] = model.weight.detach().clone()
+    finally:
+        dist.destroy_process_group()
+
+
+class TestNonFiniteGradSkipDistributed(unittest.TestCase):
+    def _spawn(self, enabled, poison_ranks):
+        world_size = 2
+        with tempfile.TemporaryDirectory() as tmpdir:
+            init_file = os.path.join(tmpdir, "init")
+            manager = mp.Manager()
+            results = manager.dict()
+            mp.spawn(
+                _skip_worker,
+                args=(world_size, init_file, results, enabled, poison_ranks),
+                nprocs=world_size,
+                join=True,
+            )
+        return results
+
+    def test_sharded_poison_on_one_rank_skips_everywhere(self):
+        # SHARD_GRAD_OP/FULL_SHARD config: the norm is all-reduced, so a poison
+        # grad on one rank's shard must flip every rank to the same decision.
+        results = self._spawn(enabled=True, poison_ranks={0})
+        for rank in range(2):
+            self.assertTrue(math.isinf(results[f"norm-{rank}"]))
+            self.assertTrue(results[f"unchanged-{rank}"])
+            self.assertTrue(results[f"grad-cleared-{rank}"])
+            self.assertTrue(results[f"adam-empty-{rank}"])
+        self.assertEqual(results["clean-0"], results["clean-1"])
+        torch.testing.assert_close(results["final-0"], results["final-1"])
+
+    def test_replicated_poison_on_all_ranks_skips_everywhere(self):
+        # NO_SHARD runs under DDP with reduction disabled: grads are identical
+        # on every rank, so an inf grad is inf everywhere and the local-norm
+        # decision still agrees.
+        results = self._spawn(enabled=False, poison_ranks={0, 1})
+        for rank in range(2):
+            self.assertTrue(math.isinf(results[f"norm-{rank}"]))
+            self.assertTrue(results[f"unchanged-{rank}"])
+            self.assertTrue(results[f"adam-empty-{rank}"])
+        torch.testing.assert_close(results["final-0"], results["final-1"])
 
 
 if __name__ == "__main__":

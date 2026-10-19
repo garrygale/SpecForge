@@ -147,7 +147,10 @@ class BF16Optimizer:
             # One inf/nan grad makes the clip coefficient 0, and 0 * inf turns
             # every fp32 master permanently NaN. Drop the step instead; grads
             # must still be cleared or the poison accumulates into the next
-            # backward and the guard would fire forever.
+            # backward and the guard would fire forever. The norm is already
+            # reduced across ranks (or replicated by DDP under NO_SHARD), so
+            # every rank takes this branch together, and the branch itself
+            # issues no collectives.
             logger.warning(
                 "BF16Optimizer: non-finite grad norm (%s); skipping step", norm_value
             )
