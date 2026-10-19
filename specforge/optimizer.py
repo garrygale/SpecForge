@@ -1,4 +1,5 @@
 import logging
+import math
 
 import torch
 import torch.distributed as dist
@@ -128,6 +129,8 @@ class BF16Optimizer:
         total_norm, clip_coef = self._reduce_grad_norm(
             local_norm_sq.to(reduction_device)
         )
+        if not math.isfinite(float(total_norm.item())):
+            return total_norm
         for grad in grads:
             coefficient = (
                 clip_coef
@@ -139,6 +142,20 @@ class BF16Optimizer:
 
     def step(self):
         grad_norm, clip_coefficient = self._grad_norm_and_clip_coefficient()
+        norm_value = float(grad_norm.item())
+        if not math.isfinite(norm_value):
+            # One inf/nan grad makes the clip coefficient 0, and 0 * inf turns
+            # every fp32 master permanently NaN. Drop the step instead; grads
+            # must still be cleared or the poison accumulates into the next
+            # backward and the guard would fire forever.
+            logger.warning(
+                "BF16Optimizer: non-finite grad norm (%s); skipping step", norm_value
+            )
+            with torch.no_grad():
+                for p in self.model_params:
+                    p.grad = None
+            self.last_grad_norm = grad_norm.detach()
+            return self.last_grad_norm
         cpu_clip_coefficient = (
             float(clip_coefficient.item()) if self.offload_master else None
         )
