@@ -587,6 +587,8 @@ def build_dflash_model(
             lk_loss_type=cfg.training.lk_loss_type,
             kl_scale=cfg.training.kl_scale,
             kl_decay=cfg.training.kl_decay,
+            anchor_policy=cfg.training.anchor_policy,
+            anchor_mining_chunk_candidates=cfg.training.anchor_mining_chunk_candidates,
         ),
     )
 
@@ -626,6 +628,12 @@ def build_dspark_model(
 ) -> AlgorithmModelParts:
     from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
 
+    if cfg.training.anchor_policy == "mined":
+        raise ValueError(
+            "training.anchor_policy='mined' is not supported for the dspark "
+            "strategy yet; its anchor semantics are unverified for chain "
+            "mining. Remove the key or switch the strategy."
+        )
     return _build_dflash_family_model(
         cfg,
         draft_model,

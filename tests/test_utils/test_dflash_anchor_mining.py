@@ -137,13 +137,17 @@ def _eye_head(vocab_size):
 
 
 def _manual_chain(script, ids, mask, start, block, shift, default_token=0,
-                  prefix_token=None):
+                  prefix_token=None, limit=None):
     seq_len = ids.shape[1]
     ids_list = ids[0].tolist()
     mask_list = (mask[0] > 0.5).tolist()
     chain = []
     a = start
-    while a + 1 < seq_len and mask_list[a + 1]:
+    while (
+        a + 1 < seq_len
+        and mask_list[a + 1]
+        and (limit is None or a < limit)
+    ):
         chain.append(a)
         stop = None
         for k in range(1 - shift, block):
@@ -202,9 +206,10 @@ class TestBaseMining(unittest.TestCase):
         hidden = torch.randn(1, self.seq_len, 8)
         return ids, hidden
 
-    def _setup(self, ids, hidden, script=None, **model_kwargs):
-        mask = torch.zeros(1, self.seq_len)
-        mask[0, self.prompt :] = 1.0
+    def _setup(self, ids, hidden, script=None, mask=None, **model_kwargs):
+        if mask is None:
+            mask = torch.zeros(1, self.seq_len)
+            mask[0, self.prompt :] = 1.0
         draft = _ScriptedDraft(self.vocab, self.block, self.seq_len, script or {})
         model_kwargs.setdefault("anchor_policy", "mined")
         model_kwargs.setdefault("anchor_mining_chunk_candidates", 512)
@@ -334,6 +339,41 @@ class TestBaseMining(unittest.TestCase):
         mask = torch.zeros(1, self.seq_len)
         with self.assertRaises(ValueError):
             model._mine_anchor_positions(ids, hidden, mask)
+
+    def test_multi_span_mines_each_turn_without_gap_jumps(self):
+        ids, hidden = self._ids()
+        mask = torch.zeros(1, self.seq_len)
+        mask[0, self.prompt:12] = 1.0
+        mask[0, 14:] = 1.0
+        # anchor 9 fully accepts, so its jump (+4) would land on 13 — the
+        # unsupervised gap token whose first label (14) is supervised and
+        # therefore anchorable; only the span limit keeps the chains apart.
+        script = {
+            (9, 1): int(ids[0, 10]),
+            (9, 2): int(ids[0, 11]),
+            (9, 3): int(ids[0, 12]),
+        }
+        model, mask = self._setup(ids, hidden, script=script, mask=mask,
+                                  num_anchors=64)
+        _, _, kept = self._kept(model, ids, hidden, mask)
+        expected = _manual_chain(
+            script, ids, mask, self.prompt - 1, self.block, 0, limit=11
+        ) + _manual_chain(
+            script, ids, mask, 13, self.block, 0, limit=19
+        )
+        self.assertEqual(kept, expected)
+        self.assertEqual(expected, [4, 5, 6, 7, 8, 9, 13, 14, 15, 16, 17, 18])
+
+    def test_head_chunk_slice_invariance(self):
+        ids, hidden = self._ids()
+        model, mask = self._setup(ids, hidden, num_anchors=64)
+        a1, k1, _ = self._kept(model, ids, hidden, mask)
+        with patch.object(
+            _dflash_module, "_MINING_HEAD_BLOCK_CHUNK", 2
+        ):
+            a2, k2, _ = self._kept(model, ids, hidden, mask)
+        self.assertTrue(torch.equal(a1, a2))
+        self.assertTrue(torch.equal(k1, k2))
 
     def test_invalid_policy_rejected(self):
         ids, hidden = self._ids()

@@ -37,6 +37,10 @@ _VALID_LOSS_TYPES = {
 _DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash"}
 _VALID_LK_LOSS_TYPES = {None, "alpha", "lambda", "tv"}
 
+#: Blocks per lm_head slice during anchor mining; bounds the full-vocab
+#: logits transient (the argmax is all that is kept).
+_MINING_HEAD_BLOCK_CHUNK = 32
+
 
 class SelectorTerms(NamedTuple):
     """Additive selector objective and metric terms for one objective chunk."""
@@ -97,6 +101,7 @@ def walk_anchor_chain(
     start: int,
     offset: int,
     label_shift: int,
+    limit: Optional[int] = None,
 ) -> Tuple[List[int], int]:
     """Walk the verification-renewal chain over per-candidate stop tables.
 
@@ -104,13 +109,19 @@ def walk_anchor_chain(
     slot ``k`` (first rejection or first uncensorable label); the caller
     pre-zeroes slots below the family's first proposal slot. A block with no
     stop slot is fully accepted and advances ``block_size + label_shift``.
+    ``limit`` bounds the anchor positions (exclusive) so a fully-accepted
+    block cannot jump across an unsupervised gap into the next span.
     """
 
     block_size = stop.shape[-1]
     chain: List[int] = []
     full_accepts = 0
     pos = start
-    while 0 <= pos - offset < stop.shape[0] and bool(anchorable[pos - offset]):
+    while (
+        0 <= pos - offset < stop.shape[0]
+        and bool(anchorable[pos - offset])
+        and (limit is None or pos < limit)
+    ):
         chain.append(pos)
         row = stop[pos - offset]
         hits = row.nonzero()
@@ -118,6 +129,19 @@ def walk_anchor_chain(
         full_accepts += hits.numel() == 0
         pos += step + label_shift
     return chain, full_accepts
+
+
+def _supervised_spans(mask: torch.Tensor) -> List[Tuple[int, int]]:
+    """Half-open ``[start, end)`` runs of supervised positions."""
+
+    edges = torch.diff(
+        mask.long(),
+        prepend=torch.zeros(1, dtype=torch.long),
+        append=torch.zeros(1, dtype=torch.long),
+    )
+    starts = (edges == 1).nonzero().flatten().tolist()
+    ends = (edges == -1).nonzero().flatten().tolist()
+    return list(zip(starts, ends))
 
 
 def create_dflash_sdpa_mask(
@@ -523,10 +547,17 @@ class OnlineDFlashModel(nn.Module):
                 "mined anchors are not yet supported for selector drafts"
             )
         bsz, n_blocks, bs = hidden4d.shape[:3]
-        logits = self.lm_head(
-            self._head_hidden(hidden4d.reshape(bsz, n_blocks * bs, -1))
-        ).reshape(bsz, n_blocks, bs, -1)
-        return logits.argmax(dim=-1)
+        proposals = torch.zeros(
+            bsz, n_blocks, bs, dtype=torch.long, device=hidden4d.device
+        )
+        for b0 in range(0, n_blocks, _MINING_HEAD_BLOCK_CHUNK):
+            b1 = min(b0 + _MINING_HEAD_BLOCK_CHUNK, n_blocks)
+            rows = hidden4d[:, b0:b1].reshape(bsz, (b1 - b0) * bs, -1)
+            logits = self.lm_head(self._head_hidden(rows))
+            proposals[:, b0:b1] = logits.reshape(
+                bsz, b1 - b0, bs, -1
+            ).argmax(dim=-1)
+        return proposals
 
     @torch.no_grad()
     def _mine_anchor_positions(
@@ -556,11 +587,12 @@ class OnlineDFlashModel(nn.Module):
         full_total = 0.0
         for b in range(bsz):
             supervised = loss_mask[b] > 0.5
-            if not bool(supervised.any()):
+            spans = _supervised_spans(supervised)
+            if not spans:
                 raise ValueError(
                     "DFlash-family mining requires supervised tokens"
                 )
-            start = max(int(supervised.nonzero()[0, 0]) - 1, 0)
+            start = max(spans[0][0] - 1, 0)
             n_cand = seq_len - start
             stop = torch.zeros(
                 n_cand, block_size, dtype=torch.bool, device=device
@@ -597,9 +629,24 @@ class OnlineDFlashModel(nn.Module):
                 stop[c0:c1] = stop_chunk
                 anchorable[c0:c1] = ~censored[:, first_slot]
 
-            chain, full_accepts = walk_anchor_chain(
-                stop.cpu(), anchorable.cpu(), start, start, shift
-            )
+            # One chain per supervised span: each turn is a fresh restart
+            # boundary in serving, and the span limit keeps a fully-accepted
+            # block from jumping a short unsupervised gap into the next turn.
+            stop_cpu = stop.cpu()
+            anchorable_cpu = anchorable.cpu()
+            chain: List[int] = []
+            full_accepts = 0
+            for span_start, span_end in spans:
+                span_chain, span_full = walk_anchor_chain(
+                    stop_cpu,
+                    anchorable_cpu,
+                    max(span_start - 1, 0),
+                    start,
+                    shift,
+                    limit=span_end - 1,
+                )
+                chain.extend(span_chain)
+                full_accepts += span_full
             if not chain:
                 raise ValueError(
                     "DFlash-family mining requires two consecutive "
@@ -1257,17 +1304,26 @@ class OnlineDominoModel(OnlineDFlashModel):
         """Mirror the serving head path: base logits plus the GRU correction
         conditioned on the previous token, composed per ``apply_logits_head``."""
         bsz, n_blocks, bs = hidden4d.shape[:3]
-        base_logits = self.lm_head(
-            self._head_hidden(hidden4d.reshape(bsz, n_blocks * bs, -1))
-        ).reshape(bsz, n_blocks, bs, -1)
         head_token_ids = prev_ids if self.shift_label else target_ids
-        final_logits = self.draft_model.apply_logits_head(
-            base_logits,
-            prev_token_embeddings=self.embed_tokens(head_token_ids),
-            hidden_states=hidden4d,
-            lm_head=self.lm_head,
+        proposals = torch.zeros(
+            bsz, n_blocks, bs, dtype=torch.long, device=hidden4d.device
         )
-        return final_logits.argmax(dim=-1)
+        for b0 in range(0, n_blocks, _MINING_HEAD_BLOCK_CHUNK):
+            b1 = min(b0 + _MINING_HEAD_BLOCK_CHUNK, n_blocks)
+            rows = hidden4d[:, b0:b1]
+            base_logits = self.lm_head(
+                self._head_hidden(rows.reshape(bsz, (b1 - b0) * bs, -1))
+            ).reshape(bsz, b1 - b0, bs, -1)
+            final_logits = self.draft_model.apply_logits_head(
+                base_logits,
+                prev_token_embeddings=self.embed_tokens(
+                    head_token_ids[:, b0:b1]
+                ),
+                hidden_states=rows,
+                lm_head=self.lm_head,
+            )
+            proposals[:, b0:b1] = final_logits.argmax(dim=-1)
+        return proposals
 
     def _domino_objective_chunk_terms(
         self,
