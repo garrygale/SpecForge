@@ -562,6 +562,12 @@ class TrainingConfig(StrictConfigModel):
     loss_decay_gamma: Optional[float] = None
     #: Anchor blocks per objective slice (0 = materialize all objective logits).
     objective_chunk_blocks: int = Field(default=128, ge=0)
+    #: Verification-chain anchor mining (Draft-OPD-style): ``mined`` trains at
+    #: the chain of speculative restart positions, re-mined each step from the
+    #: current draft weights; ``random`` keeps the uniform sampler.
+    anchor_policy: Literal["random", "mined"] = "random"
+    #: Candidate anchors per no-grad mining chunk (memory/launch knob only).
+    anchor_mining_chunk_candidates: int = Field(default=512, ge=1)
     loss_type: Literal[
         "dflash",
         "dpace",

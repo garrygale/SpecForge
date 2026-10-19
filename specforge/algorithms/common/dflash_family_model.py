@@ -2,7 +2,7 @@
 """DFlash-family training models and shared masking helpers."""
 
 import os
-from typing import Dict, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -89,6 +89,35 @@ def compute_accept_len(
     correct = (pred_ids_4d == target_ids_4d) | (~valid_mask_4d)
     accept_prefix = correct.long().cumprod(dim=2) * valid_mask_4d.long()
     return accept_prefix.sum(dim=2).float()
+
+
+def walk_anchor_chain(
+    stop: torch.Tensor,
+    anchorable: torch.Tensor,
+    start: int,
+    offset: int,
+    label_shift: int,
+) -> Tuple[List[int], int]:
+    """Walk the verification-renewal chain over per-candidate stop tables.
+
+    ``stop[c, k]`` marks the block anchored at ``offset + c`` as stopping at
+    slot ``k`` (first rejection or first uncensorable label); the caller
+    pre-zeroes slots below the family's first proposal slot. A block with no
+    stop slot is fully accepted and advances ``block_size + label_shift``.
+    """
+
+    block_size = stop.shape[-1]
+    chain: List[int] = []
+    full_accepts = 0
+    pos = start
+    while 0 <= pos - offset < stop.shape[0] and bool(anchorable[pos - offset]):
+        chain.append(pos)
+        row = stop[pos - offset]
+        hits = row.nonzero()
+        step = block_size if hits.numel() == 0 else int(hits[0, 0])
+        full_accepts += hits.numel() == 0
+        pos += step + label_shift
+    return chain, full_accepts
 
 
 def create_dflash_sdpa_mask(
@@ -312,6 +341,8 @@ class OnlineDFlashModel(nn.Module):
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
         objective_chunk_blocks: int = 128,
+        anchor_policy: str = "random",
+        anchor_mining_chunk_candidates: int = 512,
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
         selector_loss_alpha: float = 1.0,
@@ -331,6 +362,12 @@ class OnlineDFlashModel(nn.Module):
             raise ValueError(f"dpace_alpha must be in [0, 1], got {dpace_alpha}")
         if objective_chunk_blocks < 0:
             raise ValueError("objective_chunk_blocks must be >= 0")
+        if anchor_policy not in ("random", "mined"):
+            raise ValueError(
+                f"anchor_policy={anchor_policy!r}; must be 'random' or 'mined'"
+            )
+        if anchor_mining_chunk_candidates < 1:
+            raise ValueError("anchor_mining_chunk_candidates must be >= 1")
         if selector_loss_alpha < 0:
             raise ValueError("selector_loss_alpha must be >= 0")
         if not 0.0 <= selector_warmup_ratio <= 1.0:
@@ -361,6 +398,9 @@ class OnlineDFlashModel(nn.Module):
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
         self.objective_chunk_blocks = int(objective_chunk_blocks)
+        self.anchor_policy = anchor_policy
+        self.anchor_mining_chunk_candidates = int(anchor_mining_chunk_candidates)
+        self._mining_stats: Optional[Dict[str, torch.Tensor]] = None
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
         self.selector_loss_alpha = float(selector_loss_alpha)
@@ -464,6 +504,128 @@ class OnlineDFlashModel(nn.Module):
 
         return self.embed_tokens(noise_ids)
 
+    def _mining_label_shift(self) -> int:
+        """Slot ``k`` predicts token ``anchor + k + shift``; the base family
+        serves slot 0 as the anchor token itself, so its walk starts one slot
+        later than Domino's shifted labels."""
+        return 0
+
+    def _mining_proposal_ids(
+        self,
+        hidden4d: torch.Tensor,
+        target_ids: torch.Tensor,
+        prev_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Argmax proposals for anchor mining; variants with another head
+        path override this."""
+        if getattr(self.draft_model, "candidate_selector", None) is not None:
+            raise ValueError(
+                "mined anchors are not yet supported for selector drafts"
+            )
+        bsz, n_blocks, bs = hidden4d.shape[:3]
+        logits = self.lm_head(
+            self._head_hidden(hidden4d.reshape(bsz, n_blocks * bs, -1))
+        ).reshape(bsz, n_blocks, bs, -1)
+        return logits.argmax(dim=-1)
+
+    @torch.no_grad()
+    def _mine_anchor_positions(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Mine the verification-restart anchor chain (Draft-OPD style).
+
+        Densely scores candidate blocks with the current draft weights, then
+        walks the chain of first-mismatch restart positions and even-subsamples
+        it to ``num_anchors``. Pads with the sampler's sentinel convention
+        (anchor 0, keep False) so downstream stays shape-static.
+        """
+
+        bsz, seq_len = input_ids.shape
+        device = input_ids.device
+        block_size = self.block_size
+        shift = self._mining_label_shift()
+        first_slot = 1 - shift
+        slots = torch.arange(block_size, device=device)
+
+        anchors_rows: List[List[int]] = []
+        keep_rows: List[List[bool]] = []
+        count_total = 0.0
+        full_total = 0.0
+        for b in range(bsz):
+            supervised = loss_mask[b] > 0.5
+            if not bool(supervised.any()):
+                raise ValueError(
+                    "DFlash-family mining requires supervised tokens"
+                )
+            start = max(int(supervised.nonzero()[0, 0]) - 1, 0)
+            n_cand = seq_len - start
+            stop = torch.zeros(
+                n_cand, block_size, dtype=torch.bool, device=device
+            )
+            anchorable = torch.zeros(n_cand, dtype=torch.bool, device=device)
+            for c0 in range(0, n_cand, self.anchor_mining_chunk_candidates):
+                c1 = min(c0 + self.anchor_mining_chunk_candidates, n_cand)
+                cand = torch.arange(start + c0, start + c1, device=device)
+                _, _, out_hidden = self._forward_draft_blocks(
+                    input_ids=input_ids[b : b + 1],
+                    hidden_states=hidden_states[b : b + 1],
+                    loss_mask=loss_mask[b : b + 1],
+                    anchor_positions=cand.view(1, -1),
+                    block_keep_mask=torch.ones(
+                        1, c1 - c0, dtype=torch.bool, device=device
+                    ),
+                )
+                hidden4d = out_hidden.reshape(1, c1 - c0, block_size, -1)
+                label_pos = cand.view(-1, 1) + slots.view(1, -1) + shift
+                safe_labels = label_pos.clamp(max=seq_len - 1)
+                target_ids = input_ids[b, safe_labels].unsqueeze(0)
+                prev_pos = cand.view(-1, 1) + slots.view(1, -1)
+                prev_ids = input_ids[
+                    b, prev_pos.clamp(max=seq_len - 1)
+                ].unsqueeze(0)
+                predicted = self._mining_proposal_ids(
+                    hidden4d, target_ids, prev_ids
+                )[0]
+                censored = (label_pos >= seq_len) | (
+                    loss_mask[b, safe_labels] <= 0.5
+                )
+                stop_chunk = (predicted != target_ids[0]) | censored
+                stop_chunk[:, :first_slot] = False
+                stop[c0:c1] = stop_chunk
+                anchorable[c0:c1] = ~censored[:, first_slot]
+
+            chain, full_accepts = walk_anchor_chain(
+                stop.cpu(), anchorable.cpu(), start, start, shift
+            )
+            if not chain:
+                raise ValueError(
+                    "DFlash-family mining requires two consecutive "
+                    "supervised tokens"
+                )
+            count_total += len(chain)
+            full_total += full_accepts
+            if len(chain) > self.num_anchors:
+                pick = torch.linspace(
+                    0, len(chain) - 1, self.num_anchors
+                ).round().long()
+                chain = [chain[i] for i in pick.tolist()]
+            anchors_rows.append(chain + [0] * (self.num_anchors - len(chain)))
+            keep_rows.append(
+                [True] * len(chain) + [False] * (self.num_anchors - len(chain))
+            )
+
+        self._mining_stats = {
+            "count": torch.tensor(count_total, device=device),
+            "full": torch.tensor(full_total, device=device),
+        }
+        return (
+            torch.tensor(anchors_rows, dtype=torch.int64, device=device),
+            torch.tensor(keep_rows, dtype=torch.bool, device=device),
+        )
+
     def _dpace_weight(
         self,
         prob: torch.Tensor,
@@ -527,16 +689,43 @@ class OnlineDFlashModel(nn.Module):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         max_valid_anchors: Optional[int] = None,
+        anchor_positions: Optional[torch.Tensor] = None,
+        block_keep_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len,
-            loss_mask,
-            device,
-            max_valid_anchors=max_valid_anchors,
-        )
+        self._mining_stats = None
+        if anchor_positions is None and block_keep_mask is None:
+            if self.anchor_policy == "mined":
+                anchor_positions, block_keep_mask = self._mine_anchor_positions(
+                    input_ids, hidden_states, loss_mask
+                )
+            else:
+                anchor_positions, block_keep_mask = self._sample_anchor_positions(
+                    seq_len,
+                    loss_mask,
+                    device,
+                    max_valid_anchors=max_valid_anchors,
+                )
+        else:
+            if anchor_positions is None or block_keep_mask is None:
+                raise ValueError("Replay requires both anchors and block validity")
+            if (
+                anchor_positions.ndim != 2
+                or anchor_positions.shape[0] != bsz
+                or block_keep_mask.shape != anchor_positions.shape
+                or block_keep_mask.dtype != torch.bool
+                or anchor_positions.dtype != torch.int64
+            ):
+                raise ValueError("Invalid replay anchor shape or dtype")
+            if bool(
+                (
+                    ((anchor_positions < 0) | (anchor_positions >= seq_len))
+                    & block_keep_mask
+                ).any()
+            ):
+                raise ValueError("Replay anchor outside the captured input")
 
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
@@ -936,6 +1125,15 @@ class OnlineDFlashModel(nn.Module):
                 accuracy_denom.detach(),
             ),
         }
+        if self._mining_stats is not None:
+            ratio_metrics["mined_anchor_count"] = (
+                self._mining_stats["count"],
+                torch.ones_like(self._mining_stats["count"]),
+            )
+            ratio_metrics["mined_full_accept"] = (
+                self._mining_stats["full"],
+                self._mining_stats["count"].clamp_min(1.0),
+            )
         if has_selector_objective:
             ratio_metrics.update(
                 {
@@ -986,6 +1184,8 @@ class OnlineDominoModel(OnlineDFlashModel):
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
         objective_chunk_blocks: int = 128,
+        anchor_policy: str = "random",
+        anchor_mining_chunk_candidates: int = 512,
         shift_label: bool = False,
         ce_loss_alpha: float = 1.0,
         l1_loss_alpha: float = 0.0,
@@ -1002,6 +1202,8 @@ class OnlineDominoModel(OnlineDFlashModel):
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
             objective_chunk_blocks=objective_chunk_blocks,
+            anchor_policy=anchor_policy,
+            anchor_mining_chunk_candidates=anchor_mining_chunk_candidates,
             loss_type="dflash",
         )
         if ce_loss_alpha < 0:
@@ -1042,6 +1244,30 @@ class OnlineDominoModel(OnlineDFlashModel):
             )
 
         return hidden4d, prev_ids
+
+    def _mining_label_shift(self) -> int:
+        return int(bool(self.shift_label))
+
+    def _mining_proposal_ids(
+        self,
+        hidden4d: torch.Tensor,
+        target_ids: torch.Tensor,
+        prev_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Mirror the serving head path: base logits plus the GRU correction
+        conditioned on the previous token, composed per ``apply_logits_head``."""
+        bsz, n_blocks, bs = hidden4d.shape[:3]
+        base_logits = self.lm_head(
+            self._head_hidden(hidden4d.reshape(bsz, n_blocks * bs, -1))
+        ).reshape(bsz, n_blocks, bs, -1)
+        head_token_ids = prev_ids if self.shift_label else target_ids
+        final_logits = self.draft_model.apply_logits_head(
+            base_logits,
+            prev_token_embeddings=self.embed_tokens(head_token_ids),
+            hidden_states=hidden4d,
+            lm_head=self.lm_head,
+        )
+        return final_logits.argmax(dim=-1)
 
     def _domino_objective_chunk_terms(
         self,
@@ -1353,6 +1579,17 @@ class OnlineDominoModel(OnlineDFlashModel):
             "lambda_base": float(lambda_base),
             "accuracy_denom": accuracy_denom.detach(),
         }
+        if self._mining_stats is not None:
+            metrics["ratio_metrics"] = {
+                "mined_anchor_count": (
+                    self._mining_stats["count"],
+                    torch.ones_like(self._mining_stats["count"]),
+                ),
+                "mined_full_accept": (
+                    self._mining_stats["full"],
+                    self._mining_stats["count"].clamp_min(1.0),
+                ),
+            }
 
         return loss, accuracy, metrics
 

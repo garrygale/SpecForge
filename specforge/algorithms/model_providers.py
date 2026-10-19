@@ -611,6 +611,8 @@ def build_domino_model(
             l1_loss_alpha=cfg.training.domino_l1_loss_alpha,
             base_tv_loss=cfg.training.domino_base_tv_loss,
             final_tv_loss=cfg.training.domino_final_tv_loss,
+            anchor_policy=cfg.training.anchor_policy,
+            anchor_mining_chunk_candidates=cfg.training.anchor_mining_chunk_candidates,
         ),
     )
 
