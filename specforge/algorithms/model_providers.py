@@ -122,11 +122,6 @@ def _apply_draft_qat(draft_model: Any) -> None:
             include_only=w4a4_layers,
             stochastic_weight=stochastic_weight,
         )
-    print(
-        f"[QAT] enabled: w_bit={qat_w_bit}, a_bit={qat_a_bit}, "
-        f"exclude={qat_exclude}, w4a4_layers={sorted(w4a4_layers)}, "
-        f"channel_balanced={channel_balanced}"
-    )
 
 
 def build_eagle3_draft(cfg: Config, draft_config: PretrainedConfig):
@@ -328,6 +323,7 @@ def build_eagle3_model(
             cache_dir=cfg.model.cache_dir,
             trust_remote_code=cfg.model.trust_remote_code,
         )
+    print_draft_launch_banner(draft_model)
     return AlgorithmModelParts(
         model=model,
         target_head=target_head,
@@ -369,6 +365,7 @@ def build_peagle_model(
             cache_dir=cfg.model.cache_dir,
             trust_remote_code=cfg.model.trust_remote_code,
         )
+    print_draft_launch_banner(draft_model)
     return AlgorithmModelParts(model=model, target_head=target_head)
 
 
@@ -401,6 +398,108 @@ def describe_draft_mask_choice(training_model: Any, draft_model: Any) -> str:
         f"sliding_layers={len(sliding_windows)} "
         f"windows={list(sliding_windows)} full_layers={full_layers}; {reason}"
     )
+
+
+def describe_draft_features(draft_model: Any) -> str:
+    """One-line launch banner for the optional draft features.
+
+    The toggles that change the checkpoint parameterization (shared_emb_readout,
+    out_proj_after_norm, vha, ffn_sharing, grouped conv) or the served numerics
+    (target_tap_norm, attn_sink, heterogeneous_kv) all ride dflash_config, and
+    the serving side builds a different module tree from the same keys — a run
+    log should show them without opening the draft config.
+    """
+    from specforge.modeling.draft.dflash_kernels import resolve_ffn_sharing
+
+    config = getattr(draft_model, "config", None)
+    dflash_config = getattr(config, "dflash_config", None) or {}
+
+    features = []
+    if dflash_config.get("shared_emb_readout"):
+        features.append(
+            f"shared_emb_readout(emb_dim={dflash_config.get('emb_dim')})"
+        )
+    if dflash_config.get("out_proj_after_norm"):
+        features.append("out_proj_after_norm")
+    vha = dflash_config.get("vha")
+    if isinstance(vha, dict) and vha.get("physical_q_heads"):
+        features.append(
+            "vha(physical_q_heads={p}, postmix_rank={r})".format(
+                p=vha.get("physical_q_heads"),
+                r=vha.get("postmix_rank"),
+            )
+        )
+    try:
+        sharing = resolve_ffn_sharing(config)
+    except ValueError:
+        # Banner only; the draft build raises the real validation error.
+        sharing = {"mode": "<invalid>"}
+    if sharing is not None:
+        if sharing.get("mode") == "routed_outer":
+            features.append(
+                "ffn_sharing(routed_outer, experts={e}, router={r})".format(
+                    e=sharing.get("experts"),
+                    r=sharing.get("router"),
+                )
+            )
+        elif sharing.get("mode") == "<invalid>":
+            features.append("ffn_sharing(<invalid>)")
+        else:
+            features.append("ffn_sharing(lattice)")
+    taps = dflash_config.get("conv_kernel_size")
+    if taps:
+        features.append(
+            f"conv(k={taps}, g={dflash_config.get('conv_group_size')})"
+        )
+    if dflash_config.get("target_tap_norm"):
+        features.append("target_tap_norm")
+    if int(dflash_config.get("attn_sink", 0) or 0):
+        features.append(f"attn_sink={dflash_config.get('attn_sink')}")
+    if dflash_config.get("heterogeneous_kv"):
+        features.append("heterogeneous_kv")
+
+    joined = ", ".join(features) if features else "none (base draft config)"
+    return f"[draft-features] {joined}"
+
+
+def describe_draft_qat(draft_model: Any) -> Optional[str]:
+    """One-line launch banner for the draft QAT scheme, None without qat_w_bit."""
+    method_config = getattr(getattr(draft_model, "config", None), "dflash_config", None) or {}
+    qat_w_bit = method_config.get("qat_w_bit")
+    if qat_w_bit is None:
+        return None
+    w4a4_layers = set(method_config.get("qat_w4a4_layers", []) or [])
+    return (
+        f"[draft-qat] enabled: w_bit={qat_w_bit}, "
+        f"a_bit={method_config.get('qat_a_bit')}, "
+        f"exclude={list(method_config.get('qat_exclude', []) or [])}, "
+        f"w4a4_layers={sorted(w4a4_layers)}, "
+        f"channel_balanced={bool(method_config.get('channel_balanced', False))}"
+    )
+
+
+def print_draft_launch_banner(
+    draft_model: Any, training_model: Any = None
+) -> None:
+    """Print every draft feature line as one rank-0 launch banner block."""
+    lines = []
+    if getattr(getattr(draft_model, "config", None), "dflash_config", None):
+        lines.append(describe_draft_features(draft_model))
+    qat = describe_draft_qat(draft_model)
+    if qat is not None:
+        lines.append(qat)
+    if training_model is not None:
+        lines.append(describe_draft_mask_choice(training_model, draft_model))
+    if lines:
+        _print_on_launch_rank0("\n".join(lines))
+
+
+def _print_on_launch_rank0(message: str) -> None:
+    # Feature banners are per-run, not per-rank.
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0:
+        print(message, flush=True)
 
 
 def _build_dflash_family_model(
@@ -442,7 +541,7 @@ def _build_dflash_family_model(
         "objective_chunk_blocks": cfg.training.objective_chunk_blocks,
     }
     model = model_factory(common).to(device=_device(), dtype=_torch_dtype(cfg))
-    print(describe_draft_mask_choice(model, draft_model))
+    print_draft_launch_banner(draft_model, training_model=model)
     return AlgorithmModelParts(
         model=model,
         capture_layers=list(draft_model.target_layer_ids),
