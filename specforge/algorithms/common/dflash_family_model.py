@@ -100,29 +100,49 @@ def create_dflash_sdpa_mask(
     sliding_window: Optional[int] = None,
     sliding_draft_causal: bool = False,
     num_sinks: int = 0,
+    hca: Optional[dict] = None,
 ):
-    """Construct a full or sliding dense boolean DFlash mask.
+    """Construct a full, sliding, or HCA dense boolean DFlash mask.
 
     ``sliding_draft_causal`` selects the draft-half visibility of a sliding
     layer. ``False`` (the default, and what Domino serves) reproduces the
-    served symmetric band ``[q-(W-1), q+W]`` inside the query's own block —
+    served symmetric band ``[q-(W-1), q+W]`` inside the query's own block –
     draft positions may read their block's other elements, while the sliding
     lower bound still drops old positions. ``True`` keeps the legacy causal
     draft block (``[q-(W-1), q]``), which is what DFlash/DSpark serve; for
     ``W >= block_size`` it is identical to the historical causal mask.
-    ``OnlineDFlashModel`` sets this from ``dflash_config.causal`` — the same
-    field vLLM / vLLM-Ascend read — via ``resolve_sliding_draft_causal``.
+    ``OnlineDFlashModel`` sets this from ``dflash_config.causal`` – the same
+    field vLLM / vLLM-Ascend read – via ``resolve_sliding_draft_causal``.
 
     ``num_sinks`` appends always-visible trailing KV columns for the learned
     attention sinks, still gated by ``block_keep_mask`` so fully-masked query
     rows stay fully masked (their post-attention zeroing relies on it).
+
+    ``hca`` (a resolved per-layer HCA spec: hop/win/max_entries) prepends
+    compressed-entry columns, giving the KV axis
+    ``[entries || context || draft || sinks]``. A query at absolute position
+    ``t`` with band width ``sliding_window`` sees entry ``j`` iff
+    ``j*hop < t+1-W`` (entries starting below the band; with W >= win+block
+    this implies the entry is emitted) and ``j >= nE(b) - max_entries``
+    (drop-oldest once the entry budget is exceeded). The raw band keeps the
+    constant-width sliding rule above, so the seam carries at most ``win-1``
+    doubly-counted tokens — the R2 rule shared with serving.
     """
 
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError("sliding_window must be > 0")
+    if hca is not None and sliding_window is None:
+        raise ValueError("hca layers require a positive sliding_window band")
+    num_entries = 0
+    if hca is not None:
+        hop = hca["hop"]
+        win = hca["win"]
+        max_entries = hca["max_entries"]
+        num_entries = (S - win) // hop + 1 if S >= win else 0
+
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
-    KV_LEN = S + N * block_size + num_sinks
+    KV_LEN = num_entries + S + N * block_size + num_sinks
 
     q_indices = torch.arange(Q_LEN, device=device).view(1, 1, -1, 1)  # (1, 1, Q_LEN, 1)
     kv_indices = torch.arange(KV_LEN, device=device).view(
@@ -136,17 +156,38 @@ def create_dflash_sdpa_mask(
         block_size, dim=2
     )
 
-    mask_context = (kv_indices < S) & (kv_indices < anchor_expanded)
+    # Position index inside [context || draft || sinks]; negative on the
+    # entry columns, which every base-segment mask excludes via in_base.
+    base_indices = kv_indices - num_entries
+    in_base = kv_indices >= num_entries
+
+    mask_entry = None
+    if hca is not None:
+        if num_entries:
+            entry_ids = torch.arange(num_entries, device=device).view(1, 1, 1, -1)
+            band_lower = anchor_expanded + q_block_offsets - (sliding_window - 1)
+            # Entries emitted by this sample's context: (anchor - win)//hop + 1.
+            emitted = (anchor_expanded - win) // hop + 1
+            emitted = torch.clamp(emitted, min=0)
+            mask_entry = (entry_ids * hop < band_lower) & (
+                entry_ids >= emitted - max_entries
+            )
+        else:
+            mask_entry = torch.zeros(
+                (B, 1, Q_LEN, num_entries), dtype=torch.bool, device=device
+            )
+
+    mask_context = in_base & (base_indices < S) & (base_indices < anchor_expanded)
     if sliding_window is not None:
         # The current draft token occupies one slot in the window.
         context_lower_bound = anchor_expanded + q_block_offsets - (sliding_window - 1)
-        mask_context = mask_context & (kv_indices >= context_lower_bound)
+        mask_context = mask_context & (base_indices >= context_lower_bound)
 
-    is_draft = kv_indices >= S
-    kv_block_ids = (kv_indices - S) // block_size
+    is_draft = in_base & (base_indices >= S)
+    kv_block_ids = (base_indices - S) // block_size
     mask_draft = is_draft & (q_block_ids == kv_block_ids)
     if sliding_window is not None:
-        kv_block_offsets = (kv_indices - S) % block_size
+        kv_block_offsets = (base_indices - S) % block_size
         # Both served bands share the sliding lower bound; they differ only in
         # their forward half. Domino serves sliding layers non-causally: the
         # symmetric band `[q-(W-1), q+W]` (Ascend FIA sparse_mode=4 with
@@ -165,30 +206,41 @@ def create_dflash_sdpa_mask(
     valid_block = block_keep_mask.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
 
     row_mask = mask_context | mask_draft
+    if mask_entry is not None:
+        mask_entry = F.pad(mask_entry, (0, KV_LEN - mask_entry.shape[-1]))
+        row_mask = row_mask | mask_entry
     if num_sinks:
-        row_mask = row_mask | (kv_indices >= S + N * block_size)
+        row_mask = row_mask | (kv_indices >= num_entries + S + N * block_size)
     final_mask = row_mask & valid_block
     return final_mask
 
 
 def create_dflash_block_mask(
-    anchor_positions: torch.Tensor,
-    block_keep_mask: torch.Tensor,
-    S: int,
-    block_size: int,
-    device: torch.device,
+    anchor_positions,
+    block_keep_mask,
+    S,
+    block_size,
+    device,
     flex_block_size=None,
     sliding_window: Optional[int] = None,
     sliding_draft_causal: bool = False,
     num_sinks: int = 0,
+    hca: Optional[dict] = None,
 ):
     """Construct a full or sliding Flex Attention mask for DFlash training.
 
     ``sliding_draft_causal`` mirrors :func:`create_dflash_sdpa_mask` and is set
     from ``dflash_config.causal``. ``num_sinks`` mirrors the dense builder's
-    always-visible trailing columns.
+    always-visible trailing columns. ``hca`` is rejected: compressed layers
+    train through the dense sdpa/eager mask only (see
+    ``validate_dflash_attention_backend``).
     """
 
+    if hca is not None:
+        raise ValueError(
+            "HCA (compressed_attention) layers cannot use flex attention; "
+            "use attention_backend sdpa/eager."
+        )
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError("sliding_window must be > 0")
     B, N = anchor_positions.shape
@@ -519,19 +571,29 @@ class OnlineDFlashModel(nn.Module):
         layer_sliding_windows = getattr(
             self.draft_model, "layer_sliding_windows", None
         )
+        layer_hca_params = getattr(self.draft_model, "layer_hca_params", None)
+        if layer_hca_params is not None and layer_sliding_windows is None:
+            raise ValueError(
+                "compressed_attention layers require per-layer windows; got "
+                "layer_sliding_windows=None"
+            )
         if layer_sliding_windows is not None:
-            dflash_attn_mask = [
-                (
-                    full_attn_mask
-                    if window is None
-                    else mask_builder(
+            dflash_attn_mask = []
+            for layer_idx, window in enumerate(layer_sliding_windows):
+                if window is None:
+                    dflash_attn_mask.append(full_attn_mask)
+                    continue
+                layer_hca = (
+                    layer_hca_params[layer_idx] if layer_hca_params else None
+                )
+                dflash_attn_mask.append(
+                    mask_builder(
                         **mask_args,
                         sliding_window=window,
                         sliding_draft_causal=self.sliding_draft_causal,
+                        hca=layer_hca,
                     )
                 )
-                for window in layer_sliding_windows
-            ]
         else:
             sliding_window = self.draft_model.sliding_window
             dflash_attn_mask = full_attn_mask

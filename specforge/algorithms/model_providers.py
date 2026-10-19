@@ -457,6 +457,21 @@ def describe_draft_features(draft_model: Any) -> str:
         features.append(f"attn_sink={dflash_config.get('attn_sink')}")
     if dflash_config.get("heterogeneous_kv"):
         features.append("heterogeneous_kv")
+    layer_types = list(getattr(config, "layer_types", None) or [])
+    hca_config = dflash_config.get("hca")
+    if isinstance(hca_config, dict) and "heavily_compressed_attention" in layer_types:
+        hops = hca_config.get("hops", 128)
+        if not isinstance(hops, (list, tuple)):
+            hops = [hops]
+        features.append(
+            "hca(layers={l}, hops={h}, variants={v}, bias={b}, entries={e})".format(
+                l=layer_types.count("heavily_compressed_attention"),
+                h=list(hops),
+                v=hca_config.get("variants", "vanilla"),
+                b=hca_config.get("bias_mode", "learnable"),
+                e=hca_config.get("max_entries", "auto(2048-W-draft-64)"),
+            )
+        )
 
     joined = ", ".join(features) if features else "none (base draft config)"
     return f"[draft-features] {joined}"

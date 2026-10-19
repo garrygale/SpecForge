@@ -59,7 +59,18 @@ except ImportError:  # exported remote-code fallback
 
 FULL_ATTENTION = "full_attention"
 SLIDING_ATTENTION = "sliding_attention"
-_VALID_DFLASH_LAYER_TYPES = {FULL_ATTENTION, SLIDING_ATTENTION}
+COMPRESSED_ATTENTION = "heavily_compressed_attention"
+_VALID_DFLASH_LAYER_TYPES = {
+    FULL_ATTENTION,
+    SLIDING_ATTENTION,
+    COMPRESSED_ATTENTION,
+}
+
+HCA_KEY = "hca"
+HCA_FIELDS = frozenset({"variants", "hops", "bias_mode", "max_entries"})
+# variant -> coff; win = coff * hop, so "hat" pools 50%-overlapping windows.
+HCA_COFF = {"vanilla": 1, "hat": 2}
+HCA_WINDOW_BUDGET = 2048
 
 
 def _dflash_method_config(config) -> dict:
@@ -67,7 +78,11 @@ def _dflash_method_config(config) -> dict:
 
 
 def get_layer_sliding_window(config, layer_idx: int) -> Optional[int]:
-    """Return the sliding-window length for one DFlash layer, if any.
+    """Return the raw-band window length for one DFlash layer, if any.
+
+    Sliding and compressed layers both read the same per-layer
+    ``sliding_window`` entry: for a compressed (HCA) layer the window is the
+    width of the raw band that supplements the compressed history.
 
     ``dflash_config.sliding_window`` is preferred because transformers'
     strict ``Qwen3Config`` validation rejects per-layer lists at the top
@@ -76,7 +91,7 @@ def get_layer_sliding_window(config, layer_idx: int) -> Optional[int]:
     layer_types = getattr(config, "layer_types", None)
     if not layer_types or layer_idx >= len(layer_types):
         return None
-    if layer_types[layer_idx] != SLIDING_ATTENTION:
+    if layer_types[layer_idx] not in (SLIDING_ATTENTION, COMPRESSED_ATTENTION):
         return None
 
     method_config = _dflash_method_config(config)
@@ -94,6 +109,163 @@ def get_layer_sliding_window(config, layer_idx: int) -> Optional[int]:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return None
     return value
+
+
+def hat_window_kernel(win: int) -> torch.Tensor:
+    """Normalized tent-kernel pooling weights over ``win`` offsets."""
+
+    idx = torch.arange(win, dtype=torch.float32)
+    center = (win - 1) / 2
+    kernel = torch.clamp_min(1.0 - (idx - center).abs() / (win / 2), min=0.0)
+    return kernel / kernel.sum()
+
+
+def resolve_hca_config(config) -> Optional[tuple]:
+    """Resolve ``dflash_config.hca`` into per-layer HCA specs.
+
+    Returns a tuple aligned with ``num_hidden_layers`` (None on non-compressed
+    layers), or None when no layer is ``compressed_attention``. A compressed
+    layer attends ``[compressed entries || raw band || draft block || sinks]``
+    where the band width is the layer's ``sliding_window`` entry and the
+    entries pool the whole history at ``hop`` stride (``win = coff * hop``,
+    50% overlap for the "hat" variant). ``position_bias`` initializes at zero
+    ("vanilla", the V4 position_bias verbatim) or at ``log`` of the tent
+    kernel ("hat"); both are the same slot — a softmax pooling bias.
+    """
+
+    layer_types = list(getattr(config, "layer_types", None) or [])
+    num_layers = getattr(
+        config, "num_hidden_layers", len(layer_types) if layer_types else 0
+    )
+    compressed = [
+        idx for idx in range(num_layers) if layer_types[idx] == COMPRESSED_ATTENTION
+    ]
+    if not compressed:
+        if _dflash_method_config(config).get(HCA_KEY) is not None:
+            raise ValueError(
+                f"dflash_config.{HCA_KEY} is set but no layer_type is "
+                f"'{COMPRESSED_ATTENTION}'; remove the key or mark layers."
+            )
+        return None
+
+    method = _dflash_method_config(config)
+    raw = method.get(HCA_KEY)
+    if raw is None:
+        raise ValueError(
+            f"layer_types '{COMPRESSED_ATTENTION}' requires dflash_config.{HCA_KEY} "
+            "with 'variants' and optional 'hops'."
+        )
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"dflash_config.{HCA_KEY} must be a dict, got {type(raw).__name__}"
+        )
+    unknown = sorted(set(raw) - HCA_FIELDS)
+    if unknown:
+        raise ValueError(
+            f"unknown dflash_config.{HCA_KEY} entries {unknown}; expected a "
+            f"subset of {sorted(HCA_FIELDS)}"
+        )
+
+    if str(method.get("attention_mode", "gqa")).lower() == "mla":
+        raise ValueError(
+            f"dflash_config.{HCA_KEY} requires attention_mode 'gqa'/'mha', "
+            "not 'mla' (v1)"
+        )
+
+    block_size = getattr(config, "block_size", None)
+    if block_size is None:
+        block_size = method.get("block_size")
+    if not isinstance(block_size, int) or isinstance(block_size, bool):
+        raise ValueError(f"dflash_config.{HCA_KEY} requires an integer block_size")
+
+    variants = raw.get("variants", "vanilla")
+    if isinstance(variants, str):
+        variants = [variants] * len(compressed)
+    if not isinstance(variants, (list, tuple)) or len(variants) != len(compressed):
+        raise ValueError(
+            f"dflash_config.{HCA_KEY}.variants must be a variant or a list of "
+            f"{len(compressed)} (one per compressed layer), got {variants!r}"
+        )
+    hops = raw.get("hops", 128)
+    if isinstance(hops, int) and not isinstance(hops, bool):
+        hops = [hops] * len(compressed)
+    if not isinstance(hops, (list, tuple)) or len(hops) != len(compressed):
+        raise ValueError(
+            f"dflash_config.{HCA_KEY}.hops must be an int or a list of "
+            f"{len(compressed)} positive ints, got {hops!r}"
+        )
+    bias_mode = raw.get("bias_mode", "learnable")
+    if bias_mode not in ("learnable", "frozen"):
+        raise ValueError(
+            f"dflash_config.{HCA_KEY}.bias_mode must be 'learnable' or "
+            f"'frozen', got {bias_mode!r}"
+        )
+    max_entries = raw.get("max_entries")
+    if max_entries is not None and (
+        not isinstance(max_entries, int)
+        or isinstance(max_entries, bool)
+        or max_entries < 1
+    ):
+        raise ValueError(
+            f"dflash_config.{HCA_KEY}.max_entries must be a positive int, got "
+            f"{max_entries!r}"
+        )
+
+    specs = [None] * num_layers
+    for slot, layer_idx in enumerate(compressed):
+        variant = variants[slot]
+        if variant not in HCA_COFF:
+            raise ValueError(
+                f"dflash_config.{HCA_KEY}.variants supports {sorted(HCA_COFF)} "
+                f"for layer {layer_idx}, got {variant!r}"
+            )
+        hop = hops[slot]
+        if not isinstance(hop, int) or isinstance(hop, bool) or hop < 1:
+            raise ValueError(
+                f"dflash_config.{HCA_KEY}.hops[{slot}] must be a positive int "
+                f"for layer {layer_idx}, got {hop!r}"
+            )
+        coff = HCA_COFF[variant]
+        win = coff * hop
+        window = get_layer_sliding_window(config, layer_idx)
+        if window is None:
+            raise ValueError(
+                f"Layer {layer_idx} is {COMPRESSED_ATTENTION} but no positive "
+                "sliding_window is configured for its raw band."
+            )
+        if window > HCA_WINDOW_BUDGET:
+            raise ValueError(
+                f"Layer {layer_idx} is {COMPRESSED_ATTENTION} with "
+                f"sliding_window={window} > {HCA_WINDOW_BUDGET} (the served "
+                "band-call cap); lower the window, the history goes compressed."
+            )
+        if window < win + block_size:
+            raise ValueError(
+                f"Layer {layer_idx} is {COMPRESSED_ATTENTION} with window "
+                f"{window} < win({win}) + block_size({block_size}); the seam "
+                "between band and entries would drop tokens."
+            )
+        entries = max_entries
+        if entries is None:
+            entries = HCA_WINDOW_BUDGET - window - block_size - 64
+        if entries < 1:
+            raise ValueError(
+                f"Layer {layer_idx} has no compressed-entry budget left "
+                f"(window {window} + block_size {block_size} consumes the "
+                f"{HCA_WINDOW_BUDGET} attention budget); set "
+                f"dflash_config.{HCA_KEY}.max_entries explicitly or lower the "
+                "window."
+            )
+        specs[layer_idx] = {
+            "variant": variant,
+            "hop": hop,
+            "win": win,
+            "coff": coff,
+            "bias_mode": bias_mode,
+            "max_entries": entries,
+            "window": window,
+        }
+    return tuple(specs)
 
 
 def describe_sliding_draft_causal(config) -> tuple[bool, str]:
@@ -148,7 +320,11 @@ def resolve_training_sliding_draft_causal(training_model, draft_model) -> bool:
 
 
 def has_sliding_window_attention(config) -> bool:
-    """Return whether any instantiated DFlash layer uses SWA."""
+    """Return whether any DFlash layer carries a raw-band window (SWA/HCA).
+
+    Compressed (HCA) layers count too: both need a dense training mask, so
+    this predicate gates the flex-attention ban.
+    """
     layer_types = getattr(config, "layer_types", None)
     num_layers = getattr(
         config, "num_hidden_layers", len(layer_types) if layer_types else 0
@@ -188,14 +364,14 @@ def validate_dflash_sliding_window_config(config) -> None:
         for layer_idx in range(num_layers):
             layer_type = layer_types[layer_idx]
             window = raw_window[layer_idx]
-            if layer_type == SLIDING_ATTENTION:
+            if layer_type in (SLIDING_ATTENTION, COMPRESSED_ATTENTION):
                 if (
                     isinstance(window, bool)
                     or not isinstance(window, int)
                     or window <= 0
                 ):
                     raise ValueError(
-                        f"Layer {layer_idx} is sliding_attention but "
+                        f"Layer {layer_idx} is {layer_type} but "
                         f"sliding_window[{layer_idx}]={window!r}; expected a "
                         "positive integer."
                     )
@@ -214,11 +390,11 @@ def validate_dflash_sliding_window_config(config) -> None:
 
     for layer_idx in range(num_layers):
         if (
-            layer_types[layer_idx] == SLIDING_ATTENTION
+            layer_types[layer_idx] in (SLIDING_ATTENTION, COMPRESSED_ATTENTION)
             and get_layer_sliding_window(config, layer_idx) is None
         ):
             raise ValueError(
-                f"Layer {layer_idx} is marked sliding_attention but no "
+                f"Layer {layer_idx} is marked {layer_types[layer_idx]} but no "
                 "positive sliding_window is configured. Set sliding_window "
                 "to a positive integer or a per-layer list, or change "
                 f"layer_types[{layer_idx}] to 'full_attention'."
@@ -226,11 +402,11 @@ def validate_dflash_sliding_window_config(config) -> None:
 
 
 def validate_dflash_attention_backend(config, backend: Optional[str]) -> None:
-    """Reject flex attention when sliding-window layers are configured."""
+    """Reject flex attention when windowed or compressed layers are configured."""
     validate_dflash_sliding_window_config(config)
     if backend == "flex_attention" and has_sliding_window_attention(config):
         raise ValueError(
-            "DFlash sliding-window attention cannot be used with "
+            "DFlash sliding/compressed-window attention cannot be used with "
             "attention_backend='flex_attention'. Use sdpa/eager."
         )
 
@@ -379,9 +555,10 @@ def resolve_dflash_attention_layout(
     invalid = set(layer_types) - _VALID_DFLASH_LAYER_TYPES
     if invalid:
         raise ValueError(
-            "DFlash config.layer_types supports only full_attention and "
-            f"sliding_attention, got {sorted(invalid)}"
+            "DFlash config.layer_types supports only full_attention, "
+            f"sliding_attention and compressed_attention, got {sorted(invalid)}"
         )
+    resolve_hca_config(config)
 
     method_config = _dflash_method_config(config)
     sliding_window = method_config.get("sliding_window")
@@ -556,6 +733,81 @@ def _prepare_dflash_eager_mask(
     return additive_mask, valid_queries
 
 
+class DFlashHCACompressor(nn.Module):
+    """Pools the target-context history into hop-strided compressed entries.
+
+    V4-Heavily-Compressed-Attention recipe: every closed ``win``-token window
+    emits one entry ``RMSNorm(sum_j softmax(gate_j + B)_j * kv_j)`` with a
+    single shared-KV head; ``B = position_bias[win, head_dim]`` is the same
+    softmax slot as a pooling kernel (zero init = V4 vanilla, ``log`` tent
+    init = hat). The K view is rotated at the entry anchor (chunk start, or
+    window center under overlap); the V view stays unrotated, so no conjugate
+    rotation is needed on the attention output.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        head_dim: int,
+        spec: dict,
+        make_rms_norm,
+        rms_norm_eps: float,
+    ):
+        super().__init__()
+        self.hop = spec["hop"]
+        self.win = spec["win"]
+        self.anchor_offset = 0 if spec["coff"] == 1 else self.win // 2
+        self.kv_proj = nn.Linear(input_dim, head_dim, bias=False)
+        self.gate_proj = nn.Linear(input_dim, head_dim, bias=False)
+        bias = torch.zeros(self.win, head_dim)
+        if spec["variant"] == "hat":
+            bias = bias + torch.log(hat_window_kernel(self.win) + 1e-8).unsqueeze(-1)
+        self.position_bias = nn.Parameter(bias)
+        self.position_bias.requires_grad_(spec["bias_mode"] == "learnable")
+        self.norm = make_rms_norm(head_dim, rms_norm_eps)
+
+    def entry_capacity(self, context_len: int) -> int:
+        return (
+            (context_len - self.win) // self.hop + 1 if context_len >= self.win else 0
+        )
+
+    def forward(
+        self,
+        target_hidden: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        bsz, ctx_len, _ = target_hidden.shape
+        num_entries = self.entry_capacity(ctx_len)
+        if num_entries <= 0:
+            empty = target_hidden.new_zeros(bsz, 1, 0, self.kv_proj.out_features)
+            return empty, empty, 0
+
+        kv = self.kv_proj(target_hidden)
+        gate = self.gate_proj(target_hidden)
+        # unfold keeps the window axis last: [bsz, nE, head_dim, win]; overlap
+        # (coff=2) emits hop-strided windows that each span 2*hop tokens.
+        kv_windows = kv.unfold(1, self.win, self.hop)[:, :num_entries]
+        gate_windows = gate.unfold(1, self.win, self.hop)[:, :num_entries]
+        weights = torch.softmax(
+            gate_windows + self.position_bias.t(),
+            dim=-1,
+            dtype=torch.float32,
+        ).to(kv_windows.dtype)
+        pooled = self.norm((kv_windows * weights).sum(dim=-1))  # [bsz, nE, hd]
+
+        anchors = (
+            torch.arange(num_entries, device=target_hidden.device) * self.hop
+            + self.anchor_offset
+        )
+        cos_e = cos[:, anchors, :].unsqueeze(1)  # [bsz, 1, nE, hd]
+        sin_e = sin[:, anchors, :].unsqueeze(1)
+        pooled = pooled.unsqueeze(1)  # [bsz, 1, nE, hd]
+        entry_k = pooled * cos_e + rotate_half(pooled) * sin_e
+        entry_v = pooled
+        return entry_k, entry_v, num_entries
+
+
 class Qwen3DFlashAttentionBase(nn.Module):
     """Shared scaffold for the DFlash-family attention modes.
 
@@ -584,6 +836,7 @@ class Qwen3DFlashAttentionBase(nn.Module):
             ), "DFlash FlexAttention requires attention_dropout=0.0"
         self.is_causal = False
         self.sliding_window = get_layer_sliding_window(config, layer_idx)
+        self.hca = None
         self.num_sinks = int(_dflash_method_config(config).get("attn_sink", 0) or 0)
         if self.num_sinks < 0:
             raise ValueError(
@@ -620,20 +873,41 @@ class Qwen3DFlashAttentionBase(nn.Module):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
+        if self.hca is not None and attention_mask is None:
+            raise ValueError(
+                "HCA (compressed_attention) layers require an explicit "
+                "attention mask: entry visibility depends on each query's "
+                "absolute position. The training wrapper builds it via "
+                "create_dflash_sdpa_mask(..., hca=...); mask-less generate "
+                "paths are unsupported for HCA drafts (v1)."
+            )
         q, k, v = self._compute_qkv(hidden_states, target_hidden, position_embeddings)
         if past_key_values is not None:
             # The DynamicCache must never hold sink rows: get_seq_length() and
             # crop() feed position arithmetic in the generate paths. Strip the
             # trailing sink rows, update, then re-append for this call only.
+            # Compressed-entry head columns are recomputed from target_hidden
+            # every call, so they are stripped/re-prepended the same way.
             tail_k = tail_v = None
             if self.num_sinks:
                 tail_k = k[..., -self.num_sinks :, :]
                 tail_v = v[..., -self.num_sinks :, :]
                 k = k[..., : -self.num_sinks, :]
                 v = v[..., : -self.num_sinks, :]
+            head_k = head_v = None
+            if self.hca is not None:
+                num_entries = k.shape[2] - target_hidden.shape[1] - q_len
+                if num_entries > 0:
+                    head_k = k[..., :num_entries, :]
+                    head_v = v[..., :num_entries, :]
+                    k = k[..., num_entries:, :]
+                    v = v[..., num_entries:, :]
             cos, sin = position_embeddings
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+            if head_k is not None:
+                k = torch.cat([head_k, k], dim=2)
+                v = torch.cat([head_v, v], dim=2)
             if tail_k is not None:
                 k = torch.cat([k, tail_k], dim=2)
                 v = torch.cat([v, tail_v], dim=2)
@@ -763,6 +1037,17 @@ class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
                     self.num_sinks, config.num_key_value_heads, self.head_dim
                 )
             )
+        hca_specs = resolve_hca_config(config)
+        if hca_specs is not None:
+            self.hca = hca_specs[self.layer_idx]
+            if self.hca is not None:
+                self.hca_compressor = DFlashHCACompressor(
+                    self.target_hidden_size,
+                    self.head_dim,
+                    self.hca,
+                    kernels.make_rms_norm,
+                    config.rms_norm_eps,
+                )
 
     def _compute_qkv(
         self,
@@ -812,6 +1097,20 @@ class Qwen3DFlashAttention(Qwen3DFlashAttentionBase):
             )
             k = torch.cat([k, sink_k], dim=2)
             v = torch.cat([v, sink_v], dim=2)
+        if self.hca is not None:
+            # Entries lead the KV axis: [entries || context || draft || sinks].
+            # One shared head expanded over the KV groups; the mask builder
+            # computes the same entry capacity from S/hop/win.
+            entry_k, entry_v, num_entries = self.hca_compressor(
+                target_hidden, *position_embeddings
+            )
+            if num_entries > 0:
+                k = torch.cat(
+                    [entry_k.expand(-1, k.shape[1], -1, -1), k], dim=2
+                )
+                v = torch.cat(
+                    [entry_v.expand(-1, v.shape[1], -1, -1), v], dim=2
+                )
         return q, k, v
 
     def _pre_output_mix(self, attn_output: torch.Tensor) -> torch.Tensor:
@@ -1222,6 +1521,24 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 raise ValueError(
                     "all draft layers must share dflash_config.attn_sink; "
                     f"model={self.num_sinks}, layers={sorted(layer_sinks)}"
+                )
+        # Per-layer resolved HCA specs (None entries on non-compressed
+        # layers); vLLM re-resolves the same dict from dflash_config.hca.
+        self.layer_hca_params = resolve_hca_config(config)
+        if self.layer_hca_params is not None:
+            layer_specs = {
+                tuple(sorted((layer.self_attn.hca or {}).items()))
+                for layer in self.layers
+            } - {()}
+            model_specs = {
+                tuple(sorted(spec.items()))
+                for spec in self.layer_hca_params
+                if spec is not None
+            }
+            if layer_specs != model_specs:
+                raise ValueError(
+                    "draft layer HCA specs disagree with dflash_config.hca; "
+                    f"layers={sorted(layer_specs)} config={sorted(model_specs)}"
                 )
         self.target_layer_ids = dflash_config.get(
             "target_layer_ids",
