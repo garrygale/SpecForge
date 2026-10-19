@@ -70,6 +70,7 @@ MAX_REASONING_TOKENS = None     # None = no cap; int = thinking_token_budget
 FEED_REASONING = False          # include regenerated reasoning_content in later-turn requests
 MAX_TOKENS = 4096
 NUM_WORKERS = 32
+REQUEST_TIMEOUT = 600.0         # per-request timeout in seconds; raise for long generations
 OUTPUT_DIR = "./regenerated"
 RETRY_OVER_TOKENS = -1          # >0: only regenerate samples whose saved response exceeds this many tokens
 # ----------------------------------------------------------------------------
@@ -203,6 +204,16 @@ def parse_args():
         help=f"Concurrent worker threads (default: {NUM_WORKERS})",
     )
     parser.add_argument(
+        "--timeout",
+        type=float,
+        default=REQUEST_TIMEOUT,
+        help=(
+            "Per-request timeout in seconds for chat completion calls. "
+            "The OpenAI SDK default is 600s, too short for very long "
+            f"generations (default: {REQUEST_TIMEOUT})"
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default=OUTPUT_DIR,
@@ -241,6 +252,7 @@ def regenerate_one(
     reasoning_effort: str,
     max_reasoning_tokens: Optional[int],
     feed_reasoning: bool,
+    timeout: float,
 ) -> Dict[str, Any]:
     """Regenerate all assistant responses in a single sample.
 
@@ -262,7 +274,7 @@ def regenerate_one(
 
     # Create a client per sample to avoid cross-thread issues.
     # Matches the pattern in scripts/regenerate_train_data.py.
-    client = OpenAI(base_url=vllm_url, api_key="not-needed")
+    client = OpenAI(base_url=vllm_url, api_key="not-needed", timeout=timeout)
 
     regenerated: List[Dict[str, Any]] = []
     for msg in messages:
@@ -500,7 +512,7 @@ def main():
 
     # --- Test connectivity ---
     print(f"Testing connection to vLLM at {args.vllm_url} ...")
-    test_client = OpenAI(base_url=args.vllm_url, api_key="not-needed")
+    test_client = OpenAI(base_url=args.vllm_url, api_key="not-needed", timeout=args.timeout)
     try:
         test_extra_body = {"top_k": args.top_k}
         if args.enable_reasoning:
@@ -597,6 +609,7 @@ def main():
     print(f"  Think cap:    {args.max_reasoning_tokens}")
     print(f"  Feed back:    {'on' if args.feed_reasoning else 'off'}")
     print(f"  Max tokens:   {args.max_tokens}")
+    print(f"  Timeout:      {args.timeout:g}s")
     print(f"  Workers:      {args.num_workers}")
     print(f"  Output:       {output_path}")
     print(f"  Errors:       {error_path}")
@@ -646,6 +659,7 @@ def main():
                 args.reasoning_effort,
                 args.max_reasoning_tokens,
                 args.feed_reasoning,
+                args.timeout,
             ): i
             for i, sample in enumerate(samples)
         }
