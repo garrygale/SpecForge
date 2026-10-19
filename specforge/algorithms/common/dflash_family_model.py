@@ -134,11 +134,8 @@ def walk_anchor_chain(
 def _supervised_spans(mask: torch.Tensor) -> List[Tuple[int, int]]:
     """Half-open ``[start, end)`` runs of supervised positions."""
 
-    edges = torch.diff(
-        mask.long(),
-        prepend=torch.zeros(1, dtype=torch.long),
-        append=torch.zeros(1, dtype=torch.long),
-    )
+    zeros = torch.zeros(1, dtype=torch.long, device=mask.device)
+    edges = torch.diff(mask.long(), prepend=zeros, append=zeros)
     starts = (edges == 1).nonzero().flatten().tolist()
     ends = (edges == -1).nonzero().flatten().tolist()
     return list(zip(starts, ends))
@@ -586,8 +583,9 @@ class OnlineDFlashModel(nn.Module):
         count_total = 0.0
         full_total = 0.0
         for b in range(bsz):
-            supervised = loss_mask[b] > 0.5
-            spans = _supervised_spans(supervised)
+            # Span bookkeeping on CPU: one small transfer, and the int64
+            # diff/nonzero stays off the accelerator's metadata path.
+            spans = _supervised_spans((loss_mask[b] > 0.5).cpu())
             if not spans:
                 raise ValueError(
                     "DFlash-family mining requires supervised tokens"
