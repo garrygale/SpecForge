@@ -81,14 +81,17 @@ class _ScriptedDraft(nn.Module):
     def forward(self, position_ids, noise_embedding, target_hidden,
                 attention_mask=None, **kwargs):
         del noise_embedding, target_hidden, attention_mask, kwargs
+        bsz = position_ids.shape[0]
         draft_positions = position_ids[:, self.seq_len:]
         n_rows = draft_positions.shape[1]
-        onehot = torch.zeros(n_rows, self.vocab_size)
-        for r in range(n_rows):
-            slot = r % self.block_size
-            anchor = int(draft_positions[0, r]) - slot
-            onehot[r, self.script.get((anchor, slot), self.default_token)] = 1.0
-        return onehot.unsqueeze(0) * self.gain
+        onehot = torch.zeros(bsz, n_rows, self.vocab_size)
+        for i in range(bsz):
+            for r in range(n_rows):
+                slot = r % self.block_size
+                anchor = int(draft_positions[i, r]) - slot
+                onehot[i, r, self.script.get((anchor, slot),
+                                             self.default_token)] = 1.0
+        return onehot * self.gain
 
 
 class _ScriptedDominoDraft(_ScriptedDraft):
@@ -339,6 +342,50 @@ class TestBaseMining(unittest.TestCase):
         mask = torch.zeros(1, self.seq_len)
         with self.assertRaises(ValueError):
             model._mine_anchor_positions(ids, hidden, mask)
+
+    def test_bsz2_mines_samples_independently(self):
+        ids_a, hidden = self._ids()
+        ids_b = torch.zeros_like(ids_a)
+        ids = torch.cat([ids_a, ids_b], dim=0)
+        hidden2 = torch.cat([hidden, hidden], dim=0)
+        mask = torch.zeros(2, self.seq_len)
+        mask[:, self.prompt :] = 1.0
+        model, _ = self._setup(ids_a, hidden, num_anchors=64)
+        anchors, keep = model._mine_anchor_positions(ids, hidden2, mask)
+        kept_a = anchors[0][keep[0]].tolist()
+        kept_b = anchors[1][keep[1]].tolist()
+        expected_a = _manual_chain(
+            {}, ids_a, mask[:1], self.prompt, self.block, 0
+        )
+        expected_b = _manual_chain(
+            {}, ids_b, mask[1:], self.prompt, self.block, 0
+        )
+        self.assertEqual(kept_a, expected_a)
+        self.assertEqual(kept_b, expected_b)
+        self.assertEqual(expected_b, [5, 9, 13, 17])
+        self.assertTrue(bool((~keep[1][len(expected_b) :]).all()))
+        loss, _, metrics = model(ids, hidden2, mask)
+        self.assertTrue(torch.isfinite(loss).all())
+        count = metrics["ratio_metrics"]["mined_anchor_count"]
+        self.assertAlmostEqual(
+            float(count[0] / count[1]),
+            (len(expected_a) + len(expected_b)) / 2,
+            places=5,
+        )
+
+    def test_mixed_batch_empty_sample_uses_sentinel_row(self):
+        ids, hidden = self._ids()
+        ids = torch.cat([ids, ids], dim=0)
+        hidden2 = torch.cat([hidden, hidden], dim=0)
+        mask = torch.zeros(2, self.seq_len)
+        mask[0, self.prompt :] = 1.0
+        model, _ = self._setup(ids[:1], hidden, num_anchors=8)
+        anchors, keep = model._mine_anchor_positions(ids, hidden2, mask)
+        self.assertTrue(bool(keep[0].any()))
+        self.assertFalse(bool(keep[1].any()))
+        self.assertTrue(bool((anchors[1] == 0).all()))
+        loss, _, _ = model(ids, hidden2, mask)
+        self.assertTrue(torch.isfinite(loss).all())
 
     def test_multi_span_mines_each_turn_without_gap_jumps(self):
         ids, hidden = self._ids()

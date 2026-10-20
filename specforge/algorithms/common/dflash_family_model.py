@@ -582,14 +582,20 @@ class OnlineDFlashModel(nn.Module):
         keep_rows: List[List[bool]] = []
         count_total = 0.0
         full_total = 0.0
+        mined_any = False
         for b in range(bsz):
+            chain: List[int] = []
+            full_accepts = 0
             # Span bookkeeping on CPU: one small transfer, and the int64
             # diff/nonzero stays off the accelerator's metadata path.
             spans = _supervised_spans((loss_mask[b] > 0.5).cpu())
             if not spans:
-                raise ValueError(
-                    "DFlash-family mining requires supervised tokens"
-                )
+                # Sample without supervised tokens trains no anchors — the
+                # random sampler tolerates the same; only an entirely empty
+                # batch is fatal.
+                anchors_rows.append([0] * self.num_anchors)
+                keep_rows.append([False] * self.num_anchors)
+                continue
             # Serving anchors each turn's first block at the turn's first
             # token (the prefill-sampled token feeds the anchor row), never
             # at the preceding context token — so the chain starts at the
@@ -638,8 +644,6 @@ class OnlineDFlashModel(nn.Module):
             # unsupervised gap into the next turn.
             stop_cpu = stop.cpu()
             anchorable_cpu = anchorable.cpu()
-            chain: List[int] = []
-            full_accepts = 0
             for span_start, span_end in spans:
                 span_chain, span_full = walk_anchor_chain(
                     stop_cpu,
@@ -652,10 +656,10 @@ class OnlineDFlashModel(nn.Module):
                 chain.extend(span_chain)
                 full_accepts += span_full
             if not chain:
-                raise ValueError(
-                    "DFlash-family mining requires two consecutive "
-                    "supervised tokens"
-                )
+                anchors_rows.append([0] * self.num_anchors)
+                keep_rows.append([False] * self.num_anchors)
+                continue
+            mined_any = True
             count_total += len(chain)
             full_total += full_accepts
             if len(chain) > self.num_anchors:
@@ -668,9 +672,15 @@ class OnlineDFlashModel(nn.Module):
                 [True] * len(chain) + [False] * (self.num_anchors - len(chain))
             )
 
+        if not mined_any:
+            raise ValueError(
+                "DFlash-family mining requires two consecutive "
+                "supervised tokens"
+            )
         self._mining_stats = {
             "count": torch.tensor(count_total, device=device),
             "full": torch.tensor(full_total, device=device),
+            "samples": torch.tensor(float(bsz), device=device),
         }
         return (
             torch.tensor(anchors_rows, dtype=torch.int64, device=device),
@@ -1179,7 +1189,7 @@ class OnlineDFlashModel(nn.Module):
         if self._mining_stats is not None:
             ratio_metrics["mined_anchor_count"] = (
                 self._mining_stats["count"],
-                torch.ones_like(self._mining_stats["count"]),
+                self._mining_stats["samples"],
             )
             ratio_metrics["mined_full_accept"] = (
                 self._mining_stats["full"],
@@ -1643,7 +1653,7 @@ class OnlineDominoModel(OnlineDFlashModel):
             metrics["ratio_metrics"] = {
                 "mined_anchor_count": (
                     self._mining_stats["count"],
-                    torch.ones_like(self._mining_stats["count"]),
+                    self._mining_stats["samples"],
                 ),
                 "mined_full_accept": (
                     self._mining_stats["full"],
