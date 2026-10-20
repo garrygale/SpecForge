@@ -785,16 +785,21 @@ class DFlashHCACompressor(nn.Module):
 
         kv = self.kv_proj(target_hidden)
         gate = self.gate_proj(target_hidden)
-        # unfold keeps the window axis last: [bsz, nE, head_dim, win]; overlap
-        # (coff=2) emits hop-strided windows that each span 2*hop tokens.
-        kv_windows = kv.unfold(1, self.win, self.hop)[:, :num_entries]
-        gate_windows = gate.unfold(1, self.win, self.hop)[:, :num_entries]
+        # Gather the hop-strided windows by index: [bsz, nE, win, hd]. The
+        # values equal tensor unfold, but unfold's backward (UnfoldGrad) has
+        # no NPU kernel while the gather backward does. Overlap (coff=2)
+        # emits hop-strided windows that each span 2*hop tokens.
+        window_idx = (
+            torch.arange(num_entries, device=target_hidden.device) * self.hop
+        ).unsqueeze(1) + torch.arange(self.win, device=target_hidden.device)
+        kv_windows = kv[:, window_idx]
+        gate_windows = gate[:, window_idx]
         weights = torch.softmax(
-            gate_windows + self.position_bias.t(),
-            dim=-1,
+            gate_windows + self.position_bias,
+            dim=2,
             dtype=torch.float32,
         ).to(kv_windows.dtype)
-        pooled = self.norm((kv_windows * weights).sum(dim=-1))  # [bsz, nE, hd]
+        pooled = self.norm((kv_windows * weights).sum(dim=2))  # [bsz, nE, hd]
 
         anchors = (
             torch.arange(num_entries, device=target_hidden.device) * self.hop
