@@ -105,7 +105,7 @@ def walk_anchor_chain(
     offset: int,
     label_shift: int,
     limit: Optional[int] = None,
-) -> Tuple[List[int], int]:
+) -> Tuple[List[int], int, List[int]]:
     """Walk the verification-renewal chain over per-candidate stop tables.
 
     ``stop[c, k]`` marks the block anchored at ``offset + c`` as stopping at
@@ -114,10 +114,13 @@ def walk_anchor_chain(
     stop slot is fully accepted and advances ``block_size + label_shift``.
     ``limit`` bounds the anchor positions (exclusive) so a fully-accepted
     block cannot jump across an unsupervised gap into the next span.
+    Returns the visited anchors, the fully-accepted count, and each anchor's
+    stop slot (``block_size`` when fully accepted).
     """
 
     block_size = stop.shape[-1]
     chain: List[int] = []
+    steps: List[int] = []
     full_accepts = 0
     pos = start
     while (
@@ -130,8 +133,9 @@ def walk_anchor_chain(
         hits = row.nonzero()
         step = block_size if hits.numel() == 0 else int(hits[0, 0])
         full_accepts += hits.numel() == 0
+        steps.append(step)
         pos += step + label_shift
-    return chain, full_accepts
+    return chain, full_accepts, steps
 
 
 def _supervised_spans(mask: torch.Tensor) -> List[Tuple[int, int]]:
@@ -142,6 +146,33 @@ def _supervised_spans(mask: torch.Tensor) -> List[Tuple[int, int]]:
     starts = (edges == 1).nonzero().flatten().tolist()
     ends = (edges == -1).nonzero().flatten().tolist()
     return list(zip(starts, ends))
+
+
+def _mined_segment_gate(segment_lens: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Hard per-cycle CE gate: keep the committed prefix (accepted proposals
+    plus the recovery token), drop the rest — Draft-OPD's accepted stream."""
+
+    slots = torch.arange(block_size, device=segment_lens.device)
+    return (slots.view(1, 1, -1) < segment_lens.unsqueeze(-1)).float()
+
+
+def _apply_mined_prev_override(
+    prev_ids: torch.Tensor,
+    proposal_ids: torch.Tensor,
+    segment_lens: torch.Tensor,
+) -> torch.Tensor:
+    """Condition suffix slots on the draft's own proposals.
+
+    Past a cycle's stop the GRU head conditions on what the draft actually
+    proposed (serving's sequential state and Draft-OPD's replay of
+    ``d_{m,<k}``), not on the teacher-forced ground truth.
+    """
+
+    block_size = prev_ids.shape[-1]
+    slots = torch.arange(block_size, device=prev_ids.device).view(1, 1, -1)
+    replace = (slots >= segment_lens.unsqueeze(-1)) & (slots > 0)
+    shifted = torch.cat([prev_ids[:, :, :1], proposal_ids[:, :, :-1]], dim=-1)
+    return torch.where(replace, shifted, prev_ids)
 
 
 def create_dflash_sdpa_mask(
@@ -425,6 +456,7 @@ class OnlineDFlashModel(nn.Module):
         self.anchor_policy = anchor_policy
         self.anchor_mining_chunk_candidates = int(anchor_mining_chunk_candidates)
         self._mining_stats: Optional[Dict[str, torch.Tensor]] = None
+        self._mined_segments: Optional[Dict[str, torch.Tensor]] = None
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
         self.selector_loss_alpha = float(selector_loss_alpha)
@@ -583,11 +615,14 @@ class OnlineDFlashModel(nn.Module):
 
         anchors_rows: List[List[int]] = []
         keep_rows: List[List[bool]] = []
+        segment_rows: List[List[int]] = []
+        proposal_rows: List[List[List[int]]] = []
         count_total = 0.0
         full_total = 0.0
         mined_any = False
         for b in range(bsz):
             chain: List[int] = []
+            steps: List[int] = []
             full_accepts = 0
             # Span bookkeeping on CPU: one small transfer, and the int64
             # diff/nonzero stays off the accelerator's metadata path.
@@ -598,6 +633,10 @@ class OnlineDFlashModel(nn.Module):
                 # batch is fatal.
                 anchors_rows.append([0] * self.num_anchors)
                 keep_rows.append([False] * self.num_anchors)
+                segment_rows.append([0] * self.num_anchors)
+                proposal_rows.append(
+                    [[0] * block_size for _ in range(self.num_anchors)]
+                )
                 continue
             # Serving anchors each turn's first block at the turn's first
             # token (the prefill-sampled token feeds the anchor row), never
@@ -610,6 +649,9 @@ class OnlineDFlashModel(nn.Module):
                 n_cand, block_size, dtype=torch.bool, device=device
             )
             anchorable = torch.zeros(n_cand, dtype=torch.bool, device=device)
+            proposals_table = torch.zeros(
+                n_cand, block_size, dtype=torch.long, device=device
+            )
             for c0 in range(0, n_cand, self.anchor_mining_chunk_candidates):
                 c1 = min(c0 + self.anchor_mining_chunk_candidates, n_cand)
                 cand = torch.arange(start + c0, start + c1, device=device)
@@ -633,6 +675,7 @@ class OnlineDFlashModel(nn.Module):
                 predicted = self._mining_proposal_ids(
                     hidden4d, target_ids, prev_ids
                 )[0]
+                proposals_table[c0:c1] = predicted
                 censored = (label_pos >= seq_len) | (
                     loss_mask[b, safe_labels] <= 0.5
                 )
@@ -647,8 +690,9 @@ class OnlineDFlashModel(nn.Module):
             # unsupervised gap into the next turn.
             stop_cpu = stop.cpu()
             anchorable_cpu = anchorable.cpu()
+            proposals_cpu = proposals_table.cpu()
             for span_start, span_end in spans:
-                span_chain, span_full = walk_anchor_chain(
+                span_chain, span_full, span_steps = walk_anchor_chain(
                     stop_cpu,
                     anchorable_cpu,
                     span_start,
@@ -657,22 +701,41 @@ class OnlineDFlashModel(nn.Module):
                     limit=span_end - 1,
                 )
                 chain.extend(span_chain)
+                steps.extend(span_steps)
                 full_accepts += span_full
             if not chain:
                 anchors_rows.append([0] * self.num_anchors)
                 keep_rows.append([False] * self.num_anchors)
+                segment_rows.append([0] * self.num_anchors)
+                proposal_rows.append(
+                    [[0] * block_size for _ in range(self.num_anchors)]
+                )
                 continue
             mined_any = True
             count_total += len(chain)
             full_total += full_accepts
+            segs = [
+                min(step, block_size - 1) - first_slot + 1 for step in steps
+            ]
+            props = [
+                proposals_cpu[a - start].tolist() for a in chain
+            ]
             if len(chain) > self.num_anchors:
                 pick = torch.linspace(
                     0, len(chain) - 1, self.num_anchors
                 ).round().long()
-                chain = [chain[i] for i in pick.tolist()]
+                idx = pick.tolist()
+                chain = [chain[i] for i in idx]
+                segs = [segs[i] for i in idx]
+                props = [props[i] for i in idx]
             anchors_rows.append(chain + [0] * (self.num_anchors - len(chain)))
             keep_rows.append(
                 [True] * len(chain) + [False] * (self.num_anchors - len(chain))
+            )
+            segment_rows.append(segs + [0] * (self.num_anchors - len(segs)))
+            proposal_rows.append(
+                props
+                + [[0] * block_size for _ in range(self.num_anchors - len(props))]
             )
 
         if not mined_any:
@@ -684,6 +747,14 @@ class OnlineDFlashModel(nn.Module):
             "count": torch.tensor(count_total, device=device),
             "full": torch.tensor(full_total, device=device),
             "samples": torch.tensor(float(bsz), device=device),
+        }
+        self._mined_segments = {
+            "segment_lens": torch.tensor(
+                segment_rows, dtype=torch.long, device=device
+            ),
+            "proposal_ids": torch.tensor(
+                proposal_rows, dtype=torch.long, device=device
+            ),
         }
         return (
             torch.tensor(anchors_rows, dtype=torch.int64, device=device),
@@ -760,6 +831,7 @@ class OnlineDFlashModel(nn.Module):
         device = input_ids.device
 
         self._mining_stats = None
+        self._mined_segments = None
         if anchor_positions is None and block_keep_mask is None:
             if self.anchor_policy == "mined":
                 anchor_positions, block_keep_mask = self._mine_anchor_positions(
@@ -1250,6 +1322,9 @@ class OnlineDominoModel(OnlineDFlashModel):
         objective_chunk_blocks: int = 128,
         anchor_policy: str = "random",
         anchor_mining_chunk_candidates: int = 512,
+        mined_loss_variant: str = "plain",
+        mined_rejected_decay: float = 0.8,
+        mined_rejected_weight: float = 1.0,
         shift_label: bool = False,
         ce_loss_alpha: float = 1.0,
         l1_loss_alpha: float = 0.0,
@@ -1274,7 +1349,23 @@ class OnlineDominoModel(OnlineDFlashModel):
             raise ValueError("domino ce_loss_alpha must be >= 0")
         if l1_loss_alpha < 0:
             raise ValueError("domino l1_loss_alpha must be >= 0")
+        if mined_loss_variant not in ("plain", "opd"):
+            raise ValueError(
+                f"mined_loss_variant={mined_loss_variant!r}; must be 'plain' "
+                "or 'opd'"
+            )
+        if not 0.0 < mined_rejected_decay <= 1.0:
+            raise ValueError("mined_rejected_decay must be in (0, 1]")
+        if mined_rejected_weight < 0:
+            raise ValueError("mined_rejected_weight must be >= 0")
+        if mined_loss_variant == "opd" and anchor_policy != "mined":
+            raise ValueError(
+                "mined_loss_variant='opd' requires anchor_policy='mined'"
+            )
         self.shift_label = shift_label
+        self.mined_loss_variant = mined_loss_variant
+        self.mined_rejected_decay = float(mined_rejected_decay)
+        self.mined_rejected_weight = float(mined_rejected_weight)
         self.domino_ce_loss_alpha = float(ce_loss_alpha)
         self.domino_l1_loss_alpha = float(l1_loss_alpha)
         self.domino_base_tv_loss = bool(base_tv_loss)
@@ -1350,6 +1441,8 @@ class OnlineDominoModel(OnlineDFlashModel):
         weight_mask: torch.Tensor,
         eval_weight_mask: torch.Tensor,
         aligned_target_hidden: Optional[torch.Tensor],
+        mined_proposal_ids: Optional[torch.Tensor] = None,
+        rejected_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
         """Return additive Domino loss and telemetry terms for one block slice."""
         from specforge.core.domino_loss import domino_weighted_cross_entropy
@@ -1412,6 +1505,17 @@ class OnlineDominoModel(OnlineDFlashModel):
             base_accept_num = ((base_accepted + 1.0) * valid_blocks).sum()
             accept_den = valid_blocks.sum()
 
+        rejected_num = base_logits.new_zeros((), dtype=torch.float32)
+        rejected_den = base_logits.new_zeros((), dtype=torch.float32)
+        if mined_proposal_ids is not None and rejected_mask is not None:
+            rejected_num, rejected_den = self._domino_rejected_terms(
+                base_logits=base_logits,
+                correction_logits=correction_logits,
+                proposal_ids=mined_proposal_ids,
+                rejected_mask=rejected_mask,
+                aligned_target_hidden=aligned_target_hidden,
+            )
+
         return (
             final_num,
             base_num,
@@ -1424,7 +1528,68 @@ class OnlineDominoModel(OnlineDFlashModel):
             accept_num,
             base_accept_num,
             accept_den,
+            rejected_num,
+            rejected_den,
         )
+
+    def _domino_rejected_terms(
+        self,
+        base_logits: torch.Tensor,
+        correction_logits: torch.Tensor,
+        proposal_ids: torch.Tensor,
+        rejected_mask: torch.Tensor,
+        aligned_target_hidden: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Reverse-KL numerator/denominator on the draft's own suffix proposals.
+
+        k3 estimator at the draft's sampled token: ``log q(d) - log p(d)``
+        with the frozen teacher scoring the same token; positions weighted by
+        ``mined_rejected_decay ** (offset - 1)`` like Draft-OPD's rejected
+        stream. Only the suffix rows are scored, so the full-vocab transients
+        stay bounded.
+        """
+
+        if aligned_target_hidden is None:
+            raise ValueError(
+                "the rejected stream requires aligned target hidden states"
+            )
+        mask = rejected_mask > 0
+        if not bool(mask.any()):
+            zero = base_logits.new_zeros((), dtype=torch.float32)
+            return zero, zero
+        suffix_start = self.draft_model.suffix_start
+        composed = torch.cat(
+            [
+                base_logits[:, :, :suffix_start, :],
+                base_logits[:, :, suffix_start:, :] + correction_logits,
+            ],
+            dim=2,
+        )
+        shift = self._mining_label_shift()
+        slots = torch.arange(
+            base_logits.shape[2], device=base_logits.device
+        ).view(1, 1, -1)
+        offsets = slots.expand_as(mask)[mask].float()
+        weights = torch.pow(self.mined_rejected_decay, (offsets + shift - 1).clamp(min=0))
+        picked = proposal_ids[mask]
+        rows = composed[mask]
+        teacher_hidden = aligned_target_hidden[mask]
+        num = base_logits.new_zeros((), dtype=torch.float32)
+        den = base_logits.new_zeros((), dtype=torch.float32)
+        group = _MINING_HEAD_BLOCK_CHUNK * base_logits.shape[2]
+        for g0 in range(0, picked.numel(), group):
+            g1 = min(g0 + group, picked.numel())
+            row_logits = rows[g0:g1].float()
+            logq = row_logits.gather(-1, picked[g0:g1, None]).squeeze(1) - row_logits.logsumexp(-1)
+            with torch.no_grad():
+                teacher_logits = self.lm_head(teacher_hidden[g0:g1]).float()
+                logp = (
+                    teacher_logits.gather(-1, picked[g0:g1, None]).squeeze(1)
+                    - teacher_logits.logsumexp(-1)
+                )
+            num = num + ((logq - logp) * weights[g0:g1]).sum()
+            den = den + weights[g0:g1].sum()
+        return num, den
 
     def _domino_l1_numerators(
         self,
@@ -1550,6 +1715,13 @@ class OnlineDominoModel(OnlineDFlashModel):
             target_ids=target_ids,
             output_hidden=output_hidden,
         )
+        opd = self.mined_loss_variant == "opd" and self._mined_segments is not None
+        if opd and self.shift_label:
+            prev_ids = _apply_mined_prev_override(
+                prev_ids,
+                self._mined_segments["proposal_ids"],
+                self._mined_segments["segment_lens"],
+            )
         weight_mask = (
             block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
         )
@@ -1568,7 +1740,34 @@ class OnlineDominoModel(OnlineDFlashModel):
 
         eval_weight_mask = weight_mask.clone()
 
-        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+        rejected_mask = None
+        if opd:
+            # Draft-OPD accepted stream: hard gate to the cycle's committed
+            # prefix (accepted proposals plus the recovery token) replaces
+            # the soft slot decay; telemetry above stays un-gated.
+            weight_mask = weight_mask * _mined_segment_gate(
+                self._mined_segments["segment_lens"], self.block_size
+            )
+            slots = torch.arange(self.block_size, device=device)
+            shift = self._mining_label_shift()
+            suffix = slots.view(1, 1, -1) >= (
+                self._mined_segments["segment_lens"] - shift
+            ).clamp(min=0).unsqueeze(-1)
+            rejected = (
+                self._mined_segments["segment_lens"]
+                < (self.block_size - shift)
+            ).unsqueeze(-1)
+            rejected_mask = (
+                (suffix & rejected).float()
+                * block_keep_mask.unsqueeze(-1).float()
+                * (eval_weight_mask > 0).float()
+            )
+
+        if (
+            self.loss_decay_gamma is not None
+            and self.loss_decay_gamma > 0
+            and not opd
+        ):
             k = torch.arange(self.block_size, device=device).view(1, 1, -1)
             offset = 0 if self.shift_label else 1
             decay_weights = torch.exp(
@@ -1579,6 +1778,13 @@ class OnlineDominoModel(OnlineDFlashModel):
         wants_l1 = self.domino_l1_loss_alpha > 0 and (
             self.domino_base_tv_loss or self.domino_final_tv_loss
         )
+        if opd and self.mined_rejected_weight > 0:
+            if target_last_hidden_states is None:
+                raise ValueError(
+                    "mined_loss_variant='opd' requires the captured final-layer"
+                    " target_last_hidden_states for the rejected-stream teacher"
+                )
+            wants_l1 = True
         aligned_target_hidden = None
         if wants_l1:
             if target_last_hidden_states is None:
@@ -1602,6 +1808,8 @@ class OnlineDominoModel(OnlineDFlashModel):
             accept_num,
             base_accept_num,
             accept_den,
+            rejected_num,
+            rejected_den,
         ) = checkpointed_chunk_reduce(
             self._domino_objective_chunk_terms,
             hidden4d,
@@ -1610,6 +1818,8 @@ class OnlineDominoModel(OnlineDFlashModel):
             weight_mask,
             eval_weight_mask,
             aligned_target_hidden,
+            self._mined_segments["proposal_ids"] if opd else None,
+            rejected_mask,
             chunk_size=self.objective_chunk_blocks,
             dim=1,
         )
@@ -1637,6 +1847,15 @@ class OnlineDominoModel(OnlineDFlashModel):
         )
 
         loss = (1.0 - lambda_base) * final_objective + lambda_base * base_objective
+        if opd and self.mined_rejected_weight > 0:
+            # Draft-OPD rejected stream as its own ratio: reverse KL of the
+            # draft's own suffix proposals against the frozen teacher.
+            rejected_loss = torch.where(
+                rejected_den > 0,
+                rejected_num / rejected_den.clamp_min(1e-6),
+                rejected_num.new_zeros(()),
+            )
+            loss = loss + self.mined_rejected_weight * rejected_loss
         accuracy = correct_num / (accuracy_denom + 1e-6)
         metrics = {
             "final_loss": final_loss.detach(),
@@ -1663,6 +1882,11 @@ class OnlineDominoModel(OnlineDFlashModel):
                     self._mining_stats["count"].clamp_min(1.0),
                 ),
             }
+            if opd and self.mined_rejected_weight > 0:
+                metrics["ratio_metrics"]["mined_rejected_kl"] = (
+                    rejected_num.detach(),
+                    rejected_den.detach().clamp_min(1e-6),
+                )
 
         return loss, accuracy, metrics
 

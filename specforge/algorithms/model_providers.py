@@ -572,6 +572,11 @@ def build_dflash_model(
 ) -> AlgorithmModelParts:
     from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 
+    if cfg.training.mined_loss_variant == "opd":
+        raise ValueError(
+            "training.mined_loss_variant='opd' is implemented for the domino "
+            "strategy only"
+        )
     return _build_dflash_family_model(
         cfg,
         draft_model,
@@ -615,6 +620,9 @@ def build_domino_model(
             final_tv_loss=cfg.training.domino_final_tv_loss,
             anchor_policy=cfg.training.anchor_policy,
             anchor_mining_chunk_candidates=cfg.training.anchor_mining_chunk_candidates,
+            mined_loss_variant=cfg.training.mined_loss_variant,
+            mined_rejected_decay=cfg.training.mined_rejected_decay,
+            mined_rejected_weight=cfg.training.mined_rejected_weight,
         ),
     )
 

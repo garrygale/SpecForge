@@ -568,6 +568,18 @@ class TrainingConfig(StrictConfigModel):
     anchor_policy: Literal["random", "mined"] = "random"
     #: Candidate anchors per no-grad mining chunk (memory/launch knob only).
     anchor_mining_chunk_candidates: int = Field(default=512, ge=1)
+    #: Mined-anchor loss variant: ``plain`` keeps the existing CE + slot-decay
+    #: objective; ``opd`` replicates Draft-OPD's loss on the mined chain — CE
+    #: hard-gated to each cycle's committed prefix (slot decay off) plus a
+    #: rejected-suffix reverse-KL stream on the draft's own proposals. Domino
+    #: only; requires ``anchor_policy: mined`` and the captured
+    #: ``target_last_hidden_states``.
+    mined_loss_variant: Literal["plain", "opd"] = "plain"
+    #: Position decay of the rejected-suffix reverse-KL stream (Draft-OPD's gamma).
+    mined_rejected_decay: float = Field(default=0.8, gt=0.0, le=1.0)
+    #: Weight of the rejected-suffix stream (its own ratio, added to the
+    #: composed domino objective).
+    mined_rejected_weight: float = Field(default=1.0, ge=0.0)
     loss_type: Literal[
         "dflash",
         "dpace",

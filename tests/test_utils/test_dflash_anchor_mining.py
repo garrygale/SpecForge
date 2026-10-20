@@ -118,6 +118,19 @@ class _ScriptedDominoDraft(_ScriptedDraft):
             onehot[r, self.base_token] = 1.0
         return onehot.unsqueeze(0) * self.gain
 
+    def compute_correction_logits(self, *, prev_token_embeddings=None,
+                                   hidden_states=None, lm_head=None):
+        del prev_token_embeddings, lm_head
+        suffix_rows = hidden_states.shape[2] - self.suffix_start
+        return torch.zeros(
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            suffix_rows,
+            self.vocab_size,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
     def apply_logits_head(self, base_logits, *, prev_token_ids=None,
                           prev_token_embeddings=None, hidden_states=None,
                           lm_head=None):
@@ -174,26 +187,29 @@ class TestWalkAnchorChain(unittest.TestCase):
         stop = torch.zeros(3, 4, dtype=torch.bool)
         stop[0, 2] = True
         anchorable = torch.ones(3, dtype=torch.bool)
-        chain, full = walk_anchor_chain(stop, anchorable, 0, 0, 0)
+        chain, full, steps = walk_anchor_chain(stop, anchorable, 0, 0, 0)
         self.assertEqual(chain, [0, 2])
         self.assertEqual(full, 1)
+        self.assertEqual(steps, [2, 4])
 
     def test_shifted_axis_slot_zero_is_a_proposal(self):
         stop = torch.zeros(4, 4, dtype=torch.bool)
         stop[0, 0] = True
         stop[1, 1] = True
         anchorable = torch.ones(4, dtype=torch.bool)
-        chain, full = walk_anchor_chain(stop, anchorable, 0, 0, 1)
+        chain, full, steps = walk_anchor_chain(stop, anchorable, 0, 0, 1)
         self.assertEqual(chain, [0, 1, 3])
         self.assertEqual(full, 1)
+        self.assertEqual(steps, [0, 1, 4])
 
     def test_offset_and_drain(self):
         stop = torch.zeros(5, 4, dtype=torch.bool)
         anchorable = torch.zeros(5, dtype=torch.bool)
         anchorable[1] = True
-        chain, full = walk_anchor_chain(stop, anchorable, 6, 5, 0)
+        chain, full, steps = walk_anchor_chain(stop, anchorable, 6, 5, 0)
         self.assertEqual(chain, [6])
         self.assertEqual(full, 1)
+        self.assertEqual(steps, [4])
 
 
 class TestBaseMining(unittest.TestCase):
@@ -496,6 +512,192 @@ class TestDominoMining(unittest.TestCase):
         anchors, keep = model._mine_anchor_positions(ids, hidden, mask)
         kept = anchors[0][keep[0]].tolist()
         self.assertEqual(kept, [5, 10, 15])
+
+
+
+class TestMinedSegments(unittest.TestCase):
+    def test_segment_gate(self):
+        from importlib import reload  # noqa: F401
+        gate = _dflash_module._mined_segment_gate(
+            torch.tensor([[3, 0, 4]]), 4
+        )
+        self.assertEqual(
+            gate.tolist(),
+            [[[1, 1, 1, 0], [0, 0, 0, 0], [1, 1, 1, 1]]],
+        )
+
+    def test_prev_override_conditions_suffix_on_proposals(self):
+        prev = torch.tensor([[[10, 11, 12, 13]]])
+        props = torch.tensor([[[5, 6, 7, 8]]])
+        segs = torch.tensor([[2]])
+        out = _dflash_module._apply_mined_prev_override(prev, props, segs)
+        # slot 0/1 keep ground truth (slot 1 is the recovery label slot);
+        # slots past the cycle condition on the previous proposal
+        self.assertEqual(out.tolist(), [[[10, 11, 6, 7]]])
+
+    def test_base_stash_all_mismatch(self):
+        vocab, block, seq_len, prompt = 9, 4, 20, 5
+        torch.manual_seed(0)
+        ids = torch.randint(1, vocab, (1, seq_len))
+        mask = torch.zeros(1, seq_len)
+        mask[0, prompt:] = 1.0
+        hidden = torch.randn(1, seq_len, 8)
+        draft = _ScriptedDraft(vocab, block, seq_len, {})
+        model = OnlineDFlashModel(
+            draft_model=draft,
+            target_lm_head=_eye_head(vocab),
+            target_embed_tokens=nn.Embedding(vocab, vocab),
+            mask_token_id=0,
+            block_size=block,
+            attention_backend="sdpa",
+            num_anchors=64,
+            anchor_policy="mined",
+        )
+        anchors, keep = model._mine_anchor_positions(ids, hidden, mask)
+        segs = model._mined_segments["segment_lens"]
+        props = model._mined_segments["proposal_ids"]
+        self.assertEqual(anchors.shape, segs.shape)
+        self.assertEqual(tuple(props.shape), (1, 64, block))
+        count = int(keep[0].sum())
+        self.assertTrue(bool((segs[0, :count] == 1).all()))
+        self.assertTrue(bool((props[0, :count] == 0).all()))
+
+    def test_domino_stash_full_accept(self):
+        vocab, block, seq_len, prompt = 9, 4, 20, 5
+        ids = torch.full((1, seq_len), 3, dtype=torch.long)
+        mask = torch.zeros(1, seq_len)
+        mask[0, prompt:] = 1.0
+        hidden = torch.randn(1, seq_len, 8)
+        script = {
+            (5, 1): 3, (5, 2): 3, (5, 3): 3,
+            (10, 1): 3, (10, 2): 3, (10, 3): 3,
+            (15, 1): 3, (15, 2): 3, (15, 3): 3,
+        }
+        draft = _ScriptedDominoDraft(vocab, block, seq_len, script, base_token=3)
+        model = OnlineDominoModel(
+            draft_model=draft,
+            target_lm_head=_eye_head(vocab),
+            target_embed_tokens=nn.Embedding(vocab, vocab),
+            mask_token_id=0,
+            block_size=block,
+            attention_backend="sdpa",
+            num_anchors=64,
+            anchor_policy="mined",
+            shift_label=True,
+        )
+        model._mine_anchor_positions(ids, hidden, mask)
+        segs = model._mined_segments["segment_lens"]
+        props = model._mined_segments["proposal_ids"]
+        # domino shift: all-mismatch slots would give seg 1; full accept = 4
+        self.assertEqual(segs[0, :3].tolist(), [4, 4, 4])
+        self.assertEqual(props[0, :3].tolist(), [[3, 3, 3, 3]] * 3)
+
+
+class TestDominoOpdLoss(unittest.TestCase):
+    vocab = 9
+    block = 4
+    seq_len = 20
+    prompt = 5
+
+    def _model(self, script=None, **kwargs):
+        torch.manual_seed(2)
+        draft = _ScriptedDominoDraft(
+            self.vocab, self.block, self.seq_len, script or {}
+        )
+        kwargs.setdefault("shift_label", True)
+        kwargs.setdefault("anchor_policy", "mined")
+        kwargs.setdefault("mined_loss_variant", "opd")
+        return OnlineDominoModel(
+            draft_model=draft,
+            target_lm_head=_eye_head(self.vocab),
+            target_embed_tokens=nn.Embedding(self.vocab, self.vocab),
+            mask_token_id=0,
+            block_size=self.block,
+            attention_backend="sdpa",
+            num_anchors=8,
+            **kwargs,
+        )
+
+    def _data(self):
+        torch.manual_seed(3)
+        ids = torch.randint(1, self.vocab, (1, self.seq_len))
+        mask = torch.zeros(1, self.seq_len)
+        mask[0, self.prompt:] = 1.0
+        hidden = torch.randn(1, self.seq_len, 8)
+        teacher_hidden = torch.randn(1, self.seq_len, self.vocab)
+        return ids, hidden, teacher_hidden, mask
+
+    def test_rejected_terms_hand_numbers(self):
+        model = self._model(mined_rejected_decay=0.5)
+        v = self.vocab
+        base = torch.zeros(1, 1, 2, v)
+        base[0, 0, 1, 0] = 2.0
+        correction = torch.zeros(1, 1, 1, v)
+        props = torch.tensor([[[1, 1]]])
+        rej_mask = torch.tensor([[[0.0, 1.0]]])
+        teacher = torch.zeros(1, 1, 2, v)
+        teacher[0, 0, 1, 1] = 1.0
+        num, den = model._domino_rejected_terms(
+            base_logits=base,
+            correction_logits=correction,
+            proposal_ids=props,
+            rejected_mask=rej_mask,
+            aligned_target_hidden=teacher,
+        )
+        # the proposal token is id 1: spike 2.0 sits at id 0, so the
+        # student logit is 0 while the teacher logit is 1
+        logq = base[0, 0, 1, 1] - torch.logsumexp(base[0, 0, 1], dim=-1)
+        logp = teacher[0, 0, 1, 1] - torch.logsumexp(teacher[0, 0, 1], dim=-1)
+        self.assertAlmostEqual(float(den), 0.5, places=6)
+        self.assertAlmostEqual(
+            float(num), 0.5 * float(logq - logp), places=5
+        )
+
+    def test_opd_forward_runs_and_differs_from_plain(self):
+        ids, hidden, teacher_hidden, mask = self._data()
+        model = self._model(loss_decay_gamma=7.0)
+        loss_opd, _, metrics = model(
+            ids, hidden, mask, target_last_hidden_states=teacher_hidden
+        )
+        self.assertTrue(torch.isfinite(loss_opd).all())
+        loss_opd.backward()
+        self.assertIsNotNone(model.draft_model.gain.grad)
+        self.assertIn("mined_rejected_kl", metrics["ratio_metrics"])
+
+        model_plain = self._model(loss_decay_gamma=7.0, mined_loss_variant="plain")
+        loss_plain, _, _ = model_plain(
+            ids, hidden, mask, target_last_hidden_states=teacher_hidden
+        )
+        self.assertFalse(torch.allclose(loss_opd, loss_plain))
+
+    def test_opd_without_teacher_hidden_raises(self):
+        ids, hidden, _, mask = self._data()
+        model = self._model()
+        with self.assertRaises(ValueError):
+            model(ids, hidden, mask, target_last_hidden_states=None)
+
+    def test_opd_requires_mined_policy(self):
+        with self.assertRaises(ValueError):
+            self._model(anchor_policy="random", mined_loss_variant="opd")
+
+    def test_opd_all_full_accept_has_no_rejected_stream(self):
+        ids = torch.full((1, self.seq_len), 3, dtype=torch.long)
+        mask = torch.zeros(1, self.seq_len)
+        mask[0, self.prompt:] = 1.0
+        hidden = torch.randn(1, self.seq_len, 8)
+        teacher_hidden = torch.randn(1, self.seq_len, self.vocab)
+        script = {
+            (5, 1): 3, (5, 2): 3, (5, 3): 3,
+            (10, 1): 3, (10, 2): 3, (10, 3): 3,
+            (15, 1): 3, (15, 2): 3, (15, 3): 3,
+        }
+        model = self._model(script=script)
+        loss, _, metrics = model(
+            ids, hidden, mask, target_last_hidden_states=teacher_hidden
+        )
+        self.assertTrue(torch.isfinite(loss).all())
+        kl = metrics["ratio_metrics"]["mined_rejected_kl"]
+        self.assertLess(float(kl[1]), 1e-5)
 
 
 if __name__ == "__main__":
