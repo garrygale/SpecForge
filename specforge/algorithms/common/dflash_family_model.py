@@ -38,8 +38,11 @@ _DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash"}
 _VALID_LK_LOSS_TYPES = {None, "alpha", "lambda", "tv"}
 
 #: Blocks per lm_head slice during anchor mining; bounds the full-vocab
-#: logits transient (the argmax is all that is kept).
-_MINING_HEAD_BLOCK_CHUNK = 32
+#: logits transient (the argmax is all that is kept). 256 blocks = 4096
+#: rows ≈ 2 GB of bf16 logits at a 248k vocab — sized for the measured
+#: ~45 GB headroom on a 64 GB A3, still a guard for larger vocabs or
+#: smaller cards.
+_MINING_HEAD_BLOCK_CHUNK = 256
 
 
 class SelectorTerms(NamedTuple):
