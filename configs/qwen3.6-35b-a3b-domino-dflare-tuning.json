@@ -7,7 +7,7 @@
   "auto_map": {
     "AutoModel": "domino.DominoDraftModel"
   },
-  "block_size": 16,
+  "block_size": 7,
   "bos_token_id": 248044,
   "dflash_config": {
     "mask_token_id": 248070,
@@ -35,14 +35,8 @@
       "embed_proj"
     ],
     "channel_balanced": false,
+    "out_proj_after_norm": true,
     "target_hidden_size": 2048,
-    "ffn_sharing": {
-      "mode": "routed_outer",
-      "experts": 4,
-      "gate_groups": 48,
-      "up_groups": 48,
-      "router": "expert"
-    },
     "sliding_window": [
       2040,
       1024,
@@ -52,15 +46,22 @@
       1024,
       2040
     ],
-    "qat_w4a4_layers": []
+    "qat_w4a4_layers": [
+      "layers.0.mlp.up_proj",
+      "layers.2.mlp.up_proj",
+      "layers.4.mlp.up_proj",
+      "layers.0.mlp.gate_proj",
+      "layers.2.mlp.gate_proj",
+      "layers.4.mlp.gate_proj"
+    ]
   },
   "dtype": "bfloat16",
   "eos_token_id": 248044,
   "head_dim": 128,
   "hidden_act": "silu",
-  "hidden_size": 1536,
+  "hidden_size": 1024,
   "initializer_range": 0.02,
-  "intermediate_size": 9216,
+  "intermediate_size": 3072,
   "layer_types": [
     "sliding_attention",
     "sliding_attention",
