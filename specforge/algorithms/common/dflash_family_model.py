@@ -1441,7 +1441,6 @@ class OnlineDominoModel(OnlineDFlashModel):
         weight_mask: torch.Tensor,
         eval_weight_mask: torch.Tensor,
         aligned_target_hidden: Optional[torch.Tensor],
-        mined_proposal_ids: Optional[torch.Tensor] = None,
         rejected_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
         """Return additive Domino loss and telemetry terms for one block slice."""
@@ -1505,15 +1504,19 @@ class OnlineDominoModel(OnlineDFlashModel):
             base_accept_num = ((base_accepted + 1.0) * valid_blocks).sum()
             accept_den = valid_blocks.sum()
 
-        rejected_num = base_logits.new_zeros((), dtype=torch.float32)
-        rejected_den = base_logits.new_zeros((), dtype=torch.float32)
-        if mined_proposal_ids is not None and rejected_mask is not None:
-            rejected_num, rejected_den = self._domino_rejected_terms(
-                base_logits=base_logits,
-                correction_logits=correction_logits,
-                proposal_ids=mined_proposal_ids,
-                rejected_mask=rejected_mask,
-                aligned_target_hidden=aligned_target_hidden,
+        acc_kl_num = base_logits.new_zeros((), dtype=torch.float32)
+        acc_kl_den = base_logits.new_zeros((), dtype=torch.float32)
+        rej_kl_num = base_logits.new_zeros((), dtype=torch.float32)
+        rej_kl_den = base_logits.new_zeros((), dtype=torch.float32)
+        if rejected_mask is not None:
+            acc_kl_num, acc_kl_den, rej_kl_num, rej_kl_den = (
+                self._domino_opd_terms(
+                    base_logits=base_logits,
+                    correction_logits=correction_logits,
+                    weight_mask=weight_mask,
+                    rejected_mask=rejected_mask,
+                    aligned_target_hidden=aligned_target_hidden,
+                )
             )
 
         return (
@@ -1528,35 +1531,34 @@ class OnlineDominoModel(OnlineDFlashModel):
             accept_num,
             base_accept_num,
             accept_den,
-            rejected_num,
-            rejected_den,
+            acc_kl_num,
+            acc_kl_den,
+            rej_kl_num,
+            rej_kl_den,
         )
 
-    def _domino_rejected_terms(
+    def _domino_opd_terms(
         self,
         base_logits: torch.Tensor,
         correction_logits: torch.Tensor,
-        proposal_ids: torch.Tensor,
+        weight_mask: torch.Tensor,
         rejected_mask: torch.Tensor,
         aligned_target_hidden: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Reverse-KL numerator/denominator on the draft's own suffix proposals.
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Draft-OPD paper objective (Eq. 10-12) on the serving path.
 
-        k3 estimator at the draft's sampled token: ``log q(d) - log p(d)``
-        with the frozen teacher scoring the same token; positions weighted by
-        ``mined_rejected_decay ** (offset - 1)`` like Draft-OPD's rejected
-        stream. Only the suffix rows are scored, so the full-vocab transients
-        stay bounded.
+        Accepted stream: full-vocab forward KL(p_teacher || q_final) over the
+        gated committed positions. Rejected stream: full-vocab reverse
+        KL(q_final || p_teacher) on the suffix past each cycle's stop,
+        weighted ``mined_rejected_decay ** (offset - 1)``. The teacher
+        distribution is frozen; both streams read the corrected (base +
+        GRU) logits, which is what serving proposes with.
         """
 
         if aligned_target_hidden is None:
             raise ValueError(
-                "the rejected stream requires aligned target hidden states"
+                "the opd loss requires aligned target hidden states"
             )
-        mask = rejected_mask > 0
-        if not bool(mask.any()):
-            zero = base_logits.new_zeros((), dtype=torch.float32)
-            return zero, zero
         suffix_start = self.draft_model.suffix_start
         composed = torch.cat(
             [
@@ -1565,31 +1567,48 @@ class OnlineDominoModel(OnlineDFlashModel):
             ],
             dim=2,
         )
-        shift = self._mining_label_shift()
-        slots = torch.arange(
-            base_logits.shape[2], device=base_logits.device
-        ).view(1, 1, -1)
-        offsets = slots.expand_as(mask)[mask].float()
-        weights = torch.pow(self.mined_rejected_decay, (offsets + shift - 1).clamp(min=0))
-        picked = proposal_ids[mask]
-        rows = composed[mask]
-        teacher_hidden = aligned_target_hidden[mask]
-        num = base_logits.new_zeros((), dtype=torch.float32)
-        den = base_logits.new_zeros((), dtype=torch.float32)
-        group = _MINING_HEAD_BLOCK_CHUNK * base_logits.shape[2]
-        for g0 in range(0, picked.numel(), group):
-            g1 = min(g0 + group, picked.numel())
-            row_logits = rows[g0:g1].float()
-            logq = row_logits.gather(-1, picked[g0:g1, None]).squeeze(1) - row_logits.logsumexp(-1)
-            with torch.no_grad():
-                teacher_logits = self.lm_head(teacher_hidden[g0:g1]).float()
-                logp = (
-                    teacher_logits.gather(-1, picked[g0:g1, None]).squeeze(1)
-                    - teacher_logits.logsumexp(-1)
-                )
-            num = num + ((logq - logp) * weights[g0:g1]).sum()
-            den = den + weights[g0:g1].sum()
-        return num, den
+
+        def _kl_rows(student_rows, teacher_hidden_rows):
+            group = 256
+            for g0 in range(0, student_rows.shape[0], group):
+                g1 = min(g0 + group, student_rows.shape[0])
+                logq = torch.log_softmax(student_rows[g0:g1].float(), dim=-1)
+                with torch.no_grad():
+                    teacher_logits = self.lm_head(
+                        teacher_hidden_rows[g0:g1]
+                    ).float()
+                logp = torch.log_softmax(teacher_logits, dim=-1)
+                yield logq, logp, g0, g1
+
+        acc_rows = weight_mask > 0
+        acc_num = base_logits.new_zeros((), dtype=torch.float32)
+        acc_weights = weight_mask[acc_rows].float()
+        student = composed[acc_rows]
+        teacher_hidden = aligned_target_hidden[acc_rows]
+        for logq, logp, g0, g1 in _kl_rows(student, teacher_hidden):
+            p = logp.exp()
+            kl = (p * (logp - logq)).sum(dim=-1)
+            acc_num = acc_num + (kl * acc_weights[g0:g1]).sum()
+        acc_den = acc_weights.sum()
+
+        rej_rows = rejected_mask > 0
+        rej_num = base_logits.new_zeros((), dtype=torch.float32)
+        rej_den = base_logits.new_zeros((), dtype=torch.float32)
+        if bool(rej_rows.any()):
+            shift = self._mining_label_shift()
+            slots = torch.arange(
+                composed.shape[2], device=composed.device
+            ).view(1, 1, -1)
+            offsets = (slots.expand_as(rej_rows)[rej_rows].float() + shift - 1).clamp(min=0)
+            weights = torch.pow(self.mined_rejected_decay, offsets)
+            student = composed[rej_rows]
+            teacher_hidden = aligned_target_hidden[rej_rows]
+            for logq, logp, g0, g1 in _kl_rows(student, teacher_hidden):
+                q = logq.exp()
+                kl = (q * (logq - logp)).sum(dim=-1)
+                rej_num = rej_num + (kl * weights[g0:g1]).sum()
+            rej_den = weights.sum()
+        return acc_num, acc_den, rej_num, rej_den
 
     def _domino_l1_numerators(
         self,
@@ -1778,11 +1797,11 @@ class OnlineDominoModel(OnlineDFlashModel):
         wants_l1 = self.domino_l1_loss_alpha > 0 and (
             self.domino_base_tv_loss or self.domino_final_tv_loss
         )
-        if opd and self.mined_rejected_weight > 0:
+        if opd:
             if target_last_hidden_states is None:
                 raise ValueError(
                     "mined_loss_variant='opd' requires the captured final-layer"
-                    " target_last_hidden_states for the rejected-stream teacher"
+                    " target_last_hidden_states as the frozen teacher"
                 )
             wants_l1 = True
         aligned_target_hidden = None
@@ -1808,8 +1827,10 @@ class OnlineDominoModel(OnlineDFlashModel):
             accept_num,
             base_accept_num,
             accept_den,
-            rejected_num,
-            rejected_den,
+            acc_kl_num,
+            acc_kl_den,
+            rej_kl_num,
+            rej_kl_den,
         ) = checkpointed_chunk_reduce(
             self._domino_objective_chunk_terms,
             hidden4d,
@@ -1818,7 +1839,6 @@ class OnlineDominoModel(OnlineDFlashModel):
             weight_mask,
             eval_weight_mask,
             aligned_target_hidden,
-            self._mined_segments["proposal_ids"] if opd else None,
             rejected_mask,
             chunk_size=self.objective_chunk_blocks,
             dim=1,
@@ -1846,16 +1866,24 @@ class OnlineDominoModel(OnlineDFlashModel):
             tv_loss=self.domino_final_tv_loss,
         )
 
-        loss = (1.0 - lambda_base) * final_objective + lambda_base * base_objective
-        if opd and self.mined_rejected_weight > 0:
-            # Draft-OPD rejected stream as its own ratio: reverse KL of the
-            # draft's own suffix proposals against the frozen teacher.
-            rejected_loss = torch.where(
-                rejected_den > 0,
-                rejected_num / rejected_den.clamp_min(1e-6),
-                rejected_num.new_zeros(()),
+        if opd:
+            # Draft-OPD paper Eq. 13 on the serving (corrected) path only:
+            # the lambda_base curriculum and the CE/TV path mixing are
+            # training-time scaffolds for random init and stay out of the
+            # objective here (they remain visible as telemetry above).
+            lam_rej = self.mined_rejected_weight
+            acc_kl = acc_kl_num / acc_kl_den.clamp_min(1e-6)
+            rej_kl = torch.where(
+                rej_kl_den > 0,
+                rej_kl_num / rej_kl_den.clamp_min(1e-6),
+                rej_kl_num.new_zeros(()),
             )
-            loss = loss + self.mined_rejected_weight * rejected_loss
+            loss = (acc_kl + lam_rej * rej_kl) / (1.0 + lam_rej)
+        else:
+            loss = (
+                (1.0 - lambda_base) * final_objective
+                + lambda_base * base_objective
+            )
         accuracy = correct_num / (accuracy_denom + 1e-6)
         metrics = {
             "final_loss": final_loss.detach(),
@@ -1882,10 +1910,14 @@ class OnlineDominoModel(OnlineDFlashModel):
                     self._mining_stats["count"].clamp_min(1.0),
                 ),
             }
-            if opd and self.mined_rejected_weight > 0:
-                metrics["ratio_metrics"]["mined_rejected_kl"] = (
-                    rejected_num.detach(),
-                    rejected_den.detach().clamp_min(1e-6),
+            if opd:
+                metrics["ratio_metrics"]["mined_acc_kl"] = (
+                    acc_kl_num.detach(),
+                    acc_kl_den.detach().clamp_min(1e-6),
+                )
+                metrics["ratio_metrics"]["mined_rej_kl"] = (
+                    rej_kl_num.detach(),
+                    rej_kl_den.detach().clamp_min(1e-6),
                 )
 
         return loss, accuracy, metrics

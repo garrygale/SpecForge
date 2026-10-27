@@ -627,31 +627,35 @@ class TestDominoOpdLoss(unittest.TestCase):
         teacher_hidden = torch.randn(1, self.seq_len, self.vocab)
         return ids, hidden, teacher_hidden, mask
 
-    def test_rejected_terms_hand_numbers(self):
+    def test_opd_terms_hand_numbers(self):
         model = self._model(mined_rejected_decay=0.5)
         v = self.vocab
         base = torch.zeros(1, 1, 2, v)
         base[0, 0, 1, 0] = 2.0
         correction = torch.zeros(1, 1, 1, v)
-        props = torch.tensor([[[1, 1]]])
+        weight = torch.tensor([[[1.0, 0.0]]])
         rej_mask = torch.tensor([[[0.0, 1.0]]])
         teacher = torch.zeros(1, 1, 2, v)
         teacher[0, 0, 1, 1] = 1.0
-        num, den = model._domino_rejected_terms(
+        acc_num, acc_den, rej_num, rej_den = model._domino_opd_terms(
             base_logits=base,
             correction_logits=correction,
-            proposal_ids=props,
+            weight_mask=weight,
             rejected_mask=rej_mask,
             aligned_target_hidden=teacher,
         )
-        # the proposal token is id 1: spike 2.0 sits at id 0, so the
-        # student logit is 0 while the teacher logit is 1
-        logq = base[0, 0, 1, 1] - torch.logsumexp(base[0, 0, 1], dim=-1)
-        logp = teacher[0, 0, 1, 1] - torch.logsumexp(teacher[0, 0, 1], dim=-1)
-        self.assertAlmostEqual(float(den), 0.5, places=6)
-        self.assertAlmostEqual(
-            float(num), 0.5 * float(logq - logp), places=5
-        )
+        # accepted row = slot 0: forward KL(teacher || student) over the vocab
+        logp0 = torch.log_softmax(teacher[0, 0, 0], dim=-1)
+        logq0 = torch.log_softmax(base[0, 0, 0], dim=-1)
+        kl_acc = float((logp0.exp() * (logp0 - logq0)).sum())
+        self.assertAlmostEqual(float(acc_den), 1.0, places=6)
+        self.assertAlmostEqual(float(acc_num), kl_acc, places=5)
+        # rejected row = slot 1, offset 1 -> weight 0.5: reverse KL
+        logq1 = torch.log_softmax(base[0, 0, 1], dim=-1)
+        logp1 = torch.log_softmax(teacher[0, 0, 1], dim=-1)
+        kl_rej = float((logq1.exp() * (logq1 - logp1)).sum())
+        self.assertAlmostEqual(float(rej_den), 0.5, places=6)
+        self.assertAlmostEqual(float(rej_num), 0.5 * kl_rej, places=5)
 
     def test_opd_forward_runs_and_differs_from_plain(self):
         ids, hidden, teacher_hidden, mask = self._data()
@@ -662,13 +666,36 @@ class TestDominoOpdLoss(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss_opd).all())
         loss_opd.backward()
         self.assertIsNotNone(model.draft_model.gain.grad)
-        self.assertIn("mined_rejected_kl", metrics["ratio_metrics"])
+        self.assertIn("mined_acc_kl", metrics["ratio_metrics"])
+        self.assertIn("mined_rej_kl", metrics["ratio_metrics"])
 
         model_plain = self._model(loss_decay_gamma=7.0, mined_loss_variant="plain")
         loss_plain, _, _ = model_plain(
             ids, hidden, mask, target_last_hidden_states=teacher_hidden
         )
         self.assertFalse(torch.allclose(loss_opd, loss_plain))
+
+    def test_opd_ignores_lambda_base_and_tv_toggles(self):
+        ids, hidden, teacher_hidden, mask = self._data()
+        model = self._model()
+        loss_a, _, _ = model(
+            ids, hidden, mask,
+            target_last_hidden_states=teacher_hidden,
+            lambda_base=1.0,
+        )
+        loss_b, _, _ = model(
+            ids, hidden, mask,
+            target_last_hidden_states=teacher_hidden,
+            lambda_base=0.0,
+        )
+        self.assertTrue(torch.equal(loss_a, loss_b))
+        model_tv = self._model(
+            base_tv_loss=True, final_tv_loss=True, l1_loss_alpha=0.5
+        )
+        loss_tv, _, _ = model_tv(
+            ids, hidden, mask, target_last_hidden_states=teacher_hidden
+        )
+        self.assertTrue(torch.allclose(loss_a, loss_tv))
 
     def test_opd_without_teacher_hidden_raises(self):
         ids, hidden, _, mask = self._data()
@@ -696,7 +723,7 @@ class TestDominoOpdLoss(unittest.TestCase):
             ids, hidden, mask, target_last_hidden_states=teacher_hidden
         )
         self.assertTrue(torch.isfinite(loss).all())
-        kl = metrics["ratio_metrics"]["mined_rejected_kl"]
+        kl = metrics["ratio_metrics"]["mined_rej_kl"]
         self.assertLess(float(kl[1]), 1e-5)
 
 
