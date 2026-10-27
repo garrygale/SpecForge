@@ -1325,6 +1325,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         mined_loss_variant: str = "plain",
         mined_rejected_decay: float = 0.8,
         mined_rejected_weight: float = 1.0,
+        mined_opd_row_chunk: int = 2048,
         shift_label: bool = False,
         ce_loss_alpha: float = 1.0,
         l1_loss_alpha: float = 0.0,
@@ -1358,6 +1359,8 @@ class OnlineDominoModel(OnlineDFlashModel):
             raise ValueError("mined_rejected_decay must be in (0, 1]")
         if mined_rejected_weight < 0:
             raise ValueError("mined_rejected_weight must be >= 0")
+        if mined_opd_row_chunk < 1:
+            raise ValueError("mined_opd_row_chunk must be >= 1")
         if mined_loss_variant == "opd" and anchor_policy != "mined":
             raise ValueError(
                 "mined_loss_variant='opd' requires anchor_policy='mined'"
@@ -1366,6 +1369,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         self.mined_loss_variant = mined_loss_variant
         self.mined_rejected_decay = float(mined_rejected_decay)
         self.mined_rejected_weight = float(mined_rejected_weight)
+        self.mined_opd_row_chunk = int(mined_opd_row_chunk)
         self.domino_ce_loss_alpha = float(ce_loss_alpha)
         self.domino_l1_loss_alpha = float(l1_loss_alpha)
         self.domino_base_tv_loss = bool(base_tv_loss)
@@ -1569,7 +1573,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         )
 
         def _kl_rows(student_rows, teacher_hidden_rows):
-            group = 256
+            group = self.mined_opd_row_chunk
             for g0 in range(0, student_rows.shape[0], group):
                 g1 = min(g0 + group, student_rows.shape[0])
                 logq = torch.log_softmax(student_rows[g0:g1].float(), dim=-1)

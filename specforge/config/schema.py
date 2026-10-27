@@ -582,6 +582,10 @@ class TrainingConfig(StrictConfigModel):
     mined_rejected_decay: float = Field(default=0.8, gt=0.0, le=1.0)
     #: lambda_rej of the paper's Eq. 13 (lambda_acc is fixed at 1).
     mined_rejected_weight: float = Field(default=1.0, ge=0.0)
+    #: Rows per vocab-materialization group in the opd KL streams; bounds the
+    #: fp32 [rows, vocab] transients (~2 GB per tensor at a 248k vocab for
+    #: 2048 rows, double-sided with autograd). Semantically inert.
+    mined_opd_row_chunk: int = Field(default=2048, ge=1)
     loss_type: Literal[
         "dflash",
         "dpace",

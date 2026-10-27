@@ -697,6 +697,18 @@ class TestDominoOpdLoss(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(loss_a, loss_tv))
 
+    def test_opd_row_chunk_invariance(self):
+        ids, hidden, teacher_hidden, mask = self._data()
+        model = self._model()
+        loss_wide, _, _ = model(
+            ids, hidden, mask, target_last_hidden_states=teacher_hidden
+        )
+        model.mined_opd_row_chunk = 1
+        loss_narrow, _, _ = model(
+            ids, hidden, mask, target_last_hidden_states=teacher_hidden
+        )
+        self.assertTrue(torch.allclose(loss_wide, loss_narrow, rtol=1e-5))
+
     def test_opd_without_teacher_hidden_raises(self):
         ids, hidden, _, mask = self._data()
         model = self._model()
