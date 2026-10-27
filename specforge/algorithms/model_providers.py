@@ -620,6 +620,7 @@ def build_domino_model(
             final_tv_loss=cfg.training.domino_final_tv_loss,
             anchor_policy=cfg.training.anchor_policy,
             anchor_mining_chunk_candidates=cfg.training.anchor_mining_chunk_candidates,
+            anchor_mining_head_chunk_blocks=cfg.training.anchor_mining_head_chunk_blocks,
             mined_loss_variant=cfg.training.mined_loss_variant,
             mined_rejected_decay=cfg.training.mined_rejected_decay,
             mined_rejected_weight=cfg.training.mined_rejected_weight,

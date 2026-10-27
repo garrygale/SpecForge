@@ -37,14 +37,6 @@ _VALID_LOSS_TYPES = {
 _DPACE_LOSS_TYPES = _VALID_LOSS_TYPES - {"dflash"}
 _VALID_LK_LOSS_TYPES = {None, "alpha", "lambda", "tv"}
 
-#: Blocks per lm_head slice during anchor mining; bounds the full-vocab
-#: logits transient (the argmax is all that is kept). 256 blocks = 4096
-#: rows ≈ 2 GB of bf16 logits at a 248k vocab — sized for the measured
-#: ~45 GB headroom on a 64 GB A3, still a guard for larger vocabs or
-#: smaller cards.
-_MINING_HEAD_BLOCK_CHUNK = 256
-
-
 class SelectorTerms(NamedTuple):
     """Additive selector objective and metric terms for one objective chunk."""
 
@@ -398,6 +390,7 @@ class OnlineDFlashModel(nn.Module):
         objective_chunk_blocks: int = 128,
         anchor_policy: str = "random",
         anchor_mining_chunk_candidates: int = 512,
+        anchor_mining_head_chunk_blocks: int = 256,
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
         selector_loss_alpha: float = 1.0,
@@ -423,6 +416,8 @@ class OnlineDFlashModel(nn.Module):
             )
         if anchor_mining_chunk_candidates < 1:
             raise ValueError("anchor_mining_chunk_candidates must be >= 1")
+        if anchor_mining_head_chunk_blocks < 1:
+            raise ValueError("anchor_mining_head_chunk_blocks must be >= 1")
         if selector_loss_alpha < 0:
             raise ValueError("selector_loss_alpha must be >= 0")
         if not 0.0 <= selector_warmup_ratio <= 1.0:
@@ -455,6 +450,7 @@ class OnlineDFlashModel(nn.Module):
         self.objective_chunk_blocks = int(objective_chunk_blocks)
         self.anchor_policy = anchor_policy
         self.anchor_mining_chunk_candidates = int(anchor_mining_chunk_candidates)
+        self.anchor_mining_head_chunk_blocks = int(anchor_mining_head_chunk_blocks)
         self._mining_stats: Optional[Dict[str, torch.Tensor]] = None
         self._mined_segments: Optional[Dict[str, torch.Tensor]] = None
         self.loss_type = loss_type
@@ -582,8 +578,8 @@ class OnlineDFlashModel(nn.Module):
         proposals = torch.zeros(
             bsz, n_blocks, bs, dtype=torch.long, device=hidden4d.device
         )
-        for b0 in range(0, n_blocks, _MINING_HEAD_BLOCK_CHUNK):
-            b1 = min(b0 + _MINING_HEAD_BLOCK_CHUNK, n_blocks)
+        for b0 in range(0, n_blocks, self.anchor_mining_head_chunk_blocks):
+            b1 = min(b0 + self.anchor_mining_head_chunk_blocks, n_blocks)
             rows = hidden4d[:, b0:b1].reshape(bsz, (b1 - b0) * bs, -1)
             logits = self.lm_head(self._head_hidden(rows))
             proposals[:, b0:b1] = logits.reshape(
@@ -1322,6 +1318,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         objective_chunk_blocks: int = 128,
         anchor_policy: str = "random",
         anchor_mining_chunk_candidates: int = 512,
+        anchor_mining_head_chunk_blocks: int = 256,
         mined_loss_variant: str = "plain",
         mined_rejected_decay: float = 0.8,
         mined_rejected_weight: float = 1.0,
@@ -1344,6 +1341,7 @@ class OnlineDominoModel(OnlineDFlashModel):
             objective_chunk_blocks=objective_chunk_blocks,
             anchor_policy=anchor_policy,
             anchor_mining_chunk_candidates=anchor_mining_chunk_candidates,
+            anchor_mining_head_chunk_blocks=anchor_mining_head_chunk_blocks,
             loss_type="dflash",
         )
         if ce_loss_alpha < 0:
@@ -1420,8 +1418,8 @@ class OnlineDominoModel(OnlineDFlashModel):
         proposals = torch.zeros(
             bsz, n_blocks, bs, dtype=torch.long, device=hidden4d.device
         )
-        for b0 in range(0, n_blocks, _MINING_HEAD_BLOCK_CHUNK):
-            b1 = min(b0 + _MINING_HEAD_BLOCK_CHUNK, n_blocks)
+        for b0 in range(0, n_blocks, self.anchor_mining_head_chunk_blocks):
+            b1 = min(b0 + self.anchor_mining_head_chunk_blocks, n_blocks)
             rows = hidden4d[:, b0:b1]
             base_logits = self.lm_head(
                 self._head_hidden(rows.reshape(bsz, (b1 - b0) * bs, -1))

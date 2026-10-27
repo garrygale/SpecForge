@@ -431,10 +431,8 @@ class TestBaseMining(unittest.TestCase):
         ids, hidden = self._ids()
         model, mask = self._setup(ids, hidden, num_anchors=64)
         a1, k1, _ = self._kept(model, ids, hidden, mask)
-        with patch.object(
-            _dflash_module, "_MINING_HEAD_BLOCK_CHUNK", 2
-        ):
-            a2, k2, _ = self._kept(model, ids, hidden, mask)
+        model.anchor_mining_head_chunk_blocks = 2
+        a2, k2, _ = self._kept(model, ids, hidden, mask)
         self.assertTrue(torch.equal(a1, a2))
         self.assertTrue(torch.equal(k1, k2))
 

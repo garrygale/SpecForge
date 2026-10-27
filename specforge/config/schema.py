@@ -568,6 +568,10 @@ class TrainingConfig(StrictConfigModel):
     anchor_policy: Literal["random", "mined"] = "random"
     #: Candidate anchors per no-grad mining chunk (memory/launch knob only).
     anchor_mining_chunk_candidates: int = Field(default=512, ge=1)
+    #: Blocks per lm_head slice in the mining proposal pass; bounds the bf16
+    #: [rows, vocab] argmax transients (256 blocks = 4096 rows ~ 2 GB at a
+    #: 248k vocab). Semantically inert.
+    anchor_mining_head_chunk_blocks: int = Field(default=256, ge=1)
     #: Mined-anchor loss variant: ``plain`` keeps the existing CE + slot-decay
     #: objective; ``opd`` replaces it with the Draft-OPD paper objective on
     #: the serving (corrected) path only — full-vocab forward KL over each
