@@ -707,6 +707,34 @@ class TestDominoOpdLoss(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(loss_wide, loss_narrow, rtol=1e-5))
 
+    def test_opd_first_rejected_only_truncates_suffix(self):
+        ids, hidden, teacher_hidden, mask = self._data()
+        model = self._model()
+        _, _, m_full = model(
+            ids, hidden, mask, target_last_hidden_states=teacher_hidden
+        )
+        segs = model._mined_segments["segment_lens"][0].tolist()
+        # default script: every anchor stops at slot 0 -> seg 1, so each
+        # first rejected offset carries weight gamma^0 = 1; the full suffix
+        # carries sum(gamma^s) per anchor, minus tail-censored slots
+        rejected = sum(1 for seg in segs if 0 < seg < self.block)
+        decay = model.mined_rejected_decay
+        full_suffix = sum(decay ** s for s in range(self.block))
+        full_den = float(m_full["ratio_metrics"]["mined_rej_kl"][1])
+        self.assertGreater(full_den, rejected)
+        self.assertLessEqual(full_den, rejected * full_suffix)
+
+        model2 = self._model(mined_rejected_max_offsets=1)
+        loss_first, _, m_first = model2(
+            ids, hidden, mask, target_last_hidden_states=teacher_hidden
+        )
+        self.assertAlmostEqual(
+            float(m_first["ratio_metrics"]["mined_rej_kl"][1]),
+            float(rejected),
+            places=4,
+        )
+        self.assertTrue(torch.isfinite(loss_first).all())
+
     def test_opd_without_teacher_hidden_raises(self):
         ids, hidden, _, mask = self._data()
         model = self._model()

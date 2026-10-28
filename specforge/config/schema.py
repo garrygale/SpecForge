@@ -586,6 +586,14 @@ class TrainingConfig(StrictConfigModel):
     mined_rejected_decay: float = Field(default=0.8, gt=0.0, le=1.0)
     #: lambda_rej of the paper's Eq. 13 (lambda_acc is fixed at 1).
     mined_rejected_weight: float = Field(default=1.0, ge=0.0)
+    #: Cap the rejected stream to the first k rejected offsets per cycle
+    #: (0 = full gamma-weighted suffix, the paper's setting). k=1 keeps only
+    #: the first rejected token — the variant whose offline teacher exactly
+    #: matches the paper's verify-conditioned teacher (the captured
+    #: ground-truth-conditioned teacher coincides with it on the accepted
+    #: prefix). Not ablated in the paper; the closest tested row is
+    #: "w/o Weight Decay", the opposite operation.
+    mined_rejected_max_offsets: int = Field(default=0, ge=0)
     #: Rows per vocab-materialization group in the opd KL streams; bounds the
     #: fp32 [rows, vocab] transients (~2 GB per tensor at a 248k vocab for
     #: 2048 rows, double-sided with autograd). Semantically inert.

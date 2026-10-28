@@ -624,6 +624,7 @@ def build_domino_model(
             mined_loss_variant=cfg.training.mined_loss_variant,
             mined_rejected_decay=cfg.training.mined_rejected_decay,
             mined_rejected_weight=cfg.training.mined_rejected_weight,
+            mined_rejected_max_offsets=cfg.training.mined_rejected_max_offsets,
             mined_opd_row_chunk=cfg.training.mined_opd_row_chunk,
         ),
     )

@@ -1322,6 +1322,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         mined_loss_variant: str = "plain",
         mined_rejected_decay: float = 0.8,
         mined_rejected_weight: float = 1.0,
+        mined_rejected_max_offsets: int = 0,
         mined_opd_row_chunk: int = 2048,
         shift_label: bool = False,
         ce_loss_alpha: float = 1.0,
@@ -1359,6 +1360,8 @@ class OnlineDominoModel(OnlineDFlashModel):
             raise ValueError("mined_rejected_weight must be >= 0")
         if mined_opd_row_chunk < 1:
             raise ValueError("mined_opd_row_chunk must be >= 1")
+        if mined_rejected_max_offsets < 0:
+            raise ValueError("mined_rejected_max_offsets must be >= 0")
         if mined_loss_variant == "opd" and anchor_policy != "mined":
             raise ValueError(
                 "mined_loss_variant='opd' requires anchor_policy='mined'"
@@ -1367,6 +1370,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         self.mined_loss_variant = mined_loss_variant
         self.mined_rejected_decay = float(mined_rejected_decay)
         self.mined_rejected_weight = float(mined_rejected_weight)
+        self.mined_rejected_max_offsets = int(mined_rejected_max_offsets)
         self.mined_opd_row_chunk = int(mined_opd_row_chunk)
         self.domino_ce_loss_alpha = float(ce_loss_alpha)
         self.domino_l1_loss_alpha = float(l1_loss_alpha)
@@ -1771,9 +1775,15 @@ class OnlineDominoModel(OnlineDFlashModel):
             )
             slots = torch.arange(self.block_size, device=device)
             shift = self._mining_label_shift()
-            suffix = slots.view(1, 1, -1) >= (
+            suffix_start = (
                 self._mined_segments["segment_lens"] - shift
-            ).clamp(min=0).unsqueeze(-1)
+            ).clamp(min=0)
+            suffix = slots.view(1, 1, -1) >= suffix_start.unsqueeze(-1)
+            if self.mined_rejected_max_offsets > 0:
+                suffix = suffix & (
+                    slots.view(1, 1, -1)
+                    < (suffix_start + self.mined_rejected_max_offsets).unsqueeze(-1)
+                )
             rejected = (
                 self._mined_segments["segment_lens"]
                 < (self.block_size - shift)
