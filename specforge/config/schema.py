@@ -588,11 +588,11 @@ class TrainingConfig(StrictConfigModel):
     mined_rejected_weight: float = Field(default=1.0, ge=0.0)
     #: Cap the rejected stream to the first k rejected offsets per cycle
     #: (0 = full gamma-weighted suffix, the paper's setting). k=1 keeps only
-    #: the first rejected token — the variant whose offline teacher exactly
-    #: matches the paper's verify-conditioned teacher (the captured
-    #: ground-truth-conditioned teacher coincides with it on the accepted
-    #: prefix). Not ablated in the paper; the closest tested row is
-    #: "w/o Weight Decay", the opposite operation.
+    #: the first rejected token — paper v3 Table 5 shows it matches the full
+    #: stream (tau 5.94 vs 5.95 avg on Qwen3-4B) and calls it the
+    #: efficiency-oriented simplification; for us it is also the variant
+    #: whose offline teacher exactly matches the paper's verify-conditioned
+    #: teacher (they coincide on the accepted prefix).
     mined_rejected_max_offsets: int = Field(default=0, ge=0)
     #: Rows per vocab-materialization group in the opd KL streams; bounds the
     #: fp32 [rows, vocab] transients (~2 GB per tensor at a 248k vocab for
