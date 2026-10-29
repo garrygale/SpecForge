@@ -263,6 +263,24 @@ class _ConfiguredOptimizerFactory:
         if self.total_steps is None:
             raise RuntimeError("optimizer total_steps was not resolved before assembly")
         t = self.cfg.training
+        if t.optimizer == "muon" and t.fsdp_sharding == "FULL_SHARD":
+            raise ValueError(
+                "optimizer=muon cannot run under fsdp_sharding=FULL_SHARD: "
+                "FSDP reshards params between steps, so Newton-Schulz would "
+                "orthogonalize rank-local shards instead of full matrices. "
+                "Use SHARD_GRAD_OP (default) or NO_SHARD."
+            )
+        muon_kwargs = {}
+        if t.optimizer == "muon":
+            muon_kwargs = dict(
+                muon_lr=t.muon_lr,
+                muon_momentum=t.muon_momentum,
+                muon_nesterov=t.muon_nesterov,
+                muon_weight_decay=t.muon_weight_decay,
+                muon_ns_steps=t.muon_ns_steps,
+                muon_adjust_lr=t.muon_adjust_lr,
+                muon_adamw_name_hints=t.muon_adamw_name_hints,
+            )
         return BF16Optimizer(
             draft_module,
             lr=t.learning_rate,
@@ -271,6 +289,8 @@ class _ConfiguredOptimizerFactory:
             lr_scheduler=t.lr_scheduler,
             total_steps=self.total_steps,
             offload_master=t.optimizer_cpu_offload,
+            optimizer_type=t.optimizer,
+            **muon_kwargs,
         )
 
 

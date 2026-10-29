@@ -536,6 +536,29 @@ class TrainingConfig(StrictConfigModel):
     #: Keep FP32 Adam masters and moments on CPU while the trainable draft
     #: remains on the accelerator.
     optimizer_cpu_offload: bool = False
+    #: Optimizer over the fp32 master weights. ``muon`` routes full 2D
+    #: hidden matrices through ``torch.optim.Muon`` (Newton-Schulz
+    #: orthogonalized momentum) and keeps everything else — norms/biases,
+    #: embeddings, vocab projections, table-like and 3D params — on AdamW.
+    #: Requires torch>=2.9 and non-FULL_SHARD fsdp_sharding.
+    optimizer: Literal["adamw", "muon"] = "adamw"
+    #: Muon group learning rate; ``None`` reuses ``learning_rate`` (the
+    #: match_rms_adamw update scaling makes AdamW-tuned lr transfer).
+    muon_lr: Optional[float] = Field(default=None, gt=0.0)
+    muon_momentum: float = Field(default=0.95, ge=0.0, lt=1.0)
+    muon_nesterov: bool = True
+    #: Decoupled weight decay inside the Muon group only. Moonlight pairs
+    #: 0.1 with match_rms_adamw; 0.0 keeps an A/B against the wd-free
+    #: AdamW baseline algorithm-pure.
+    muon_weight_decay: float = Field(default=0.0, ge=0.0)
+    muon_ns_steps: int = Field(default=5, ge=1)
+    #: Update scaling: ``match_rms_adamw`` = 0.2*sqrt(max(m,n)) (Moonlight,
+    #: AdamW lr transfer); ``original`` = sqrt(max(1, m/n)) (Keller Jordan).
+    muon_adjust_lr: Literal["match_rms_adamw", "original"] = (
+        "match_rms_adamw"
+    )
+    #: Extra name substrings forcing matching params onto the AdamW group.
+    muon_adamw_name_hints: List[str] = Field(default_factory=list)
     ttt_length: int = Field(default=7, gt=0)
     attention_backend: Literal["eager", "sdpa", "flex_attention", "fa", "usp"] = (
         "flex_attention"
