@@ -263,12 +263,16 @@ class _ConfiguredOptimizerFactory:
         if self.total_steps is None:
             raise RuntimeError("optimizer total_steps was not resolved before assembly")
         t = self.cfg.training
-        if t.optimizer == "muon" and t.fsdp_sharding == "FULL_SHARD":
+        if t.optimizer == "muon" and t.fsdp_sharding != "NO_SHARD":
             raise ValueError(
-                "optimizer=muon cannot run under fsdp_sharding=FULL_SHARD: "
-                "FSDP reshards params between steps, so Newton-Schulz would "
-                "orthogonalize rank-local shards instead of full matrices. "
-                "Use SHARD_GRAD_OP (default) or NO_SHARD."
+                f"optimizer=muon requires training.fsdp_sharding='NO_SHARD' "
+                f"(got {t.fsdp_sharding!r}): the optimizer is built after the "
+                "FSDP wrap, and every strategy that shards parameters "
+                "(SHARD_GRAD_OP included) leaves the draft's parameters as "
+                "1D local flat-shard views under use_orig_params=True, so no "
+                "2D matrix ever reaches Newton-Schulz and training would "
+                "silently degrade to pure AdamW. NO_SHARD wraps with DDP and "
+                "keeps replicated 2D parameters."
             )
         muon_kwargs = {}
         if t.optimizer == "muon":

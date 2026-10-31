@@ -540,7 +540,10 @@ class TrainingConfig(StrictConfigModel):
     #: hidden matrices through ``torch.optim.Muon`` (Newton-Schulz
     #: orthogonalized momentum) and keeps everything else — norms/biases,
     #: embeddings, vocab projections, table-like and 3D params — on AdamW.
-    #: Requires torch>=2.9 and non-FULL_SHARD fsdp_sharding.
+    #: Requires torch>=2.9 and fsdp_sharding="NO_SHARD": the optimizer is
+    #: built after the FSDP wrap, and any strategy that shards parameters
+    #: leaves the draft's params as 1D flat-shard views, so no 2D matrix
+    #: would ever reach Newton-Schulz.
     optimizer: Literal["adamw", "muon"] = "adamw"
     #: Muon group learning rate; ``None`` reuses ``learning_rate`` (the
     #: match_rms_adamw update scaling makes AdamW-tuned lr transfer).

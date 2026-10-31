@@ -504,14 +504,20 @@ class TestOptimizerFactoryGuards(unittest.TestCase):
         cfg = SimpleNamespace(training=_training_cfg(**training_overrides))
         return _ConfiguredOptimizerFactory(cfg)
 
-    def test_muon_rejects_full_shard(self):
-        factory = self._factory(fsdp_sharding="FULL_SHARD", optimizer="muon")
-        with self.assertRaisesRegex(ValueError, "FULL_SHARD"):
-            factory(SimpleNamespace())
+    def test_muon_rejects_every_param_sharding_strategy(self):
+        # the factory runs after the FSDP wrap; SHARD_GRAD_OP leaves params
+        # as 1D flat-shard views exactly like FULL_SHARD does
+        for sharding in ("FULL_SHARD", "SHARD_GRAD_OP"):
+            with self.subTest(sharding=sharding):
+                factory = self._factory(fsdp_sharding=sharding, optimizer="muon")
+                with self.assertRaisesRegex(ValueError, "NO_SHARD"):
+                    factory(SimpleNamespace())
 
     @unittest.skipUnless(TORCH_HAS_MUON, "torch>=2.9 required for torch.optim.Muon")
-    def test_muon_constructs_under_shard_grad_op(self):
-        factory = self._factory(optimizer="muon", muon_lr=0.02)
+    def test_muon_constructs_under_no_shard(self):
+        factory = self._factory(
+            fsdp_sharding="NO_SHARD", optimizer="muon", muon_lr=0.02
+        )
         optimizer = factory(_TinyTrainable())
         self.assertEqual(optimizer.optimizer_type, "muon")
         self.assertIsNotNone(optimizer.muon_optimizer)
@@ -524,10 +530,68 @@ class TestOptimizerFactoryGuards(unittest.TestCase):
             places=9,
         )
 
-    def test_adamw_ignores_full_shard_guard(self):
+    def test_adamw_ignores_sharding_guard(self):
         factory = self._factory(fsdp_sharding="FULL_SHARD", optimizer="adamw")
         optimizer = factory(_TinyTrainable())
         self.assertIsNone(optimizer.muon_optimizer)
+
+
+class TestMuonEmptyGroupFailsClosed(unittest.TestCase):
+    @unittest.skipUnless(TORCH_HAS_MUON, "torch>=2.9 required for torch.optim.Muon")
+    def test_empty_muon_group_raises_with_breakdown(self):
+        # hints cover every 2D matrix, so nothing can match the Muon group
+        model = _TinyTrainable()
+        with self.assertRaisesRegex(ValueError, "matched no trainable param") as ctx:
+            BF16Optimizer(
+                model,
+                lr=1e-3,
+                total_steps=10,
+                optimizer_type="muon",
+                muon_adamw_name_hints=["fc", "head"],
+            )
+        message = str(ctx.exception)
+        self.assertIn("'name hint': 1", message)
+        self.assertIn("muon_adamw_name_hints", message)
+
+
+@unittest.skipUnless(TORCH_HAS_MUON, "torch>=2.9 required for torch.optim.Muon")
+class TestMuonFsdpTwoRankRegression(unittest.TestCase):
+    """Reproduces the 8-rank failure: params reach the factory as 1D FSDP
+    flat-shard views under every param-sharding strategy, while world-1 runs
+    auto-degrade to NO_SHARD and hide the bug."""
+
+    def test_two_rank_shard_views_and_no_shard_muon(self):
+        import subprocess
+        import sys
+
+        probe = os.path.join(os.path.dirname(__file__), "fsdp_muon_2rank_probe.py")
+        env = dict(os.environ)
+        env.setdefault("MASTER_ADDR", "127.0.0.1")
+        env["MASTER_PORT"] = "29755"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--nproc_per_node=2",
+                "--master_addr=127.0.0.1",
+                "--master_port=29755",
+                probe,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            env=env,
+            cwd=os.path.join(os.path.dirname(__file__), "..", ".."),
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"probe failed:\n{result.stdout}\n{result.stderr}",
+        )
+        self.assertIn("shard_grad_op_all_params_1d=True", result.stdout)
+        self.assertIn("no_shard_muon_params=2", result.stdout)
+        self.assertIn("no_shard_masters_2d=True", result.stdout)
 
 
 if __name__ == "__main__":

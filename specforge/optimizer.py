@@ -198,12 +198,39 @@ class BF16Optimizer:
                 adjust_lr_fn=muon_adjust_lr,
             )
         else:
-            logger.warning(
-                "optimizer='muon' but no trainable param matched the Muon "
-                "group; every param stays on AdamW"
+            breakdown = {
+                "not 2D": 0,
+                "degenerate dim": 0,
+                "vocab-dim": 0,
+                "name hint": 0,
+            }
+            hints = tuple(_MUON_ADAMW_NAME_HINTS) + tuple(muon_adamw_name_hints)
+            vocab_set = {int(vocab_size)} if vocab_size else set()
+            for name, param in self._named_model_params:
+                if param.ndim != 2:
+                    breakdown["not 2D"] += 1
+                elif min(param.shape) <= 1:
+                    breakdown["degenerate dim"] += 1
+                elif max(param.shape) in vocab_set:
+                    breakdown["vocab-dim"] += 1
+                elif any(hint in name for hint in hints):
+                    breakdown["name hint"] += 1
+            raise ValueError(
+                "optimizer='muon' matched no trainable param; refusing to "
+                "silently train pure AdamW. Exclusion breakdown over "
+                f"{len(self._named_model_params)} trainable params: "
+                f"{breakdown}. A dominant 'not 2D' count means the params "
+                "arrived as 1D FSDP flat-shard views — use "
+                "training.fsdp_sharding='NO_SHARD'. Otherwise check "
+                "muon_adamw_name_hints."
             )
         muon_numel = sum(p.numel() for _, p in muon_named)
         adamw_numel = sum(p.numel() for _, p in adamw_named)
+        summary = (
+            f"Muon param split: muon {len(muon_named)} params / "
+            f"{muon_numel / 1e6:.2f}M elements, adamw {len(adamw_named)} "
+            f"params / {adamw_numel / 1e6:.2f}M elements"
+        )
         listing = ["Muon param split:"]
         listing += [f"  muon  {name} {tuple(p.shape)}" for name, p in muon_named]
         listing += [f"  adamw {name} {tuple(p.shape)}" for name, p in adamw_named]
@@ -217,6 +244,7 @@ class BF16Optimizer:
             or not dist.is_initialized()
             or dist.get_rank() == 0
         ):
+            print(summary, flush=True)
             logger.info("\n".join(listing))
         return adamw_masters
 
