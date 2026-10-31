@@ -13,11 +13,12 @@
     "mask_token_id": 248070,
     "target_layer_ids": [
       1,
-      7,
-      13,
-      19,
-      25,
-      31,
+      6,
+      11,
+      16,
+      22,
+      27,
+      32,
       37
     ],
     "projector_type": "domino",
@@ -29,11 +30,6 @@
     "shift_label": true,
     "use_hidden_proj": false,
     "hidden_proj_dim": 256,
-    "qat_w_bit": 4,
-    "qat_a_bit": 8,
-    "qat_exclude": [
-      "embed_proj"
-    ],
     "channel_balanced": false,
     "out_proj_after_norm": true,
     "target_hidden_size": 2048,
@@ -42,17 +38,10 @@
       1024,
       512,
       512,
+      512,
       1024,
       1024,
       2040
-    ],
-    "qat_w4a4_layers": [
-      "layers.0.mlp.up_proj",
-      "layers.2.mlp.up_proj",
-      "layers.4.mlp.up_proj",
-      "layers.0.mlp.gate_proj",
-      "layers.2.mlp.gate_proj",
-      "layers.4.mlp.gate_proj"
     ]
   },
   "dtype": "bfloat16",
@@ -69,14 +58,15 @@
     "sliding_attention",
     "sliding_attention",
     "sliding_attention",
+    "sliding_attention",
     "sliding_attention"
   ],
   "max_position_embeddings": 262144,
-  "max_window_layers": 7,
+  "max_window_layers": 8,
   "model_type": "qwen3",
   "num_attention_heads": 32,
-  "num_hidden_layers": 7,
-  "num_key_value_heads": 8,
+  "num_hidden_layers": 8,
+  "num_key_value_heads": 4,
   "num_target_layers": 40,
   "pad_token_id": 248044,
   "rms_norm_eps": 1e-06,
