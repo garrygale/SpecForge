@@ -1,0 +1,56 @@
+model:
+  target_model_path: "Qwen/Qwen3.5-35B-A3B"
+  draft_model_config: "C:\Users\g\Desktop\codeAgents\SpecForge\configs\qwen3.6-35b-a3b-domino-dflare-tuning.json"
+  target_backend: "sglang"
+  embedding_key: "model.language_model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+  sglang_mem_fraction_static: 0.8
+  draft_checkpoint_path: [a path on server, not accessible from this machine]
+data:
+  train_data_path: [a path on server, not accessible from this machine]
+  max_length: 8192
+  chat_template: "qwen3.5"
+  build_dataset_num_proc: 128
+  cache_dir: "./cache"
+training:
+  strategy: "domino"
+  domino_ce_loss_alpha: 0
+  domino_l1_loss_alpha: 1.0
+  domino_base_tv_loss: false
+  domino_final_tv_loss: true
+  num_epochs: 1
+  batch_size: 2
+  accumulation_steps: 8
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1
+  attention_backend: "sdpa"
+  num_anchors: 512
+  loss_decay_gamma: 4
+  save_interval: 2000
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+  anchor_policy: "mined"
+  anchor_mining_chunk_candidates: 512
+  anchor_mining_head_chunk_blocks: 256
+  optimizer: muon
+tracking:
+  report_to: "tensorboard"
+run_id: "qwen3.5-35b-a3b-dflash-online"
+output_dir: "./outputs/qwen3.5-35b-a3b-dflash-online"
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8
+  disaggregated:
+    control_dir: outputs/qwen3.5-35b-a3b-dflash-online/control
+    consumer_state_dir: outputs/qwen3.5-35b-a3b-dflash-online/consumer-state
+    backend: mooncake
+    server_urls:
+      - http://127.0.0.1:30000
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_protocol: tcp
