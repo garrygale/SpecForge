@@ -34,6 +34,7 @@ from specforge.algorithms.contracts import (
     FeatureMode,
     OfflineStorageContract,
 )
+from specforge.algorithms.common.image_input import image_streaming_adapter
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 ALGORITHM_NAME = "dflash"
@@ -192,6 +193,14 @@ def algorithm_spec() -> AlgorithmSpec:
                 modality="text",
                 required_tensors=ready,
             ),
+            # Text-only draft over image-grounded prompts: the trainer-side
+            # feature contract is unchanged, images only alter the producer's
+            # capture request and the processor-expanded input_ids.
+            FeatureContract(
+                mode=FeatureMode.STREAMING,
+                modality="image",
+                required_tensors=ready,
+            ),
         ),
         capabilities=AlgorithmCapabilities(
             attention_backends={"eager", "sdpa", "flex_attention"},
@@ -262,6 +271,24 @@ def algorithm_providers() -> AlgorithmProviders:
                     ),
                 ),
                 build_collator=collator,
+            ),
+            ServerStreamingProvider(
+                modality="image",
+                capture_method="dflash",
+                target_representation=None,
+                layout=ServerCaptureLayout(
+                    aux_feature="hidden_states",
+                    last_hidden_feature=None,
+                    passthrough=(
+                        ("input_ids", "input_ids", ()),
+                        ("loss_mask", "loss_mask", ()),
+                    ),
+                ),
+                build_collator=collator,
+                build_input_adapter=image_streaming_adapter(
+                    minimum_loss_tokens_fn=minimum_loss_tokens,
+                    loss_mask_filter=has_consecutive_supervised_tokens,
+                ),
             ),
         ),
     )

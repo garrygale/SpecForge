@@ -1,0 +1,69 @@
+# Mixed language-only + image-grounded draft training (llava-665k style).
+#
+# Data: scripts/prepare_llava_665k.py -> scripts/regen_responses_mm.py produce
+#   data/llava665k_regen.jsonl  (records with "images": [relpath] or [])
+#   data/llava665k_images/      (deduped image dir; bytes never enter caches)
+# Language-only records can be concatenated into the same JSONL -- rows are
+# routed per-record inside the image input adapter.
+#
+# Capture-server requirements (external SGLang, patched spec-capture):
+#   - serve the VL teacher, e.g.
+#     python -m sglang.launch_server --model Qwen/Qwen3-VL-8B-Instruct \
+#         --enable-spec-capture --spec-capture-method dflash \
+#         --chunked-prefill-size -1 ...
+#     (dflash-family capture is the path VL targets wire; eagle3 does not
+#     populate layers_to_capture on VL models)
+#   - context length / max_prefill_tokens must cover EXPANDED sequences
+#     (Qwen-VL dynamic resolution can exceed 1k tokens per image), hence
+#     max_length 4096 here and a server context to match
+#   - local and server processors must be the same model revision: the
+#     seq-length guard fails loud on any expansion mismatch
+
+model:
+  target_model_path: "Qwen/Qwen3-VL-8B-Instruct"
+  draft_model_config: "configs/qwen3-8b-domino.json"
+  target_backend: "sglang"
+  trust_remote_code: true
+  input_modality: "image"
+  torch_dtype: "bfloat16"
+data:
+  train_data_path: "./data/llava665k_regen.jsonl"
+  image_root: "./data/llava665k_images"
+  max_length: 4096
+  chat_template: "qwen"
+  build_dataset_num_proc: 32
+  cache_dir: "./cache"
+training:
+  strategy: "domino"
+  num_epochs: 6
+  batch_size: 2
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1
+  attention_backend: "flex_attention"
+  num_anchors: 256
+  loss_decay_gamma: 7
+  save_interval: 1000
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+tracking:
+  report_to: "none"
+  wandb_project: "qwen3-vl-8b-domino-mm"
+  wandb_name: "qwen3-vl-8b-domino-mm-dp4"
+run_id: "qwen3-vl-8b-domino-mm-disaggregated"
+output_dir: "./outputs/qwen3-vl-8b-domino-mm-disaggregated"
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+  disaggregated:
+    control_dir: outputs/qwen3-vl-8b-domino-mm-disaggregated/control
+    backend: mooncake
+    server_urls:
+      - http://127.0.0.1:30000
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_protocol: tcp

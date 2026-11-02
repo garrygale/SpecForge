@@ -30,6 +30,7 @@ from specforge.algorithms.contracts import (
     FeatureMode,
     OfflineStorageContract,
 )
+from specforge.algorithms.common.image_input import image_streaming_adapter
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 ALGORITHM_NAME = "domino"
@@ -195,6 +196,16 @@ def algorithm_spec() -> AlgorithmSpec:
                 allowed_target_representations={"hidden_state"},
                 default_target_representation="hidden_state",
             ),
+            # Text-only draft over image-grounded prompts; the feature
+            # contract mirrors the text streaming contract.
+            FeatureContract(
+                mode=FeatureMode.STREAMING,
+                modality="image",
+                required_tensors=ready - {"target_last_hidden_states"},
+                optional_tensors={"target_last_hidden_states"},
+                allowed_target_representations={"hidden_state"},
+                default_target_representation="hidden_state",
+            ),
         ),
         capabilities=AlgorithmCapabilities(
             attention_backends={"eager", "sdpa", "flex_attention"},
@@ -259,6 +270,25 @@ def algorithm_providers() -> AlgorithmProviders:
                 ),
                 build_collator=collator,
                 resolve_optional_tensors=resolve_optional_tensors,
+            ),
+            ServerStreamingProvider(
+                modality="image",
+                capture_method="dflash",
+                target_representation="hidden_state",
+                layout=ServerCaptureLayout(
+                    aux_feature="hidden_states",
+                    last_hidden_feature="target_last_hidden_states",
+                    passthrough=(
+                        ("input_ids", "input_ids", ()),
+                        ("loss_mask", "loss_mask", ()),
+                    ),
+                ),
+                build_collator=collator,
+                resolve_optional_tensors=resolve_optional_tensors,
+                build_input_adapter=image_streaming_adapter(
+                    minimum_loss_tokens_fn=minimum_loss_tokens,
+                    loss_mask_filter=has_consecutive_supervised_tokens,
+                ),
             ),
         ),
     )

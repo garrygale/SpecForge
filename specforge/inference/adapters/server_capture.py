@@ -306,25 +306,60 @@ class SGLangServerCaptureAdapter:
             },
         )
 
+    def _request_groups(self, tasks: List[PromptTask]) -> List[List[PromptTask]]:
+        """Split a lease batch into single-input-mode groups when the adapter
+        requires it. SGLang's batched /generate picks one input mode (text
+        xor input_ids) per request body, so a mixed text/image batch must
+        travel as separate calls.
+        """
+        splitter = getattr(self.request_input_adapter, "split_request_groups", None)
+        if splitter is None:
+            return [list(tasks)]
+        groups = list(splitter(tasks))
+        if sum(len(group) for group in groups) != len(tasks):
+            raise ValueError(
+                "ServerInputAdapter.split_request_groups must partition the "
+                "batch exactly once per task"
+            )
+        return [group for group in groups if group]
+
     # -- the RefSource entry point ----------------------------------------------
     def produce_refs(
         self, tasks: List[PromptTask], *, capture: CaptureConfig
     ) -> List[Union["SampleRef", ServerCaptureFailure]]:  # noqa: F821
-        """One batched server call -> one committed-ready ref per task.
+        """One batched server call per input-mode group -> one
+        committed-ready ref per task.
 
         Order-aligned with ``tasks``; a per-task server error becomes a
         :class:`ServerCaptureFailure` (the worker fails just that lease). Any
         transport-level error raises — the worker fails the whole lease batch
         retryable, mirroring ``generate_features`` semantics.
         """
-        body = self._request_inputs(tasks)
+        out: List[Any] = [None] * len(tasks)
+        position = {id(task): index for index, task in enumerate(tasks)}
+        successful_refs = []
+        for group in self._request_groups(tasks):
+            refs = self._produce_group(group, capture, successful_refs)
+            for task, item in zip(group, refs):
+                out[position[id(task)]] = item
+        for ref in successful_refs:
+            self.store.adopt(ref)
+        return out
+
+    def _produce_group(
+        self,
+        group: List[PromptTask],
+        capture: CaptureConfig,
+        successful_refs: List[Any],
+    ) -> List[Union[Any, ServerCaptureFailure]]:
+        body = self._request_inputs(group)
         # A fresh cache namespace forces a full prefill on every attempt while
         # leaving SGLang free to use the radix data structure required by hybrid
         # targets. Retries need a new key because the prior attempt may have
         # populated its namespace before the response was lost.
-        body["extra_key"] = [uuid.uuid4().hex for _ in tasks]
+        body["extra_key"] = [uuid.uuid4().hex for _ in group]
         body["sampling_params"] = {"temperature": 0.0, "max_new_tokens": 0}
-        capture_payloads = [self._spec_capture_payload(t) for t in tasks]
+        capture_payloads = [self._spec_capture_payload(t) for t in group]
         body["spec_capture"] = capture_payloads
         for payload in capture_payloads:
             feature_names = list(payload["features"].values())
@@ -340,14 +375,13 @@ class SGLangServerCaptureAdapter:
             f"{self.base_url}/generate", json_body=body, timeout=self.timeout_s
         )
         rows = _flatten_list_wrappers(rows)
-        if len(rows) != len(tasks):
+        if len(rows) != len(group):
             raise RuntimeError(
                 f"spec-capture server returned {len(rows)} rows for "
-                f"{len(tasks)} tasks"
+                f"{len(group)} tasks"
             )
         out: List[Union[Any, ServerCaptureFailure]] = []
-        successful_refs = []
-        for task, row in zip(tasks, rows):
+        for task, row in zip(group, rows):
             if not isinstance(row, dict):
                 raise RuntimeError(
                     "spec-capture server returned a non-object row for task "
@@ -465,8 +499,6 @@ class SGLangServerCaptureAdapter:
             # terminal provisional cleanup even though no refs are returned.
             successful_refs.append(ref)
             out.append(ref)
-        for ref in successful_refs:
-            self.store.adopt(ref)
         return out
 
     def health(self) -> Dict[str, Any]:

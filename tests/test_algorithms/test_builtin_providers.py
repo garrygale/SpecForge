@@ -155,12 +155,21 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 self.assertIsNone(policy.target_defaults)
                 self.assertIsNone(policy.apply_overrides)
 
-    def test_vlm_is_not_registered_as_a_builtin(self):
+    def test_image_modality_is_streaming_only_for_dflash_family(self):
+        dflash_family = {"dflash", "domino", "dspark"}
         for registration in self.registry:
             modalities = {
-                contract.modality for contract in registration.spec.feature_contracts
+                (contract.mode, contract.modality)
+                for contract in registration.spec.feature_contracts
             }
-            self.assertEqual({"text"}, modalities, registration.name)
+            # text-only draft over image-grounded prompts; offline image
+            # capture stays unregistered everywhere
+            self.assertNotIn(("offline", "image"), modalities, registration.name)
+            self.assertEqual(
+                registration.name in dflash_family,
+                ("streaming", "image") in modalities,
+                registration.name,
+            )
 
     def test_builtin_resume_contracts_cover_resolved_objective_semantics(self):
         training = SimpleNamespace(

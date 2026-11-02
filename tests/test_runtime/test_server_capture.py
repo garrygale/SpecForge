@@ -17,6 +17,7 @@ import ctypes
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import torch
@@ -964,6 +965,130 @@ class TestServerCaptureProducerWiring(unittest.TestCase):
         self.assertEqual(produced, len(prompts))
         self.assertEqual(channel.published, len(prompts))
         self.assertTrue(channel.is_closed())
+
+
+class _MixedStubServer(_StubCaptureServer):
+    """Capture stub that also accepts text/image_data request bodies.
+
+    Input-mode-grouped requests carry no top-level ``input_ids``; the token
+    sequence still reaches the server inside each task's passthrough.
+    """
+
+    def __call__(self, url: str, json_body: Dict[str, Any], timeout: float):
+        if "input_ids" not in json_body:
+            ids = []
+            for spec in json_body["spec_capture"]:
+                for item in spec.get("passthrough", []):
+                    if item["name"] == "input_ids":
+                        ids.append(item["data"])
+            json_body = dict(json_body, input_ids=ids)
+        return super().__call__(url, json_body, timeout)
+
+
+class _BrokenSplitAdapter(_GenericRequestInputAdapter):
+    def __init__(self):
+        super().__init__({"input_ids": [[1, 2, 3]]})
+
+    def split_request_groups(self, tasks):
+        return [tasks[:1]]  # drops the second task -> not a partition
+
+
+class TestModalityRequestGrouping(unittest.TestCase):
+    """Mixed text/image lease batches split into per-input-mode server calls."""
+
+    def _image_task(self, i: int, length: int, image: str, prompt_text: str):
+        task = _task(i, length)
+        task.payload["image"] = image
+        task.payload["prompt_text"] = prompt_text
+        return task
+
+    def test_mixed_batch_splits_into_two_calls_and_keeps_order(self):
+        import tempfile as _tempfile
+
+        from specforge.algorithms.common.image_input import image_streaming_adapter
+
+        image_dir = _tempfile.mkdtemp(prefix="sc_mm_")
+        image_name = "img.jpg"
+        image_bytes = b"\xff\xd8jpeg-bytes"
+        with open(os.path.join(image_dir, image_name), "wb") as fh:
+            fh.write(image_bytes)
+
+        backend = _FakeMooncakeStore()
+        server = _MixedStubServer(backend)
+        posted: List[Dict[str, Any]] = []
+
+        def recording_server(url, json_body, timeout):
+            posted.append(json_body)
+            return server(url, json_body, timeout)
+
+        adapter = image_streaming_adapter()(
+            SimpleNamespace(data=SimpleNamespace(image_root=image_dir))
+        )
+        tasks = [
+            _task(0, 4),
+            self._image_task(1, 5, image_name, "rendered one"),
+            _task(2, 6),
+            self._image_task(3, 4, image_name, "rendered two"),
+        ]
+        _, _, _, capture_adapter = _mk(
+            algorithm="dflash",
+            server=recording_server,
+            backend=backend,
+            request_input_adapter=adapter,
+        )
+
+        refs = capture_adapter.produce_refs(tasks, capture=_dflash_contract())
+
+        self.assertTrue(all(isinstance(ref, SampleRef) for ref in refs))
+        self.assertEqual(
+            ["t0", "t1", "t2", "t3"], [ref.source_task_id for ref in refs]
+        )
+        self.assertEqual(2, len(posted))
+        text_body, image_body = posted
+        self.assertEqual(
+            [tasks[0].payload["input_ids"], tasks[2].payload["input_ids"]],
+            text_body["input_ids"],
+        )
+        self.assertNotIn("text", text_body)
+        self.assertEqual(["rendered one", "rendered two"], image_body["text"])
+        self.assertEqual([[image_bytes], [image_bytes]], image_body["image_data"])
+        self.assertNotIn("input_ids", image_body)
+        self.assertEqual(2, len(image_body["spec_capture"]))
+        self.assertEqual(2, len(image_body["extra_key"]))
+        for body in posted:
+            self.assertEqual(
+                {"temperature": 0.0, "max_new_tokens": 0},
+                body["sampling_params"],
+            )
+
+    def test_splitter_must_partition_the_batch(self):
+        _, _, _, capture_adapter = _mk(
+            algorithm="dflash",
+            request_input_adapter=_BrokenSplitAdapter(),
+        )
+        with self.assertRaisesRegex(ValueError, "must partition"):
+            capture_adapter.produce_refs(
+                [_task(0, 4), _task(1, 4)], capture=_dflash_contract()
+            )
+
+    def test_single_modality_batch_stays_one_call(self):
+        adapter = _GenericRequestInputAdapter({"input_ids": [[1, 2], [3, 4]]})
+        posted = []
+
+        def recording_server(url, json_body, timeout):
+            posted.append(json_body)
+            return _StubCaptureServer(_FakeMooncakeStore())(url, json_body, timeout)
+
+        _, _, _, capture_adapter = _mk(
+            algorithm="dflash",
+            server=recording_server,
+            request_input_adapter=adapter,
+        )
+        refs = capture_adapter.produce_refs(
+            [_task(0, 2), _task(1, 2)], capture=_dflash_contract()
+        )
+        self.assertEqual(2, len(refs))
+        self.assertEqual(1, len(posted))
 
 
 if __name__ == "__main__":

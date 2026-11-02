@@ -83,6 +83,24 @@ class ApplicationCompositionTest(unittest.TestCase):
         ):
             resolve_run(config)
 
+    def test_image_modality_resolves_for_dflash_family(self):
+        for algorithm in ("dflash", "domino", "dspark"):
+            with self.subTest(algorithm=algorithm):
+                resolved = resolve_run(
+                    Config.model_validate(_payload(algorithm, modality="image"))
+                )
+                provider = resolved.algorithm.providers.server_streaming_for("image")
+                self.assertIsNotNone(provider.build_input_adapter)
+
+    def test_image_modality_still_unsupported_for_eagle3(self):
+        config = Config.model_validate(_payload("eagle3", modality="image"))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "no streaming feature contract and provider",
+        ):
+            resolve_run(config)
+
     def test_peagle_offline_remains_unsupported(self):
         config = Config.model_validate(_payload("peagle", mode="offline"))
 

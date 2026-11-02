@@ -144,6 +144,10 @@ class DataConfig(StrictConfigModel):
     chat_template: str = "llama3"
     is_preformatted: bool = False
     train_only_last_turn: bool = False
+    #: Root directory for the image paths carried by multimodal training
+    #: data (model.input_modality="image"). Image bytes are read from disk
+    #: lazily and never enter the tokenization cache.
+    image_root: str = ""
     build_dataset_num_proc: int = Field(default=8, gt=0)
     #: Ordered background feature-loader workers. ``None`` preserves the
     #: former strategy defaults (EAGLE/P-EAGLE=4, DFlash-family=8).
