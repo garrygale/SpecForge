@@ -21,9 +21,11 @@ That is the whole interface. It will:
 
 Why this matters: the fc input is ``cat([hidden_states[L] for L in taps])`` with
 NO per-tap normalization, and the draft quantizer is per-token symmetric, so one
-step ``s = max_t/qmax`` covers the whole concat. Effective bits for a tap of RMS
-``r`` are ``b_eff = bits - log2(max_t / r)``; a tap with ``b_eff <= 1`` carries
-at most one bit, and ``b_eff < 0`` means it is inside the dead zone.
+step ``s = max_t/qmax`` covers the whole concat. ``max_t`` is measured directly
+on that concat (per-token abs max; ``--rho`` falls back to the old
+``rho * rms_loudest`` estimate). Effective bits for a tap of RMS ``r`` are
+``b_eff = bits - log2(max_t / r)``; a tap with ``b_eff <= 1`` carries at most one
+bit, and ``b_eff < 0`` means it is inside the dead zone.
 
 STATISTICS WARNING: hidden-state norms are extremely heavy tailed (massive
 activations), so a MEAN over tokens is dominated by a few outliers -- on
@@ -225,6 +227,13 @@ def per_layer_curve(hs, mask):
     return rows
 
 
+def _tap_indices(n_layers, taps, map_from_layers=None):
+    if map_from_layers:
+        return [min(max(int(round(t / map_from_layers * n_layers)), 0), n_layers)
+                for t in taps]
+    return [min(max(int(t), 0), n_layers) for t in taps]
+
+
 def tap_stats(hs, mask, taps, map_from_layers=None):
     """Per-tap per-token RMS and the within-token across-tap disparity.
 
@@ -232,12 +241,7 @@ def tap_stats(hs, mask, taps, map_from_layers=None):
     then matched by relative depth. On the real Qwen3-8B leave it None and the
     taps are used as-is.
     """
-    n_layers = len(hs) - 1
-    if map_from_layers:
-        idx = [min(max(int(round(t / map_from_layers * n_layers)), 0), n_layers)
-               for t in taps]
-    else:
-        idx = [min(max(int(t), 0), n_layers) for t in taps]
+    idx = _tap_indices(len(hs) - 1, taps, map_from_layers)
     mask_c = mask.cpu()
     R = torch.stack([
         hs[L + 1].float().cpu().pow(2).mean(dim=-1).sqrt()[mask_c] for L in idx], dim=1)
@@ -268,10 +272,39 @@ def tap_stats(hs, mask, taps, map_from_layers=None):
     }
 
 
-def effective_bits_table(tap_rms, pi, bits: int, rho: float):
-    """b_eff = bits - log2(max_t / r); max_t ~ rho * rms_loudest."""
+def concat_max_t_stats(hs, mask, taps, map_from_layers=None):
+    """MEASURED max_t: per-token abs max over the fc concat, i.e. exactly the
+    amax the per-token quantizer (wxay.quantize_activation) computes. Also the
+    realized max_t / rms_loudest ratio -- the quantity --rho used to estimate.
+    Medians/quantiles, not means: the per-token max is heavy tailed.
+    """
+    idx = _tap_indices(len(hs) - 1, taps, map_from_layers)
+    mask_c = mask.cpu()
+    mx = torch.stack([hs[L + 1].float().cpu()[mask_c].abs().amax(dim=-1)
+                      for L in idx], dim=1)                 # (M, T)
+    r = torch.stack([hs[L + 1].float().cpu()[mask_c].pow(2).mean(dim=-1).sqrt()
+                     for L in idx], dim=1)                  # (M, T)
+    max_t = mx.amax(dim=1)                                  # (M,)
+    rho = max_t / r.amax(dim=1).clamp(min=1e-12)            # (M,)
+    return {
+        "tokens": int(max_t.numel()),
+        "max_t_median": float(max_t.median()),
+        "max_t_mean": float(max_t.mean()),
+        "max_t_p90": float(max_t.quantile(0.90)),
+        "max_t_p99": float(max_t.quantile(0.99)),
+        "max_t_max": float(max_t.max()),
+        "realized_rho_median": float(rho.median()),
+        "realized_rho_p10": float(rho.quantile(0.10)),
+        "realized_rho_p90": float(rho.quantile(0.90)),
+        "realized_rho_p99": float(rho.quantile(0.99)),
+        "per_tap_max_median": [float(mx[:, j].median()) for j in range(len(idx))],
+    }
+
+
+def effective_bits_table(tap_rms, pi, bits: int, max_t: float):
+    """b_eff = bits - log2(max_t / r); max_t measured on the concat, or
+    rho * rms_loudest when --rho is given."""
     qmax = 2 ** (bits - 1) - 1
-    max_t = rho * max(tap_rms)
     s = max_t / qmax
     rows = []
     for r, p in zip(tap_rms, pi):
@@ -281,7 +314,7 @@ def effective_bits_table(tap_rms, pi, bits: int, rho: float):
             "effective_bits": float(torch.log2(torch.tensor(max(2.0 * r / s, 1e-30)))),
             "tap_rel_error_from_step": float((s ** 2 / 12.0) ** 0.5 / max(r, 1e-30)),
         })
-    return {"bits": bits, "rho": rho, "step": float(s), "taps": rows,
+    return {"bits": bits, "max_t": float(max_t), "step": float(s), "taps": rows,
             "pi_share_on_taps_le_1_bit": float(
                 sum(r["pi_column_energy_share"] for r in rows if r["effective_bits"] <= 1.0))}
 
@@ -304,8 +337,9 @@ def main():
     ap.add_argument("--max-len", type=int, default=128)
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp32", "fp16"])
     ap.add_argument("--device", default="auto", help="auto | cpu | cuda | npu")
-    ap.add_argument("--rho", type=float, default=15.0,
-                    help="assumed max_t/rms_loudest for the effective-bits table (default 15)")
+    ap.add_argument("--rho", type=float, default=None,
+                    help="estimate max_t as rho * loudest-tap RMS instead of measuring "
+                         "it on the concat (old behaviour; default: measured)")
     ap.add_argument("--bits", default="8,4")
     ap.add_argument("--proxy-map-layers", type=int, default=None,
                     help="ONLY when profiling a smaller proxy model: the tap reference "
@@ -339,8 +373,10 @@ def main():
         "rho": args.rho,
         "per_hidden_state": per_layer_curve(hs, mask),
         "taps_stats": tap_stats(hs, mask, taps, args.proxy_map_layers),
+        "concat_max_t": concat_max_t_stats(hs, mask, taps, args.proxy_map_layers),
     }
     ts = report["taps_stats"]
+    mt = report["concat_max_t"]
 
     print()
     print("=" * 96)
@@ -358,6 +394,16 @@ def main():
           % (ts["ratio_of_tap_medians"], ts["ratio_of_tap_means_outlier_dominated"]))
     print("  heavy tail: %.2f%% of tokens have some tap rms > 10; %.3f%% > 100" % (
         100 * ts["token_fraction_any_tap_gt_10"], 100 * ts["token_fraction_any_tap_gt_100"]))
+
+    print()
+    print("MEASURED CONCAT MAX_T (per-token abs max over the fc concat -- the amax")
+    print("  the per-token quantizer actually computes; medians -- means are heavy tailed)")
+    print("  median %.2f   mean %.2f   p90 %.2f   p99 %.2f   max %.2f" % (
+        mt["max_t_median"], mt["max_t_mean"], mt["max_t_p90"], mt["max_t_p99"], mt["max_t_max"]))
+    print("  realized max_t/rms_loudest: median %.2fx   p10 %.2fx   p90 %.2fx   p99 %.2fx"
+          "   (the quantity --rho used to estimate)" % (
+        mt["realized_rho_median"], mt["realized_rho_p10"],
+        mt["realized_rho_p90"], mt["realized_rho_p99"]))
 
     print()
     print("FULL STACK (median per-token RMS; the massive-activation onset is visible)")
@@ -378,15 +424,21 @@ def main():
             H = fc.shape[1] // n_taps
             pi = [float(fc[:, j * H:(j + 1) * H].pow(2).sum() / fc.pow(2).sum())
                   for j in range(n_taps)]
+            if args.rho:
+                max_t = args.rho * max(p["rms_median"] for p in ts["per_tap"])
+                max_src = "%.1f x rms_loudest (--rho)" % args.rho
+            else:
+                max_t = mt["max_t_median"]
+                max_src = "measured concat max_t, token median"
             report["pi_column_energy_share"] = pi
             report["effective_bits"] = {}
             print()
             print("EFFECTIVE BITS PER TAP with ONE shared per-token scale over the concat")
-            print("  (b_eff = bits - log2(max_t/r), max_t = %.1f x rms_loudest; pi from fc.weight)"
-                  % args.rho)
+            print("  (b_eff = bits - log2(max_t/r), max_t = %.4g = %s; pi from fc.weight)"
+                  % (max_t, max_src))
             for bits in bits_list:
                 tab = effective_bits_table([p["rms_median"] for p in ts["per_tap"]],
-                                          pi, bits, args.rho)
+                                          pi, bits, max_t)
                 report["effective_bits"]["%dbit" % bits] = tab
                 print("  --- %d-bit, step %.4f ---" % (bits, tab["step"]))
                 print("    target L    rms        pi       b_eff    tap rel-err")
@@ -412,6 +464,8 @@ def main():
     print("  tap rms medians   : %s" % ["%.3f" % p["rms_median"] for p in ts["per_tap"]])
     print("  disparity median  : %.2fx  (p10 %.2fx / p90 %.2fx)" % (
         ts["disparity_median"], ts["disparity_p10"], ts["disparity_p90"]))
+    print("  max_t measured    : %.2f (median; realized rho median %.2fx, p90 %.2fx)" % (
+        mt["max_t_median"], mt["realized_rho_median"], mt["realized_rho_p90"]))
     if fc is not None and "8bit" in report.get("effective_bits", {}):
         print("  b_eff @8-bit      : %s" % ["%.2f" % t["effective_bits"]
                                             for t in report["effective_bits"]["8bit"]["taps"]])

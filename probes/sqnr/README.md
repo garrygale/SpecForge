@@ -48,12 +48,17 @@ the 5 GB checkpoint. It prints, and writes to
    disparity a single per-token scale has to cover);
 2. the full per-layer profile (median per-token RMS, so the massive-activation
    onset is visible);
-3. the **effective-bits table**: `b_eff = bits - log2(max_t / r)`, per tap, and
-   how much of the trained `fc`'s column energy sits on taps with `b_eff <= 1`.
+3. the **measured concat `max_t`** (per-token abs max over the taps -- exactly
+   what the per-token quantizer's `amax` computes) and its realized
+   `max_t/rms_loudest` distribution;
+4. the **effective-bits table**: `b_eff = bits - log2(max_t / r)`, per tap, with
+   the measured `max_t` (token median), and how much of the trained `fc`'s
+   column energy sits on taps with `b_eff <= 1`.
 
 Useful flags: `--draft-ckpt <path>` (local draft; also picks up its taps and
 skips the network), `--no-fc` (skip the fc lookup), `--texts-file <file>`,
-`--rho <float>` (max_t/rms_loudest, default 15), `--proxy-map-layers 36` **only**
+`--rho <float>` (estimate `max_t` as rho*rms_loudest instead of measuring it --
+old behaviour, off by default), `--proxy-map-layers 36` **only**
 when profiling a smaller model as a proxy.
 
 Offline runs work as long as `--draft-ckpt` points at a local dir containing
