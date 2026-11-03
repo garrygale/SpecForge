@@ -562,14 +562,19 @@ class OnlineDFlashModel(nn.Module):
         later than Domino's shifted labels."""
         return 0
 
+    def _correction_warmup_len(self) -> int:
+        return int(getattr(self.draft_model, "correction_warmup_len", 0))
+
     def _mining_proposal_ids(
         self,
         hidden4d: torch.Tensor,
         target_ids: torch.Tensor,
         prev_ids: torch.Tensor,
+        warmup_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Argmax proposals for anchor mining; variants with another head
         path override this."""
+        del warmup_ids
         if getattr(self.draft_model, "candidate_selector", None) is not None:
             raise ValueError(
                 "mined anchors are not yet supported for selector drafts"
@@ -668,8 +673,17 @@ class OnlineDFlashModel(nn.Module):
                 prev_ids = input_ids[
                     b, prev_pos.clamp(max=seq_len - 1)
                 ].unsqueeze(0)
+                warmup_ids = None
+                warmup_len = self._correction_warmup_len()
+                if warmup_len > 0:
+                    warmup_pos = (
+                        cand.view(-1, 1)
+                        - warmup_len
+                        + torch.arange(warmup_len, device=device).view(1, -1)
+                    ).clamp(min=0)
+                    warmup_ids = input_ids[b, warmup_pos].unsqueeze(0)
                 predicted = self._mining_proposal_ids(
-                    hidden4d, target_ids, prev_ids
+                    hidden4d, target_ids, prev_ids, warmup_ids
                 )[0]
                 proposals_table[c0:c1] = predicted
                 censored = (label_pos >= seq_len) | (
@@ -1386,7 +1400,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         anchor_positions: torch.Tensor,
         target_ids: torch.Tensor,
         output_hidden: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         bsz, n, bs = target_ids.shape
         hidden4d = output_hidden.reshape(bsz, n, bs, output_hidden.shape[-1])
 
@@ -1404,7 +1418,24 @@ class OnlineDominoModel(OnlineDFlashModel):
                 prev_indices,
             )
 
-        return hidden4d, prev_ids
+        warmup_ids = None
+        warmup_len = self._correction_warmup_len()
+        if warmup_len > 0:
+            # Committed tokens left of each anchor; the clamp duplicates the
+            # sequence-start token, matching serving's ring still filling.
+            warmup_offsets = torch.arange(
+                -warmup_len, 0, device=input_ids.device
+            ).view(1, 1, -1)
+            warmup_indices = (
+                anchor_positions.unsqueeze(-1) + warmup_offsets
+            ).clamp(min=0)
+            warmup_ids = torch.gather(
+                input_ids.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
+                2,
+                warmup_indices,
+            )
+
+        return hidden4d, prev_ids, warmup_ids
 
     def _mining_label_shift(self) -> int:
         return int(bool(self.shift_label))
@@ -1414,6 +1445,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         hidden4d: torch.Tensor,
         target_ids: torch.Tensor,
         prev_ids: torch.Tensor,
+        warmup_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Mirror the serving head path: base logits plus the GRU correction
         conditioned on the previous token, composed per ``apply_logits_head``."""
@@ -1433,6 +1465,11 @@ class OnlineDominoModel(OnlineDFlashModel):
                 prev_token_embeddings=self.embed_tokens(
                     head_token_ids[:, b0:b1]
                 ),
+                warmup_embeddings=(
+                    self.embed_tokens(warmup_ids[:, b0:b1])
+                    if warmup_ids is not None
+                    else None
+                ),
                 hidden_states=rows,
                 lm_head=self.lm_head,
             )
@@ -1443,10 +1480,11 @@ class OnlineDominoModel(OnlineDFlashModel):
         self,
         hidden: torch.Tensor,
         prev_ids: torch.Tensor,
+        warmup_ids: Optional[torch.Tensor],
         target_ids: torch.Tensor,
         weight_mask: torch.Tensor,
         eval_weight_mask: torch.Tensor,
-        aligned_target_hidden: Optional[torch.Tensor],
+        aligned_target_hidden: Optional[torch.Tensor] = None,
         rejected_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
         """Return additive Domino loss and telemetry terms for one block slice."""
@@ -1460,9 +1498,13 @@ class OnlineDominoModel(OnlineDFlashModel):
         ).reshape(batch_size, num_blocks, block_size, -1)
         head_token_ids = prev_ids if self.shift_label else target_ids
         head_token_embeddings = self.embed_tokens(head_token_ids)
+        warmup_embeddings = None
+        if warmup_ids is not None:
+            warmup_embeddings = self.embed_tokens(warmup_ids)
         correction_logits = self.draft_model.compute_correction_logits(
             hidden_states=hidden,
             prev_token_embeddings=head_token_embeddings,
+            warmup_embeddings=warmup_embeddings,
             lm_head=self.lm_head,
         )
         final_num, base_num, predicted_ids, base_predicted_ids = (
@@ -1734,13 +1776,22 @@ class OnlineDominoModel(OnlineDFlashModel):
         )
 
         bsz, n, bs = target_ids.shape
-        hidden4d, prev_ids = self._build_domino_head_inputs(
+        hidden4d, prev_ids, warmup_ids = self._build_domino_head_inputs(
             input_ids=input_ids,
             anchor_positions=anchor_positions,
             target_ids=target_ids,
             output_hidden=output_hidden,
         )
         opd = self.mined_loss_variant == "opd" and self._mined_segments is not None
+        if opd and self._correction_warmup_len() > 0:
+            # opd conditions the GRU on the mined walk's accepted proposals;
+            # the pre-anchor committed stream under that policy is a different
+            # reconstruction than the plain gather used here. Surface instead
+            # of silently feeding the ground-truth stream.
+            raise ValueError(
+                "correction_warmup_len > 0 is not supported with "
+                "mined_loss_variant='opd'"
+            )
         if opd and self.shift_label:
             prev_ids = _apply_mined_prev_override(
                 prev_ids,
@@ -1847,6 +1898,7 @@ class OnlineDominoModel(OnlineDFlashModel):
             self._domino_objective_chunk_terms,
             hidden4d,
             prev_ids,
+            warmup_ids,
             target_ids,
             weight_mask,
             eval_weight_mask,

@@ -1700,6 +1700,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.mask_token_id = dflash_config.get("mask_token_id", None)
         self.projector_type = dflash_config.get("projector_type", None)
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
+        self.correction_warmup_len = int(
+            dflash_config.get("correction_warmup_len", 0)
+        )
         self.shift_label = dflash_config.get("shift_label", False)
         self._init_draft_head(config, dflash_config)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
@@ -1802,6 +1805,34 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             return output.to(dtype=input.dtype), h_n.to(dtype=input.dtype)
         return gru(input, h0)
 
+    def _warmup_seed_ids(
+        self,
+        output_ids: torch.Tensor,
+        start: int,
+        num_input_tokens: int,
+    ) -> torch.Tensor:
+        """Committed tokens left of the anchor for GRU warm-up.
+
+        Mirrors serving's per-request ring: only generated tokens enter the
+        window, left-padded with the first generated token while the ring is
+        still filling (the prompt tail never reaches the draft-side ring).
+        """
+        warmup_len = int(getattr(self, "correction_warmup_len", 0))
+        lo = max(num_input_tokens, start - warmup_len)
+        warmup_ids = output_ids[:, lo:start]
+        pad = warmup_len - warmup_ids.shape[1]
+        if pad > 0:
+            warmup_ids = torch.cat(
+                [
+                    output_ids[:, num_input_tokens : num_input_tokens + 1].expand(
+                        -1, pad
+                    ),
+                    warmup_ids,
+                ],
+                dim=1,
+            )
+        return warmup_ids
+
     def _domino_generate_step(
         self,
         start: int,
@@ -1813,6 +1844,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         past_key_values_draft,
         target_hidden: torch.Tensor,
         temperature: float,
+        num_input_tokens: Optional[int] = None,
     ):
         """One Domino decode step matching vLLM's anchor-as-first draft path."""
         text_target = _target_text_model(target)
@@ -1857,8 +1889,19 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 temperature,
             )
         realized_prefix_ids = verify_ids[:, : 1 + prefix_len]
-        realized_prefix_embeds = target_embed(realized_prefix_ids)
-        _, gru_hidden = self._run_inference_gru(realized_prefix_embeds)
+        seed_ids = realized_prefix_ids
+        warmup_len = int(getattr(self, "correction_warmup_len", 0))
+        if warmup_len > 0:
+            if num_input_tokens is None:
+                raise ValueError(
+                    "correction_warmup_len > 0 requires num_input_tokens "
+                    "to scope the warm-up window"
+                )
+            warmup_ids = self._warmup_seed_ids(
+                output_ids, start, num_input_tokens
+            )
+            seed_ids = torch.cat([warmup_ids, realized_prefix_ids], dim=1)
+        _, gru_hidden = self._run_inference_gru(target_embed(seed_ids))
 
         for i in range(prefix_len, k_draft):
             z_i = full_hidden[:, i : i + 1]
@@ -2096,6 +2139,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                         past_key_values_draft,
                         target_hidden,
                         temperature,
+                        num_input_tokens=num_input_tokens,
                     )
                 )
                 pos_match = (verify_ids[:, 1:] == posterior[:, :-1]).float()

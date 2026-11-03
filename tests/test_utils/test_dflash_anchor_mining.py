@@ -119,8 +119,9 @@ class _ScriptedDominoDraft(_ScriptedDraft):
         return onehot.unsqueeze(0) * self.gain
 
     def compute_correction_logits(self, *, prev_token_embeddings=None,
+                                   warmup_embeddings=None,
                                    hidden_states=None, lm_head=None):
-        del prev_token_embeddings, lm_head
+        del prev_token_embeddings, warmup_embeddings, lm_head
         suffix_rows = hidden_states.shape[2] - self.suffix_start
         return torch.zeros(
             hidden_states.shape[0],
@@ -132,9 +133,10 @@ class _ScriptedDominoDraft(_ScriptedDraft):
         )
 
     def apply_logits_head(self, base_logits, *, prev_token_ids=None,
-                          prev_token_embeddings=None, hidden_states=None,
-                          lm_head=None):
-        del prev_token_ids, prev_token_embeddings, hidden_states, lm_head
+                          prev_token_embeddings=None, warmup_embeddings=None,
+                          hidden_states=None, lm_head=None):
+        del prev_token_ids, prev_token_embeddings, warmup_embeddings
+        del hidden_states, lm_head
         out = base_logits.clone()
         n_blocks, block_size = out.shape[1], out.shape[2]
         for i in range(n_blocks):

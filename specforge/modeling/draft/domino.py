@@ -91,6 +91,14 @@ class DominoDraftModel(DFlashDraftModel):
         self.emb_dim = int(dflash_config["emb_dim"])
         self.gru_hidden_dim = int(dflash_config["gru_hidden_dim"])
         self.pure_draft_prefix_len = int(dflash_config.get("pure_draft_prefix_len", 0))
+        self.correction_warmup_len = int(
+            dflash_config.get("correction_warmup_len", 0)
+        )
+        if self.correction_warmup_len < 0:
+            raise ValueError(
+                "dflash_config.correction_warmup_len must be >= 0, got "
+                f"{self.correction_warmup_len}"
+            )
         self.shift_label = bool(dflash_config.get("shift_label", False))
 
         self.prefix_gru = eagerGRU(
@@ -204,6 +212,13 @@ class DominoDraftModel(DFlashDraftModel):
         block_output_ids: torch.LongTensor,
     ) -> torch.LongTensor:
         """Sample a block while causally applying Domino's GRU correction."""
+        if getattr(self, "correction_warmup_len", 0) > 0:
+            # This block-local path has no committed history to warm the GRU
+            # from; serving-side semantics only exist via _domino_generate_step.
+            raise ValueError(
+                "correction_warmup_len > 0 requires the domino generate step "
+                "(spec_generate's projector=='domino' branch)"
+            )
         target_embed = _target_embed_tokens(target)
         target_lm_head = _target_lm_head(target)
         base_logits = target_lm_head(self.head_hidden(draft_hidden))
@@ -231,12 +246,14 @@ class DominoDraftModel(DFlashDraftModel):
         *,
         prev_token_ids: Optional[torch.LongTensor] = None,
         prev_token_embeddings: Optional[torch.Tensor] = None,
+        warmup_embeddings: Optional[torch.Tensor] = None,
         hidden_states: torch.Tensor,
         lm_head: Optional[nn.Module] = None,
     ) -> torch.Tensor:
         del prev_token_ids
         correction_logits = self.compute_correction_logits(
             prev_token_embeddings=prev_token_embeddings,
+            warmup_embeddings=warmup_embeddings,
             hidden_states=hidden_states,
             lm_head=lm_head,
         )
@@ -250,24 +267,43 @@ class DominoDraftModel(DFlashDraftModel):
         prev_token_embeddings: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         lm_head: Optional[nn.Module] = None,
+        warmup_embeddings: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Return suffix-only Domino logits without materializing final logits."""
+        """Return suffix-only Domino logits without materializing final logits.
+
+        ``warmup_embeddings`` ([bsz, n_blocks, warmup_len, H], committed
+        tokens left of each anchor) is prepended to the GRU window so the
+        state at every corrected row already carries the recent-token
+        history; the correction rows themselves are unchanged.
+        """
         if prev_token_embeddings is None:
             raise ValueError("DominoDraftModel requires prev_token_embeddings")
 
         bsz, n_blocks, block_size = hidden_states.shape[:3]
+        warmup_len = 0
+        if warmup_embeddings is not None:
+            warmup_len = warmup_embeddings.shape[2]
         if self.shift_label:
-            gru_inputs = prev_token_embeddings.reshape(bsz * n_blocks, block_size, -1)
+            gru_inputs = prev_token_embeddings
+            if warmup_len:
+                gru_inputs = torch.cat(
+                    [warmup_embeddings, prev_token_embeddings], dim=2
+                )
+            gru_inputs = gru_inputs.reshape(bsz * n_blocks, -1, gru_inputs.shape[-1])
             gru_out = self._run_gru(gru_inputs)
-            gru_out = gru_out.reshape(bsz, n_blocks, block_size, -1)
-            prefix_states = gru_out[:, :, self.suffix_start :, :]
+            gru_out = gru_out.reshape(bsz, n_blocks, warmup_len + block_size, -1)
+            prefix_states = gru_out[:, :, warmup_len + self.suffix_start :, :]
         else:
-            gru_inputs = prev_token_embeddings[:, :, : block_size - 1, :].reshape(
-                bsz * n_blocks, block_size - 1, -1
-            )
+            prev_embeddings = prev_token_embeddings[:, :, : block_size - 1]
+            gru_inputs = prev_embeddings
+            if warmup_len:
+                gru_inputs = torch.cat([warmup_embeddings, prev_embeddings], dim=2)
+            gru_inputs = gru_inputs.reshape(bsz * n_blocks, -1, gru_inputs.shape[-1])
             gru_out = self._run_gru(gru_inputs)
-            gru_out = gru_out.reshape(bsz, n_blocks, block_size - 1, -1)
-            prefix_states = gru_out[:, :, self.suffix_start - 1 :, :]
+            gru_out = gru_out.reshape(
+                bsz, n_blocks, warmup_len + block_size - 1, -1
+            )
+            prefix_states = gru_out[:, :, warmup_len + self.suffix_start - 1 :, :]
 
         if getattr(self, "shared_emb_readout", False):
             if lm_head is None:
