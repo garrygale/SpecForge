@@ -45,25 +45,34 @@ class _WarmupStub:
 
 
 class TestWarmupSeedWindow(unittest.TestCase):
-    def test_window_matches_serving_ring_semantics(self):
+    def test_window_is_the_full_history_left_of_the_anchor(self):
         stub = _WarmupStub()
         output_ids = torch.tensor([[10, 11, 12, 13, 20, 21, 22, 23, 24, 25]])
-        num_input_tokens = 4
 
-        # First round: ring empty -> first generated token broadcast.
+        # Round 1 (anchor = first response token): the warm-up is the prompt
+        # tail, matching the training gather and serving's admission seed.
         self.assertEqual(
-            stub._warmup_seed_ids(output_ids, 4, num_input_tokens).tolist(),
-            [[20, 20, 20]],
+            stub._warmup_seed_ids(output_ids, 4).tolist(),
+            [[11, 12, 13]],
         )
-        # Two committed tokens -> [pad, g0, g1].
+        # The window crosses the prompt boundary freely.
         self.assertEqual(
-            stub._warmup_seed_ids(output_ids, 6, num_input_tokens).tolist(),
-            [[20, 20, 21]],
+            stub._warmup_seed_ids(output_ids, 6).tolist(),
+            [[13, 20, 21]],
         )
-        # Ring full -> the prompt tail never enters the window.
         self.assertEqual(
-            stub._warmup_seed_ids(output_ids, 10, num_input_tokens).tolist(),
+            stub._warmup_seed_ids(output_ids, 10).tolist(),
             [[23, 24, 25]],
+        )
+        # Near the sequence start the first token pads, like the gather's
+        # clamp at index 0.
+        self.assertEqual(
+            stub._warmup_seed_ids(output_ids, 2).tolist(),
+            [[10, 10, 11]],
+        )
+        self.assertEqual(
+            stub._warmup_seed_ids(output_ids, 0).tolist(),
+            [[10, 10, 10]],
         )
 
 

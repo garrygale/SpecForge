@@ -91,14 +91,18 @@ class DominoDraftModel(DFlashDraftModel):
         self.emb_dim = int(dflash_config["emb_dim"])
         self.gru_hidden_dim = int(dflash_config["gru_hidden_dim"])
         self.pure_draft_prefix_len = int(dflash_config.get("pure_draft_prefix_len", 0))
-        self.correction_warmup_len = int(
-            dflash_config.get("correction_warmup_len", 0)
-        )
-        if self.correction_warmup_len < 0:
+        warmup_len = dflash_config.get("correction_warmup_len", 0)
+        if isinstance(warmup_len, bool) or not isinstance(warmup_len, int):
             raise ValueError(
-                "dflash_config.correction_warmup_len must be >= 0, got "
-                f"{self.correction_warmup_len}"
+                "dflash_config.correction_warmup_len must be an int, got "
+                f"{warmup_len!r}"
             )
+        if not 0 <= warmup_len <= 128:
+            raise ValueError(
+                "dflash_config.correction_warmup_len must be in [0, 128], "
+                f"got {warmup_len}"
+            )
+        self.correction_warmup_len = warmup_len
         self.shift_label = bool(dflash_config.get("shift_label", False))
 
         self.prefix_gru = eagerGRU(

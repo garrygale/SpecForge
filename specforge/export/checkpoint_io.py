@@ -165,6 +165,17 @@ def materialize_draft(
             f"checkpoint carries weights the {type(model).__name__} architecture "
             f"does not have: {sorted(unexpected)}"
         )
+    # The warm-up length changes no weight keys but changes what the
+    # correction head conditioned on during training; serving a mismatched
+    # value silently shifts the GRU state distribution.
+    trained_warmup = int(state.get("domino_correction_warmup_len", 0))
+    export_warmup = int(getattr(model, "correction_warmup_len", 0))
+    if export_warmup != trained_warmup:
+        raise ValueError(
+            f"--draft-config has correction_warmup_len={export_warmup} but the "
+            f"checkpoint was trained with {trained_warmup}; export with the "
+            "training config or retrain"
+        )
     tolerated = {"t2d", "d2t"} if vocab_mapping_path else set()
     non_embed_missing = [
         key for key in missing if "embed" not in key.lower() and key not in tolerated

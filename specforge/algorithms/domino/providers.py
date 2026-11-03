@@ -96,8 +96,13 @@ def resume_contract(config, draft_model, training_model):
         "domino_shift_label": bool(training_model.shift_label),
         "domino_sliding_draft_causal": bool(sliding_draft_causal),
         "domino_pure_draft_prefix_len": int(draft_model.pure_draft_prefix_len),
-        "domino_correction_warmup_len": int(
-            getattr(draft_model, "correction_warmup_len", 0)
+        # Recorded only when the warm-up is active: the resume checker treats
+        # every persisted key as required, and W=0 runs (including every
+        # pre-existing checkpoint) are semantically identical without it.
+        **(
+            {"domino_correction_warmup_len": int(draft_model.correction_warmup_len)}
+            if int(getattr(draft_model, "correction_warmup_len", 0)) > 0
+            else {}
         ),
         "domino_target_hidden_size": int(draft_model.target_hidden_size),
         "domino_out_proj_after_norm": bool(
