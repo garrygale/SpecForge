@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 try:
@@ -28,6 +29,14 @@ except ImportError:  # exported top-level remote-code layout
     )
     from dflash2 import DFlashGroupedConv, Qwen3DFlash2DecoderLayer
     from registry import register_draft
+
+
+class _SwiGLU(nn.Module):
+    """Gated bottleneck: rows [gate; up] of the doubled fc1, silu(gate) * up."""
+
+    def forward(self, x):
+        gate, up = x.chunk(2, dim=-1)
+        return F.silu(gate) * up
 
 
 @register_draft
@@ -104,6 +113,29 @@ class DominoDraftModel(DFlashDraftModel):
             )
         self.correction_warmup_len = warmup_len
         self.shift_label = bool(dflash_config.get("shift_label", False))
+        # SwiGLU-gated correction bottleneck (legacy two-path head only):
+        # embed_proj.0 doubles to [2*emb_dim, in_dim] and the SiLU becomes
+        # silu(gate) * up. The doubled weight is a different checkpoint
+        # parameterization, so the flag must match the trained weights.
+        self.correction_swiglu = bool(
+            dflash_config.get("correction_swiglu", False)
+        )
+        if self.correction_swiglu:
+            if dflash_config.get("shared_emb_readout", False):
+                raise ValueError(
+                    "correction_swiglu is not compatible with "
+                    "shared_emb_readout (the shared readout is a pure "
+                    "linear add in emb space)"
+                )
+            if not dflash_config.get("use_embed_proj", True):
+                raise ValueError(
+                    "correction_swiglu requires use_embed_proj=true"
+                )
+            if dflash_config.get("use_hidden_proj", False):
+                raise ValueError(
+                    "correction_swiglu is not compatible with "
+                    "use_hidden_proj"
+                )
 
         self.prefix_gru = eagerGRU(
             input_size=self.target_hidden_size,
@@ -165,9 +197,10 @@ class DominoDraftModel(DFlashDraftModel):
         use_embed = dflash_config.get("use_embed_proj", True)
         use_hidden = bool(dflash_config.get("use_hidden_proj", False))
         if use_embed:
+            bottleneck = 2 * self.emb_dim if self.correction_swiglu else self.emb_dim
             self.embed_proj = nn.Sequential(
-                nn.Linear(in_dim, self.emb_dim, bias=False),
-                nn.SiLU(),
+                nn.Linear(in_dim, bottleneck, bias=False),
+                _SwiGLU() if self.correction_swiglu else nn.SiLU(),
                 nn.Linear(self.emb_dim, config.vocab_size, bias=False),
             )
             self.hidden_proj = None

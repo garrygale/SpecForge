@@ -115,6 +115,14 @@ def resume_contract(config, draft_model, training_model):
                 "shared_emb_readout", False
             )
         ),
+        # Like the warm-up key: recorded only when the gated head is active —
+        # every pre-existing checkpoint is SiLU and must stay resumable, and a
+        # swiglu-config resume of a silu run fails on the fc1 shape mismatch.
+        **(
+            {"domino_correction_swiglu": True}
+            if bool(getattr(draft_model, "correction_swiglu", False))
+            else {}
+        ),
         "domino_fusion_mode": str(
             getattr(draft_model.config, "dflash_config", {}).get("fusion_mode", "")
         ),
