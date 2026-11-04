@@ -1,9 +1,10 @@
 """Image+text ``ServerInputAdapter`` for externally captured streaming training.
 
 The draft stays text-only: multimodal samples only change what the producer
-sends to the capture server (rendered prompt text + image bytes) and the
-token sequence the trainer sees (the processor-expanded ``input_ids``, where
-the image occupies a prompt-side token grid with ``loss_mask == 0``).
+sends to the capture server (pre-expanded ``input_ids`` + base64 image data
+URIs; the server injects vision embeddings at the image-token positions) and
+the token sequence the trainer sees (the processor-expanded ``input_ids``,
+where the image occupies a prompt-side token grid with ``loss_mask == 0``).
 
 Modality identifier: ``"image"`` (register per algorithm alongside the text
 provider; layout and collator are shared with text because the trainer-side
@@ -201,41 +202,30 @@ class ImageTextAdapter:
         )
 
     def split_request_groups(self, tasks):
-        """SGLang's batched /generate picks ONE input mode per request body
-        (text xor input_ids), so mixed lease batches are split by modality.
-        """
-        text_tasks = [task for task in tasks if not task.payload.get("image")]
-        image_tasks = [task for task in tasks if task.payload.get("image")]
-        groups = []
-        if text_tasks:
-            groups.append(text_tasks)
-        if image_tasks:
-            groups.append(image_tasks)
-        return groups or [list(tasks)]
+        """All tasks share one input mode (input_ids), so a mixed batch is a
+        single server call; kept for interface parity/testing."""
+        return [list(tasks)]
 
     def build_request_inputs(self, tasks):
-        """One homogeneous group -> model-input fields for one server call.
+        """One request body for any mix of text and image tasks.
 
-        Image tasks travel as rendered ``text`` (placeholder intact; the
-        server-side processor expands it exactly like the local expansion
-        that produced ``input_ids``) plus ``image_data`` base64 data URIs --
-        JSON-safe, since the transport POSTs the whole body as JSON. Text
-        tasks keep the exact-token ``input_ids`` transport.
+        Every task travels as exact-token ``input_ids``. Image tasks carry
+        the processor-EXPANDED ids (image grid tokens included) plus their
+        image as a base64 data URI; the server injects vision embeddings at
+        the image-token positions -- the standard pre-tokenized multimodal
+        request (verl-style), which also works for engines launched with
+        ``--skip-tokenizer-init`` that reject text prompts.
         """
         payload_images = [task.payload.get("image") for task in tasks]
-        if any(payload_images) and not all(payload_images):
-            raise ValueError(
-                "build_request_inputs received a mixed group; call "
-                "split_request_groups first"
-            )
-        if not all(payload_images):
-            return {"input_ids": [list(task.payload["input_ids"]) for task in tasks]}
-        texts = [task.payload["prompt_text"] for task in tasks]
-        if any(text is None for text in texts):
-            raise ValueError("image task is missing prompt_text")
+        input_ids = [list(task.payload["input_ids"]) for task in tasks]
+        if not any(payload_images):
+            return {"input_ids": input_ids}
         image_data = []
-        for task in tasks:
-            rel = task.payload["image"]
+        for task, rel in zip(tasks, payload_images):
+            if not rel:
+                # per-request None entries are normalized upstream
+                image_data.append(None)
+                continue
             path = rel if os.path.isabs(rel) else os.path.join(self._image_root(), rel)
             with open(path, "rb") as fh:
                 data = fh.read()
@@ -244,7 +234,7 @@ class ImageTextAdapter:
             image_data.append(
                 [f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"]
             )
-        return {"text": texts, "image_data": image_data}
+        return {"input_ids": input_ids, "image_data": image_data}
 
     def _image_root(self) -> str:
         config = getattr(self, "_config", None)

@@ -6,6 +6,10 @@
 # Language-only records can be concatenated into the same JSONL -- rows are
 # routed per-record inside the image input adapter.
 #
+# Transport: every request rides pre-expanded input_ids; image tasks add
+# base64 image data URIs and the server injects vision embeddings at the
+# image-token positions (pre-tokenized mm path, --skip-tokenizer-init safe).
+#
 # Capture-server requirements (external SGLang, patched spec-capture):
 #   - serve the VL teacher, e.g.
 #     python -m sglang.launch_server --model Qwen/Qwen3-VL-8B-Instruct \
@@ -17,7 +21,8 @@
 #     (Qwen-VL dynamic resolution can exceed 1k tokens per image), hence
 #     max_length 4096 here and a server context to match
 #   - local and server processors must be the same model revision: the
-#     seq-length guard fails loud on any expansion mismatch
+#     image-token count in our input_ids and the server's computed grid
+#     must agree, and the seq-length guard fails loud on any mismatch
 
 model:
   target_model_path: "Qwen/Qwen3-VL-8B-Instruct"

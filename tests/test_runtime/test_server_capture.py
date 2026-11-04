@@ -968,24 +968,6 @@ class TestServerCaptureProducerWiring(unittest.TestCase):
         self.assertTrue(channel.is_closed())
 
 
-class _MixedStubServer(_StubCaptureServer):
-    """Capture stub that also accepts text/image_data request bodies.
-
-    Input-mode-grouped requests carry no top-level ``input_ids``; the token
-    sequence still reaches the server inside each task's passthrough.
-    """
-
-    def __call__(self, url: str, json_body: Dict[str, Any], timeout: float):
-        if "input_ids" not in json_body:
-            ids = []
-            for spec in json_body["spec_capture"]:
-                for item in spec.get("passthrough", []):
-                    if item["name"] == "input_ids":
-                        ids.append(item["data"])
-            json_body = dict(json_body, input_ids=ids)
-        return super().__call__(url, json_body, timeout)
-
-
 class _BrokenSplitAdapter(_GenericRequestInputAdapter):
     def __init__(self):
         super().__init__({"input_ids": [[1, 2, 3]]})
@@ -1003,7 +985,7 @@ class TestModalityRequestGrouping(unittest.TestCase):
         task.payload["prompt_text"] = prompt_text
         return task
 
-    def test_mixed_batch_splits_into_two_calls_and_keeps_order(self):
+    def test_mixed_batch_travels_as_one_input_ids_call(self):
         import tempfile as _tempfile
 
         from specforge.algorithms.common.image_input import image_streaming_adapter
@@ -1015,7 +997,7 @@ class TestModalityRequestGrouping(unittest.TestCase):
             fh.write(image_bytes)
 
         backend = _FakeMooncakeStore()
-        server = _MixedStubServer(backend)
+        server = _StubCaptureServer(backend)
         posted: List[Dict[str, Any]] = []
 
         def recording_server(url, json_body, timeout):
@@ -1044,26 +1026,25 @@ class TestModalityRequestGrouping(unittest.TestCase):
         self.assertEqual(
             ["t0", "t1", "t2", "t3"], [ref.source_task_id for ref in refs]
         )
-        self.assertEqual(2, len(posted))
-        text_body, image_body = posted
+        # one call, unified input_ids mode; image tasks add per-request
+        # image_data entries (None for text tasks)
+        self.assertEqual(1, len(posted))
+        body = posted[0]
         self.assertEqual(
-            [tasks[0].payload["input_ids"], tasks[2].payload["input_ids"]],
-            text_body["input_ids"],
+            [task.payload["input_ids"] for task in tasks], body["input_ids"]
         )
-        self.assertNotIn("text", text_body)
-        self.assertEqual(["rendered one", "rendered two"], image_body["text"])
-        (uri,) = image_body["image_data"][0]
-        self.assertTrue(uri.startswith("data:image/jpeg;base64,"))
-        self.assertEqual(image_bytes, base64.b64decode(uri.split(",", 1)[1]))
-        self.assertEqual(2, len(image_body["image_data"]))
-        self.assertNotIn("input_ids", image_body)
-        self.assertEqual(2, len(image_body["spec_capture"]))
-        self.assertEqual(2, len(image_body["extra_key"]))
-        for body in posted:
-            self.assertEqual(
-                {"temperature": 0.0, "max_new_tokens": 0},
-                body["sampling_params"],
-            )
+        self.assertNotIn("text", body)
+        self.assertEqual(4, len(body["image_data"]))
+        self.assertIsNone(body["image_data"][0])
+        self.assertIsNone(body["image_data"][2])
+        for entry in (body["image_data"][1], body["image_data"][3]):
+            (uri,) = entry
+            self.assertTrue(uri.startswith("data:image/jpeg;base64,"))
+            self.assertEqual(image_bytes, base64.b64decode(uri.split(",", 1)[1]))
+        self.assertEqual(
+            {"temperature": 0.0, "max_new_tokens": 0},
+            body["sampling_params"],
+        )
 
     def test_splitter_must_partition_the_batch(self):
         _, _, _, capture_adapter = _mk(

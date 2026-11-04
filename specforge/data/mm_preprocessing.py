@@ -41,12 +41,44 @@ def _text_ids(tokenizer, text: str) -> list:
     return [int(t) for t in ids]
 
 
+def _char_spans_to_token_spans(spans, tokenizer, text: str, max_length: int):
+    """Map char spans to token spans with one tokenization per segment.
+
+    All cut points (span boundaries) are sorted once; each SEGMENT is
+    tokenized once and prefix lengths are cumulative sums, so the cost is
+    O(len(text)) instead of O(spans x len(text)). Identical to per-prefix
+    re-encoding because every cut lands on a special-token boundary.
+    """
+    points = sorted({point for span in spans for point in span if 0 < point <= len(text)})
+    if not points:
+        return [(0, 0)] * len(spans)
+    lengths = []
+    prev = 0
+    for point in points:
+        lengths.append(len(_text_ids(tokenizer, text[prev:point])))
+        prev = point
+    lengths.append(len(_text_ids(tokenizer, text[prev:])))
+    prefix = {0: 0}
+    total = 0
+    for point, seg_len in zip(points, lengths):
+        total += seg_len
+        prefix[point] = min(total, max_length)
+    out = []
+    for start_char, end_char in spans:
+        start = prefix.get(min(max(start_char, 0), len(text)), 0)
+        end = prefix.get(min(max(end_char, 0), len(text)), 0)
+        out.append((start, end))
+    return out
+
+
 def _spans_to_mask(spans, tokenizer, text: str, ids_len: int, max_length: int):
     """Turn (start_char, end_char) assistant spans into a token loss mask."""
     loss_mask = torch.zeros(1, ids_len, dtype=torch.long)
-    for start_char, end_char in spans:
-        start_idx = min(len(_text_ids(tokenizer, text[:start_char])[:max_length]), ids_len)
-        end_idx = min(len(_text_ids(tokenizer, text[:end_char])[:max_length]), ids_len)
+    for start_idx, end_idx in _char_spans_to_token_spans(
+        spans, tokenizer, text, max_length
+    ):
+        start_idx = min(start_idx, ids_len)
+        end_idx = min(end_idx, ids_len)
         if start_idx < end_idx:
             loss_mask[0, start_idx:end_idx] = 1
     return loss_mask
@@ -121,20 +153,10 @@ def encode_image_conversation(
     that violates it falls back to per-prefix processor calls for that
     sample.
     """
-    from PIL import Image
-
     if len(image_paths) != 1:
         raise ValueError(
             f"expected exactly one image per sample, got {len(image_paths)}"
         )
-    images = []
-    for image_path in image_paths:
-        full = (
-            image_path
-            if os.path.isabs(image_path)
-            else os.path.join(image_root, image_path)
-        )
-        images.append(Image.open(full).convert("RGB"))
 
     messages = _prepare_messages(parser, conversation)
     if not any(m["role"] == "user" for m in messages):
@@ -158,11 +180,26 @@ def encode_image_conversation(
             ignore_spans.append((idx, idx + len(token_str)))
             start = idx + len(token_str)
 
+    images = None
+
+    def load_images():
+        nonlocal images
+        if images is None:
+            from PIL import Image
+
+            full = (
+                image_paths[0]
+                if os.path.isabs(image_paths[0])
+                else os.path.join(image_root, image_paths[0])
+            )
+            images = [Image.open(full).convert("RGB")]
+        return images
+
     expanded = _expand_once(
         parser,
         processor,
         image_paths[0],
-        images,
+        load_images,
         rendered,
         image_token,
         n_cache,
@@ -170,7 +207,7 @@ def encode_image_conversation(
     if expanded is None:
         return _encode_via_processor_prefixes(
             processor,
-            images,
+            load_images(),
             rendered,
             spans,
             ignore_spans,
@@ -182,25 +219,39 @@ def encode_image_conversation(
     input_ids = torch.tensor([ids], dtype=torch.long)
     expanded_spans = _shift_spans(spans, rendered, expanded_text, image_token)
     expanded_ignore = _shift_spans(ignore_spans, rendered, expanded_text, image_token)
-    loss_mask = _spans_to_mask(expanded_spans, parser.tokenizer, expanded_text, len(ids), max_length)
-    for start_char, end_char in expanded_ignore:
-        start_idx = min(len(_text_ids(parser.tokenizer, expanded_text[:start_char])[:max_length]), len(ids))
-        end_idx = min(len(_text_ids(parser.tokenizer, expanded_text[:end_char])[:max_length]), len(ids))
+    if expanded_spans is None or expanded_ignore is None:
+        return _encode_via_processor_prefixes(
+            processor,
+            load_images(),
+            rendered,
+            spans,
+            ignore_spans,
+            max_length,
+        )
+    loss_mask = _spans_to_mask(
+        expanded_spans, parser.tokenizer, expanded_text, len(ids), max_length
+    )
+    for start_idx, end_idx in _char_spans_to_token_spans(
+        expanded_ignore, parser.tokenizer, expanded_text, max_length
+    ):
+        start_idx = min(start_idx, len(ids))
+        end_idx = min(end_idx, len(ids))
         if start_idx < end_idx:
             loss_mask[0, start_idx:end_idx] = 0
     return input_ids, loss_mask, rendered
 
 
-def _expand_once(parser, processor, image_path, images, rendered, image_token, n_cache):
+def _expand_once(parser, processor, image_path, load_images, rendered, image_token, n_cache):
     """Processor-expanded ids for ``rendered``, or None when the string-level
-    expansion assumption does not hold (caller falls back)."""
+    expansion assumption does not hold (caller falls back). The image is
+    decoded only when the processor actually runs (memo miss)."""
     if rendered.count(image_token) != 1:
         return None
     if n_cache is not None and image_path in n_cache:
         n = n_cache[image_path]
         ids = None
     else:
-        ids = _image_ids(processor, rendered, images)
+        ids = _image_ids(processor, rendered, load_images())
         base_len = len(_text_ids(parser.tokenizer, rendered))
         # the placeholder contributes c ids to the plain tokenizer and n to
         # the processor's expansion (n >= c); c is measured, not assumed
@@ -312,6 +363,30 @@ class MMPromptSequence(Sequence):
         return {"payload": payload}
 
 
+_WORKER_THREADS_LIMITED = False
+
+
+def _limit_worker_threads():
+    """One torch intra-op thread per map worker.
+
+    Image preprocessing uses torch CPU ops whose default thread pool spans
+    every core; with many map workers that oversubscribes the machine badly
+    (e.g. 128 workers x N cores of runnable threads). Harmless on small
+    boxes, decisive on big ones. Runs once per worker process.
+    """
+    global _WORKER_THREADS_LIMITED
+    if _WORKER_THREADS_LIMITED:
+        return
+    _WORKER_THREADS_LIMITED = True
+    try:
+        import torch
+
+        if torch.get_num_threads() > 1:
+            torch.set_num_threads(1)
+    except Exception:
+        pass
+
+
 def build_mm_dataset(
     dataset,
     tokenizer,
@@ -355,6 +430,8 @@ def build_mm_dataset(
     original_cols = dataset.column_names
 
     def preprocess_function(examples):
+        if num_proc is not None and num_proc > 1:
+            _limit_worker_threads()
         conversations = examples["conversations"]
         images_col = examples.get("images")
         tools = examples.get("tools")

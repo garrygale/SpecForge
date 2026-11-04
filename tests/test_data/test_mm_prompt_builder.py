@@ -322,40 +322,34 @@ class TestBuildRequestInputs(unittest.TestCase):
             }
         )
 
-    def test_split_request_groups_partitions_by_modality(self):
+    def test_split_request_groups_is_a_single_group(self):
         text0 = self._task("t0")
         image1 = self._task("t1", image="img.jpg", prompt_text="p1")
         text2 = self._task("t2")
         groups = self.adapter.split_request_groups([text0, image1, text2])
-        self.assertEqual([[text0, text2], [image1]], groups)
+        self.assertEqual([[text0, image1, text2]], groups)
 
-    def test_build_request_inputs_for_each_group(self):
+    def test_build_request_inputs_unified_input_ids(self):
         image = self._task("t1", image="img.jpg", prompt_text="rendered", ids=[9, 8])
-        inputs = self.adapter.build_request_inputs([image])
-        self.assertEqual(["rendered"], inputs["text"])
-        # JSON-safe data URIs: the transport POSTs the whole body as JSON
-        (uri,) = inputs["image_data"][0]
+        text = self._task("t0", ids=[1, 2, 3])
+        inputs = self.adapter.build_request_inputs([text, image])
+        self.assertEqual([[1, 2, 3], [9, 8]], inputs["input_ids"])
+        self.assertEqual(2, len(inputs["image_data"]))
+        self.assertIsNone(inputs["image_data"][0])
+        (uri,) = inputs["image_data"][1]
         self.assertTrue(uri.startswith("data:image/jpeg;base64,"))
         import base64
 
         self.assertEqual(
             b"\xff\xd8jpeg-bytes", base64.b64decode(uri.split(",", 1)[1])
         )
-        self.assertNotIn("input_ids", inputs)
+        self.assertNotIn("text", inputs)
 
+    def test_build_request_inputs_text_only_omits_image_data(self):
         text = self._task("t0", ids=[1, 2, 3])
         inputs = self.adapter.build_request_inputs([text])
         self.assertEqual([[1, 2, 3]], inputs["input_ids"])
-        self.assertNotIn("text", inputs)
-
-    def test_mixed_group_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "mixed group"):
-            self.adapter.build_request_inputs(
-                [
-                    self._task("t0"),
-                    self._task("t1", image="img.jpg", prompt_text="p"),
-                ]
-            )
+        self.assertNotIn("image_data", inputs)
 
 
 class FileCountingProcessor(FakeProcessor):
