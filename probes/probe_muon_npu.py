@@ -202,6 +202,8 @@ def main():
     log("[FIT] 80-step least-squares race (same shell, same lr where meaningful):")
     for name, kwargs in (
         ("muon", dict(optimizer_type="muon", lr=5e-2)),
+        ("muon+normuon", dict(optimizer_type="muon", lr=5e-2, muon_variant="normuon")),
+        ("muon+adamuon", dict(optimizer_type="muon", lr=5e-2, muon_variant="adamuon")),
         ("adamw", dict(lr=5e-2)),
     ):
         torch.manual_seed(0)
@@ -220,6 +222,37 @@ def main():
             if first is None:
                 first = last
         log(f"    {name:5s}: loss {first:8.3f} -> {last:8.3f} (ratio {last / first:.3f})")
+    log()
+
+    # ---- 6. VARIANT: normuon/adamuon step smoke, update-RMS pin, timing ----
+    from specforge.optimizer import _VariantMuon
+
+    lr = 2e-2
+    log("[VARIANT] update RMS must pin at 0.2*lr (actual-norm alignment); 4 warmup steps then measure:")
+    for variant in ("normuon", "adamuon"):
+        for shape in shapes[:2]:
+            try:
+                m = (torch.randn(shape, device=device) * 0.02).requires_grad_(True)
+                opt = _VariantMuon([m], lr=lr, variant=variant)
+                for _ in range(4):
+                    m.grad = torch.randn_like(m) * 0.1
+                    opt.step()
+                before = m.detach().clone()
+                m.grad = torch.randn_like(m) * 0.1
+                t0 = time.perf_counter()
+                opt.step()
+                if device.type != "cpu":
+                    getattr(torch, device.type).synchronize()
+                dt = time.perf_counter() - t0
+                rms = float((m.detach() - before).pow(2).mean().sqrt())
+                expected = 0.2 * lr
+                verdict(
+                    abs(rms - expected) < 0.05 * expected,
+                    "VARIANT",
+                    f"{variant} {shape}: update RMS {rms:.3e} (expected {expected:.3e}), step {dt * 1e3:.2f} ms",
+                )
+            except Exception as exc:  # noqa: BLE001
+                verdict(False, "VARIANT", f"{variant} {shape} raised {type(exc).__name__}: {exc}")
     log()
 
     log("# copyable report below " + "-" * 40)

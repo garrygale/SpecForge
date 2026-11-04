@@ -284,6 +284,8 @@ class _ConfiguredOptimizerFactory:
                 muon_ns_steps=t.muon_ns_steps,
                 muon_adjust_lr=t.muon_adjust_lr,
                 muon_adamw_name_hints=t.muon_adamw_name_hints,
+                muon_variant=t.muon_variant,
+                muon_beta2=t.muon_beta2,
             )
         return BF16Optimizer(
             draft_module,

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from specforge.optimizer import BF16Optimizer, split_params_for_muon
+from specforge.optimizer import BF16Optimizer, _VariantMuon, split_params_for_muon
 
 TORCH_HAS_MUON = hasattr(torch.optim, "Muon")
 
@@ -474,6 +474,195 @@ class TestMuonCheckpointing(unittest.TestCase):
             optimizer.load_state_dict(state)
 
 
+@unittest.skipUnless(TORCH_HAS_MUON, "torch>=2.9 required for torch.optim.Muon")
+class TestMuonVariants(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # load_state_dict logs through print_on_rank0, which needs a
+        # process group even on a single rank.
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+            os.environ.setdefault("MASTER_PORT", "29519")
+            dist.init_process_group(backend="gloo", rank=0, world_size=1)
+            cls._owns_group = True
+        else:
+            cls._owns_group = False
+
+    @classmethod
+    def tearDownClass(cls):
+        import torch.distributed as dist
+
+        if cls._owns_group and dist.is_initialized():
+            dist.destroy_process_group()
+
+    def test_variant_reduces_loss(self):
+        for variant in ("normuon", "adamuon"):
+            with self.subTest(variant=variant):
+                torch.manual_seed(0)
+                model = nn.Sequential(
+                    nn.Linear(32, 64, bias=False),
+                    nn.GELU(),
+                    nn.Linear(64, 32, bias=False),
+                )
+                model.norm_w = nn.Parameter(torch.ones(32))
+                optimizer = BF16Optimizer(
+                    model,
+                    lr=5e-2,
+                    total_steps=200,
+                    lr_scheduler="constant",
+                    optimizer_type="muon",
+                    muon_variant=variant,
+                )
+                torch.manual_seed(1)
+                inputs = torch.randn(128, 32)
+                targets = inputs @ torch.randn(32, 32)
+                criterion = nn.MSELoss()
+                first = last = None
+                for step in range(80):
+                    loss = criterion(model(inputs), targets)
+                    optimizer.model.zero_grad()
+                    loss.backward()
+                    last = float(loss)
+                    if first is None:
+                        first = last
+                    optimizer.step()
+                self.assertLess(last, first * 0.5)
+
+    def test_inner_update_rms_is_pinned_at_02_lr(self):
+        # both variants align the update through its actual norm, so the
+        # per-element update RMS must equal 0.2*lr exactly; vanilla only
+        # gets there through the shape formula plus the NS sigma wobble
+        lr = 1e-2
+        for variant in ("vanilla", "normuon", "adamuon"):
+            with self.subTest(variant=variant):
+                torch.manual_seed(0)
+                param = torch.randn(48, 32)
+                if variant == "vanilla":
+                    opt = torch.optim.Muon(
+                        [param],
+                        lr=lr,
+                        weight_decay=0.0,
+                        adjust_lr_fn="match_rms_adamw",
+                    )
+                else:
+                    opt = _VariantMuon(
+                        [param], lr=lr, variant=variant, weight_decay=0.0
+                    )
+                generator = torch.Generator().manual_seed(3)
+                for _ in range(4):
+                    param.grad = torch.randn(48, 32, generator=generator)
+                    opt.step()
+                before = param.detach().clone()
+                param.grad = torch.randn(48, 32, generator=generator)
+                opt.step()
+                rms = float((param.detach() - before).pow(2).mean().sqrt())
+                expected = 0.2 * lr
+                if variant == "vanilla":
+                    self.assertTrue(
+                        0.3 * expected < rms < 2.5 * expected,
+                        f"vanilla rms {rms} vs expected {expected}",
+                    )
+                else:
+                    self.assertAlmostEqual(
+                        rms,
+                        expected,
+                        delta=expected * 0.03,
+                        msg=f"{variant} rms {rms}",
+                    )
+
+    def test_state_statistic_granularity(self):
+        for variant, expected_shape in (
+            ("normuon", (48, 1)),
+            ("adamuon", (48, 32)),
+        ):
+            with self.subTest(variant=variant):
+                param = torch.randn(48, 32)
+                opt = _VariantMuon([param], lr=1e-2, variant=variant)
+                param.grad = torch.randn(48, 32)
+                opt.step()
+                state = opt.state[param]
+                self.assertIn("momentum_buffer", state)
+                stat = state["second_moment"]
+                self.assertEqual(tuple(stat.shape), expected_shape)
+                self.assertGreater(float(stat.min()), 0.0)
+
+    def test_variant_roundtrip_and_cross_variant_guard(self):
+        def make(variant):
+            torch.manual_seed(0)
+            model = _TinyTrainable()
+            return (
+                BF16Optimizer(
+                    model,
+                    lr=1e-2,
+                    total_steps=100,
+                    warmup_ratio=0.0,
+                    lr_scheduler="constant",
+                    optimizer_type="muon",
+                    muon_variant=variant,
+                ),
+                model,
+            )
+
+        optimizer_a, model_a = make("adamuon")
+        optimizer_b, model_b = make("adamuon")
+        for step in range(3):
+            _set_grads(model_a, seed=step)
+            optimizer_a.step()
+        state = optimizer_a.state_dict()
+        self.assertEqual(state["muon_variant"], "adamuon")
+        optimizer_b.load_state_dict(state)
+        _set_grads(model_a, seed=99)
+        _set_grads(model_b, seed=99)
+        optimizer_a.step()
+        optimizer_b.step()
+        for p_a, p_b in zip(model_a.parameters(), model_b.parameters()):
+            self.assertTrue(torch.equal(p_a, p_b))
+
+        optimizer_c, _ = make("normuon")
+        with self.assertRaisesRegex(ValueError, "variant"):
+            optimizer_c.load_state_dict(state)
+
+    def test_variant_requires_match_rms_adamw(self):
+        with self.assertRaisesRegex(ValueError, "match_rms_adamw"):
+            BF16Optimizer(
+                _TinyTrainable(),
+                lr=1e-2,
+                total_steps=100,
+                lr_scheduler="constant",
+                optimizer_type="muon",
+                muon_variant="normuon",
+                muon_adjust_lr="original",
+            )
+
+    def test_factory_routes_variant(self):
+        from torch.optim import Muon as TorchMuon
+
+        from specforge.training.assembly import _ConfiguredOptimizerFactory
+
+        cfg = SimpleNamespace(
+            training=_training_cfg(
+                fsdp_sharding="NO_SHARD",
+                optimizer="muon",
+                muon_variant="adamuon",
+            )
+        )
+        optimizer = _ConfiguredOptimizerFactory(cfg)(_TinyTrainable())
+        self.assertIsInstance(optimizer.muon_optimizer, _VariantMuon)
+        self.assertEqual(optimizer.muon_variant, "adamuon")
+
+        cfg = SimpleNamespace(
+            training=_training_cfg(
+                fsdp_sharding="NO_SHARD",
+                optimizer="muon",
+                muon_variant="vanilla",
+            )
+        )
+        optimizer = _ConfiguredOptimizerFactory(cfg)(_TinyTrainable())
+        self.assertIsInstance(optimizer.muon_optimizer, TorchMuon)
+
+
 def _training_cfg(**overrides):
     base = dict(
         learning_rate=1e-3,
@@ -492,6 +681,8 @@ def _training_cfg(**overrides):
         muon_ns_steps=5,
         muon_adjust_lr="match_rms_adamw",
         muon_adamw_name_hints=[],
+        muon_variant="vanilla",
+        muon_beta2=0.95,
     )
     base.update(overrides)
     return SimpleNamespace(**base)

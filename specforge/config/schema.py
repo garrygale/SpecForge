@@ -579,6 +579,17 @@ class TrainingConfig(StrictConfigModel):
     )
     #: Extra name substrings forcing matching params onto the AdamW group.
     muon_adamw_name_hints: List[str] = Field(default_factory=list)
+    #: Muon update-rule variant. ``vanilla`` = stock torch.optim.Muon.
+    #: ``normuon`` rescales the orthogonalized update by a per-row RMS
+    #: statistic EMA (arXiv 2510.05491); ``adamuon`` uses an element-wise
+    #: second moment plus the paper's Sign transform (arXiv 2507.11005).
+    #: Both keep the update RMS at 0.2 (match_rms_adamw target), so
+    #: AdamW-tuned lr transfer is preserved and the variant only
+    #: redistributes update mass.
+    muon_variant: Literal["vanilla", "normuon", "adamuon"] = "vanilla"
+    #: Second-moment decay for the non-vanilla variants (both papers use
+    #: 0.95, matching the Muon momentum).
+    muon_beta2: float = Field(default=0.95, ge=0.0, lt=1.0)
     ttt_length: int = Field(default=7, gt=0)
     attention_backend: Literal["eager", "sdpa", "flex_attention", "fa", "usp"] = (
         "flex_attention"
