@@ -346,3 +346,38 @@ class TestTrainingForward(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWarmupExportGuard(unittest.TestCase):
+    def _check(self, state, export_warmup):
+        from specforge.export.checkpoint_io import _check_warmup_export
+
+        _check_warmup_export(state, export_warmup)
+
+    def test_legacy_warmup0_checkpoint_exports_at_zero(self):
+        self._check({}, 0)
+        self._check({"strategy": "domino"}, 0)
+
+    def test_warmup0_checkpoint_refuses_nonzero_export(self):
+        with self.assertRaises(ValueError, msg="trained with"):
+            self._check(
+                {"domino_correction_warmup_len": 0, "strategy": "domino"}, 16
+            )
+
+    def test_warmup_checkpoint_requires_matching_export(self):
+        state = {"domino_correction_warmup_len": 16, "strategy": "domino"}
+        self._check(state, 16)
+        with self.assertRaises(ValueError, msg="trained with"):
+            self._check(state, 0)
+        with self.assertRaises(ValueError, msg="trained with"):
+            self._check(state, 8)
+
+    def test_warmup_export_from_unrecorded_checkpoint_fails_closed(self):
+        # Direct-builder run: trained with a warm-up but never recorded it.
+        with self.assertRaises(ValueError, msg="does not record"):
+            self._check({"strategy": "domino"}, 16)
+
+    def test_stray_key_on_non_domino_strategy_is_ignored(self):
+        self._check(
+            {"domino_correction_warmup_len": 16, "strategy": "dspark"}, 0
+        )

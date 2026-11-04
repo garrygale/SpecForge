@@ -141,6 +141,34 @@ def resolve_training_state(checkpoint_path: str) -> Dict[str, Any]:
     )
 
 
+def _check_warmup_export(state: Dict[str, Any], export_warmup: int) -> None:
+    """Fail closed when the export warm-up length cannot be proven to match.
+
+    A W>0 export requires the checkpoint to record its training value
+    (absent key = the run bypassed the resume contract, e.g. a direct
+    StepRuntimeConfig build); a recorded W>0 refuses a W=0 export config.
+    Key-less checkpoints are legacy W=0 runs and keep exporting at W=0.
+    """
+    trained_warmup = state.get("domino_correction_warmup_len")
+    if export_warmup > 0 and trained_warmup is None:
+        raise ValueError(
+            f"--draft-config has correction_warmup_len={export_warmup} but "
+            "the checkpoint does not record its training warm-up length "
+            "(no domino_correction_warmup_len); only checkpoints trained "
+            "through the resume contract can export a warm-up"
+        )
+    if (
+        trained_warmup is not None
+        and export_warmup != int(trained_warmup)
+        and (export_warmup > 0 or state.get("strategy") == "domino")
+    ):
+        raise ValueError(
+            f"--draft-config has correction_warmup_len={export_warmup} but "
+            f"the checkpoint was trained with {int(trained_warmup)}; export "
+            "with the training config or retrain"
+        )
+
+
 def materialize_draft(
     state: Dict[str, Any],
     draft_config_path: str,
@@ -168,14 +196,9 @@ def materialize_draft(
     # The warm-up length changes no weight keys but changes what the
     # correction head conditioned on during training; serving a mismatched
     # value silently shifts the GRU state distribution.
-    trained_warmup = int(state.get("domino_correction_warmup_len", 0))
-    export_warmup = int(getattr(model, "correction_warmup_len", 0))
-    if export_warmup != trained_warmup:
-        raise ValueError(
-            f"--draft-config has correction_warmup_len={export_warmup} but the "
-            f"checkpoint was trained with {trained_warmup}; export with the "
-            "training config or retrain"
-        )
+    _check_warmup_export(
+        state, int(getattr(model, "correction_warmup_len", 0))
+    )
     tolerated = {"t2d", "d2t"} if vocab_mapping_path else set()
     non_embed_missing = [
         key for key in missing if "embed" not in key.lower() and key not in tolerated

@@ -1700,8 +1700,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.mask_token_id = dflash_config.get("mask_token_id", None)
         self.projector_type = dflash_config.get("projector_type", None)
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
-        self.correction_warmup_len = int(
-            dflash_config.get("correction_warmup_len", 0)
+        # `or 0` tolerates an explicit JSON null; the Domino subclass
+        # validates the raw value (bool/float/range) in _init_draft_head.
+        self.correction_warmup_len = (
+            dflash_config.get("correction_warmup_len") or 0
         )
         self.shift_label = dflash_config.get("shift_label", False)
         self._init_draft_head(config, dflash_config)
