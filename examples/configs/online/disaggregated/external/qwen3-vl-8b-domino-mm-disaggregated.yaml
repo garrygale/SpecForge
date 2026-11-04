@@ -34,11 +34,11 @@ model:
 data:
   train_data_path: "./data/llava665k_regen.jsonl"
   image_root: "./data/llava665k_images"
-  # MUST equal the server's --mm-min-pixels/--mm-max-pixels: they decide the
-  # image token grid, and any local/server disagreement desyncs the expansion
-  # (server falls back to decode+retokenize -> token drift -> guard rejects)
-  image_min_pixels: 3136        # 4*28*28
-  image_max_pixels: 1003520     # 1280*28*28 (~1280 image tokens)
+  # Leave the pixel bounds UNSET by default: sglang v0.5.18 computes image
+  # token counts with the HF processor's own config, so both sides agree
+  # automatically as long as they load the same model repo. Set them only
+  # when one side's processor bounds are explicitly overridden (they
+  # decide the expansion length; disagreement desyncs input_ids).
   max_length: 4096
   chat_template: "qwen"
   build_dataset_num_proc: 32
