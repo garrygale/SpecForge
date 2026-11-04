@@ -36,6 +36,16 @@ outstanding, so a lone in-flight response cannot deadlock a waiting
 producer. Set `SGLANG_SPEC_CAPTURE_TIMING=1` to log per-stage
 materialize/register/put timings and queue-to-stream latency.
 
+The v0.5.18 patch also archives finished request states
+(`rid_to_finished`) instead of letting `_handle_batch_output` drop them:
+a batched capture POST whose earlier rows finish (max_new_tokens=0) while
+the tokenizer manager is still multimodal-processing later rows reaches
+`_wait_one_response` only after its state was deleted upstream — the
+waiter then raised `KeyError: rid_to_state[rid]` (surfacing as ASGI 500s
+plus "state was deleted" logs) and the whole lease batch was retried.
+Late waiters now claim their output from the archive; every cleanup path
+(abort, disconnect, discard) clears both maps.
+
 The client boundary is
 [`adapters/server_capture.py`](adapters/server_capture.py). Algorithm-owned
 providers map generic server artifacts (`aux`, `last_hidden`, passthrough

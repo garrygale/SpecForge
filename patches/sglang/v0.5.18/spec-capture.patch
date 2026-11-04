@@ -628,10 +628,24 @@ index 18a42407af..5c1ce295eb 100644
              indexer_topk=self.indexer_topk,
              customized_info=(
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index 41c9cd212e..b01fd9e64b 100644
+index 41c9cd2..bbf642c 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
-@@ -1450,6 +1450,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -579,6 +579,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+     def init_running_status(self):
+         # Request states
+         self.rid_to_state: Dict[str, ReqState] = {}
++        # Spec-capture: finished states wait here for a late waiter.
++        # _handle_batch_output queues a finished output and drops the
++        # live entry immediately; a batched request whose earlier rows
++        # completed while the dispatch loop was still tokenizing later
++        # rows reaches _wait_one_response only afterwards (the generator
++        # body runs at first __anext__, not at creation).
++        self.rid_to_finished: Dict[str, ReqState] = {}
+         self.event_loop = None
+         self.asyncio_tasks = set()
+ 
+@@ -1450,6 +1457,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                  multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                  mm_data_mooncake=obj.mm_data_mooncake,
                  encoder_urls=obj.encoder_urls,
@@ -639,7 +653,36 @@ index 41c9cd212e..b01fd9e64b 100644
              )
          elif isinstance(obj, EmbeddingReqInput):
              # Resolve unresolved embed overrides now that input_ids are available
-@@ -2322,6 +2323,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1717,6 +1725,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             # to ensure aborted request state is cleaned up.
+             if state.obj.rid in self.rid_to_state:
+                 del self.rid_to_state[state.obj.rid]
++            self.rid_to_finished.pop(state.obj.rid, None)
+ 
+             # Mark ongoing LoRA request as finished.
+             if self.enable_lora and state.obj.lora_path:
+@@ -1736,7 +1745,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         request: Optional[fastapi.Request] = None,
+     ):
+         """Wait for the response of one request."""
+-        state = self.rid_to_state[obj.rid]
++        state = self.rid_to_state.get(obj.rid) or self.rid_to_finished.pop(
++            obj.rid, None
++        )
++        if state is None:
++            raise KeyError(f"no live or archived state for rid={obj.rid}")
+         # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
+         is_stream = getattr(obj, "stream", False)
+         while True:
+@@ -1814,6 +1827,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                         yield abort_out
+                         break
+ 
++                self.rid_to_finished.pop(obj.rid, None)
+                 yield out
+                 break
+ 
+@@ -2322,6 +2336,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                  hidden_states = recv_obj.output_hidden_states[i]
                  if hidden_states is not None:
                      meta_info["hidden_states"] = hidden_states
@@ -650,6 +693,22 @@ index 41c9cd212e..b01fd9e64b 100644
              if getattr(recv_obj, "routed_experts", None):
                  val = recv_obj.routed_experts[i]
                  if val is not None:
+@@ -2477,6 +2495,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                         )
+                     )
+ 
++                self.rid_to_finished[rid] = state
+                 del self.rid_to_state[rid]
+ 
+                 # Mark ongoing LoRA request as finished.
+@@ -3427,6 +3446,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             rids = obj.rid
+         for rid in rids:
+             self.rid_to_state.pop(rid, None)
++            self.rid_to_finished.pop(rid, None)
+ 
+     def _should_dispatch_to_encoder(
+         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
 diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
 index 69d00c9af9..6620ef83d7 100644
 --- a/python/sglang/srt/managers/utils.py
