@@ -256,6 +256,7 @@ Common fields:
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
 | `training.lr_scheduler` | `cosine` | Learning-rate schedule after warmup: `cosine` or `constant`. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
+| `training.warmup_type` | `linear` | Warmup ramp shape: `linear` (`t/T`) or `cosine` (`0.5*(1-cos(pi*t/T))`, joins the decay with zero slope instead of the linear kink). |
 | `training.max_grad_norm` | `0.5` | Positive gradient-clipping norm. |
 | `training.optimizer_cpu_offload` | `false` | Keep the optimizer's FP32 master parameters and Adam state on CPU. |
 | `training.attention_backend` | `flex_attention` | `eager`, `sdpa`, `flex_attention`, `fa`, or `usp`; the selected strategy must support it. |

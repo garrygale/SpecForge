@@ -1,3 +1,4 @@
+import math
 from warnings import warn
 
 from torch.optim.lr_scheduler import CosineAnnealingLR as _CosineAnnealingLR
@@ -54,20 +55,40 @@ class _TwoStageScheduler(_LRScheduler):
 
 
 class _WarmupScheduler(_TwoStageScheduler):
-    """Starts with a linear warmup lr schedule until it reaches N epochs then applies
-    the specific scheduler (For example: ReduceLROnPlateau).
+    """Ramps lr up over N epochs, then hands over to the wrapped scheduler.
 
     Args:
         optimizer (:class:`torch.optim.Optimizer`): Wrapped optimizer.
-        warmup_epochs (int): Number of epochs to linearly warmup lr until starting applying the scheduler.
+        warmup_epochs (int): Number of epochs to warmup lr until starting applying the scheduler.
         after_scheduler (:class:`torch.optim.lr_scheduler`): After target_epoch, use this scheduler.
+        warmup_type (str): ``"linear"`` ramps as t/T; ``"cosine"`` ramps as
+            0.5*(1-cos(pi*t/T)), which reaches peak lr with zero slope and
+            joins a cosine decay without the linear kink.
         last_epoch (int, optional): The index of last epoch, defaults to -1. When last_epoch=-1,
             the schedule is started from the beginning or When last_epoch=-1, sets initial lr as lr.
     """
 
-    def __init__(self, optimizer, warmup_epochs, after_scheduler, last_epoch=-1):
+    def __init__(
+        self,
+        optimizer,
+        warmup_epochs,
+        after_scheduler,
+        warmup_type="linear",
+        last_epoch=-1,
+    ):
+        if warmup_type not in ("linear", "cosine"):
+            raise ValueError(
+                f"unsupported warmup_type={warmup_type!r}; "
+                "expected 'linear' or 'cosine'"
+            )
+        self.warmup_type = warmup_type
         self.warmup_epochs = int(warmup_epochs)
         super().__init__(optimizer, after_scheduler, last_epoch)
+
+    def warmup_factor(self, t):
+        if self.warmup_type == "cosine":
+            return 0.5 * (1.0 - math.cos(math.pi * t))
+        return t
 
     def get_lr(self):
         if self.last_epoch >= self.warmup_epochs:
@@ -76,7 +97,8 @@ class _WarmupScheduler(_TwoStageScheduler):
                 self.finished = True
             return self.after_scheduler.get_lr()
 
-        return [(self.last_epoch + 1) / self.warmup_epochs * lr for lr in self.base_lrs]
+        t = (self.last_epoch + 1) / self.warmup_epochs
+        return [self.warmup_factor(t) * lr for lr in self.base_lrs]
 
     def step(self, epoch=None):
         if self.finished:
@@ -91,12 +113,13 @@ class _WarmupScheduler(_TwoStageScheduler):
 
 
 class CosineAnnealingWarmupLR(_WarmupScheduler):
-    """Cosine annealing learning rate scheduler with learning rate warmup. A linear warmup schedule will be applied.
+    """Cosine annealing learning rate scheduler with learning rate warmup.
 
     Args:
         optimizer (:class:`torch.optim.Optimizer`): Wrapped optimizer.
         total_steps (int): Number of total training steps.
         warmup_steps (int, optional): Number of warmup steps, defaults to 0.
+        warmup_type (str, optional): ``"linear"`` or ``"cosine"`` warmup ramp, defaults to linear.
         eta_min (int, optional): Minimum learning rate, defaults to 0.
         last_epoch (int, optional): The index of last epoch, defaults to -1. When last_epoch=-1,
             the schedule is started from the beginning or When last_epoch=-1, sets initial lr as lr.
@@ -107,6 +130,7 @@ class CosineAnnealingWarmupLR(_WarmupScheduler):
         optimizer,
         total_steps: int,
         warmup_steps: int = 0,
+        warmup_type: str = "linear",
         eta_min: float = 0.0,
         last_epoch: int = -1,
     ):
@@ -116,7 +140,13 @@ class CosineAnnealingWarmupLR(_WarmupScheduler):
             eta_min=eta_min,
             last_epoch=last_epoch,
         )
-        super().__init__(optimizer, warmup_steps, base_scheduler, last_epoch=last_epoch)
+        super().__init__(
+            optimizer,
+            warmup_steps,
+            base_scheduler,
+            warmup_type=warmup_type,
+            last_epoch=last_epoch,
+        )
 
 
 class _FlatLR(_LRScheduler):
@@ -127,13 +157,14 @@ class _FlatLR(_LRScheduler):
 
 
 class ConstantWarmupLR(_WarmupScheduler):
-    """Linear warmup followed by a constant learning rate."""
+    """Warmup (linear or cosine ramp) followed by a constant learning rate."""
 
     def __init__(
         self,
         optimizer,
         total_steps: int,
         warmup_steps: int = 0,
+        warmup_type: str = "linear",
         last_epoch: int = -1,
     ):
         if total_steps <= 0:
@@ -144,7 +175,13 @@ class ConstantWarmupLR(_WarmupScheduler):
                 f"{warmup_steps} for total_steps={total_steps}"
             )
         base_scheduler = _FlatLR(optimizer, last_epoch=last_epoch)
-        super().__init__(optimizer, warmup_steps, base_scheduler, last_epoch=last_epoch)
+        super().__init__(
+            optimizer,
+            warmup_steps,
+            base_scheduler,
+            warmup_type=warmup_type,
+            last_epoch=last_epoch,
+        )
 
 
 __all__ = ["ConstantWarmupLR", "CosineAnnealingWarmupLR"]

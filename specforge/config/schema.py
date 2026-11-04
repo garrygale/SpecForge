@@ -549,6 +549,10 @@ class TrainingConfig(StrictConfigModel):
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
+    #: Warmup ramp shape. ``cosine`` ramps as 0.5*(1-cos(pi*t/T)) so lr
+    #: reaches peak with zero slope and joins the decay without the kink a
+    #: linear ramp leaves at the warmup boundary.
+    warmup_type: Literal["linear", "cosine"] = "linear"
     max_grad_norm: float = Field(default=0.5, gt=0.0)
     #: Keep FP32 Adam masters and moments on CPU while the trainable draft
     #: remains on the accelerator.

@@ -66,6 +66,7 @@ class BF16Optimizer:
         total_steps=800_000,
         warmup_ratio=0.015,
         lr_scheduler="cosine",
+        warmup_type="linear",
         offload_master=False,
         optimizer_type="adamw",
         muon_lr=None,
@@ -130,10 +131,17 @@ class BF16Optimizer:
                 f"expected one of {sorted(scheduler_types)}"
             )
         self.lr_scheduler_type = lr_scheduler
+        if warmup_type not in ("linear", "cosine"):
+            raise ValueError(
+                f"unsupported warmup_type={warmup_type!r}; "
+                "expected 'linear' or 'cosine'"
+            )
+        self.warmup_type = warmup_type
         self.scheduler = scheduler_types[lr_scheduler](
             self.optimizer,
             total_steps=total_steps,
             warmup_steps=int(warmup_ratio * total_steps),
+            warmup_type=warmup_type,
         )
         if self.muon_optimizer is not None:
             # The scheduler init already moved the AdamW group lr to the first
@@ -398,6 +406,14 @@ class BF16Optimizer:
                 f"{saved_scheduler_type!r} but this run has "
                 f"lr_scheduler={self.lr_scheduler_type!r}"
             )
+        # checkpoints predate warmup_type only ever ramped linearly
+        saved_warmup_type = state_dict.get("warmup_type", "linear")
+        if saved_warmup_type != self.warmup_type:
+            raise ValueError(
+                "checkpoint optimizer used warmup_type="
+                f"{saved_warmup_type!r} but this run has "
+                f"warmup_type={self.warmup_type!r}"
+            )
         saved_max_grad_norm = state_dict.get("max_grad_norm")
         if saved_max_grad_norm is not None and float(saved_max_grad_norm) != float(
             self.max_grad_norm
@@ -476,6 +492,7 @@ class BF16Optimizer:
             "optimizer_state_dict": copy.deepcopy(self.optimizer.state_dict()),
             "scheduler_state_dict": copy.deepcopy(self.scheduler.state_dict()),
             "lr_scheduler_type": self.lr_scheduler_type,
+            "warmup_type": self.warmup_type,
             "optimizer_type": self.optimizer_type,
             "max_grad_norm": self.max_grad_norm,
             # rank-local fp32 masters; without them a resume re-quantizes from bf16

@@ -392,6 +392,19 @@ class ConfigSchemaTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValidationError, field):
                     Config.model_validate(invalid_payload)
 
+    def test_warmup_type_toggle(self):
+        payload = _online_payload("dflash")
+        payload["training"]["warmup_type"] = "cosine"
+        config = Config.model_validate(payload)
+        self.assertEqual(config.training.warmup_type, "cosine")
+
+        default_config = Config.model_validate(_online_payload("dflash"))
+        self.assertEqual(default_config.training.warmup_type, "linear")
+
+        payload["training"]["warmup_type"] = "sqrt"
+        with self.assertRaisesRegex(ValidationError, "warmup_type"):
+            Config.model_validate(payload)
+
     def test_tv_is_a_supported_acceptance_loss_type(self):
         payload = _online_payload("dflash")
         payload["training"]["lk_loss_type"] = "tv"
