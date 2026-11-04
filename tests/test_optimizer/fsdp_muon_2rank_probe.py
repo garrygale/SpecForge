@@ -66,6 +66,7 @@ def _training_cfg(**overrides):
         max_grad_norm=0.5,
         warmup_ratio=0.0,
         lr_scheduler="cosine",
+        warmup_type="linear",
         optimizer_cpu_offload=False,
         total_steps=10,
         max_steps=None,
