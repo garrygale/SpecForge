@@ -34,6 +34,39 @@ def _image_ids(processor, text: str, images) -> list:
     return [int(t) for t in ids]
 
 
+def _text_ids(tokenizer, text: str) -> list:
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    if torch.is_tensor(ids):
+        ids = ids.tolist()
+    return [int(t) for t in ids]
+
+
+def _spans_to_mask(spans, tokenizer, text: str, ids_len: int, max_length: int):
+    """Turn (start_char, end_char) assistant spans into a token loss mask."""
+    loss_mask = torch.zeros(1, ids_len, dtype=torch.long)
+    for start_char, end_char in spans:
+        start_idx = min(len(_text_ids(tokenizer, text[:start_char])[:max_length]), ids_len)
+        end_idx = min(len(_text_ids(tokenizer, text[:end_char])[:max_length]), ids_len)
+        if start_idx < end_idx:
+            loss_mask[0, start_idx:end_idx] = 1
+    return loss_mask
+
+
+def _mask_from_spans_via_processor(spans, processor, images, text, ids_len, max_length):
+    """Same as _spans_to_mask but every prefix runs the full processor."""
+    loss_mask = torch.zeros(1, ids_len, dtype=torch.long)
+    for start_char, end_char in spans:
+        start_idx = min(
+            len(_image_ids(processor, text[:start_char], images)[:max_length]), ids_len
+        )
+        end_idx = min(
+            len(_image_ids(processor, text[:end_char], images)[:max_length]), ids_len
+        )
+        if start_idx < end_idx:
+            loss_mask[0, start_idx:end_idx] = 1
+    return loss_mask
+
+
 def _prepare_messages(parser, conversation) -> list:
     """Mirror GeneralParser.parse's message prep (normalize/system/sanitize)."""
     conversation = [parser._normalize_message(message) for message in conversation]
@@ -69,14 +102,24 @@ def encode_image_conversation(
     train_only_last_turn: bool = False,
     tool=None,
     image_placeholder: str = "<|image_pad|>",
+    image_token: str = "<|image_pad|>",
+    n_cache: Optional[dict] = None,
 ) -> tuple:
     """Render + expand one image-grounded conversation.
 
-    Returns ``(input_ids[1, L], loss_mask[1, L], rendered_text)``. The image
-    placeholder is prepended to the first user turn (llava convention); the
-    processor expands it into the image token grid, and the loss mask is
-    anchored by re-running the processor on text prefixes so image expansion
-    is accounted for identically.
+    Returns ``(input_ids[1, L], loss_mask[1, L], rendered_text)`` where the
+    rendered text keeps the single image placeholder (the capture server
+    expands it itself) while the ids are processor-expanded so they align
+    with the captured hidden states.
+
+    Cost model: the processor runs its full image preprocessing ONCE per
+    unique image path (memoized in ``n_cache``); everything else -- assistant
+    span anchoring, ignore-token zeroing -- uses the plain text tokenizer.
+    String-level expansion (processor replaces the placeholder with N copies
+    of ``image_token`` and then tokenizes) holds for the standard HF
+    multimodal processors and is verified per first encounter; a processor
+    that violates it falls back to per-prefix processor calls for that
+    sample.
     """
     from PIL import Image
 
@@ -101,52 +144,113 @@ def encode_image_conversation(
 
     rendered = parser.apply_chat_template(messages, tool=tool)
 
-    ids = _image_ids(processor, rendered, images)[:max_length]
-    input_ids = torch.tensor([ids], dtype=torch.long)
-    loss_mask = torch.zeros(1, len(ids), dtype=torch.long)
-
     matches = list(re.finditer(parser.assistant_pattern, rendered, re.DOTALL))
     if train_only_last_turn and matches:
         matches = [matches[-1]]
-
-    for match in matches:
-        start_idx = len(
-            _image_ids(processor, rendered[: match.start(1)], images)[:max_length]
-        )
-        end_idx = len(
-            _image_ids(processor, rendered[: match.end(1)], images)[:max_length]
-        )
-        start_idx = min(start_idx, len(ids))
-        end_idx = min(end_idx, len(ids))
-        if start_idx < end_idx:
-            loss_mask[0, start_idx:end_idx] = 1
-
+    spans = [(m.start(1), m.end(1)) for m in matches]
+    ignore_spans = []
     for token_str in parser.chat_template.ignore_token or []:
         start = 0
         while True:
             idx = rendered.find(token_str, start)
             if idx == -1:
                 break
-            start_idx = min(
-                len(
-                    _image_ids(
-                        processor, rendered[:idx], images
-                    )[:max_length]
-                ),
-                len(ids),
-            )
-            end_idx = min(
-                len(
-                    _image_ids(
-                        processor, rendered[: idx + len(token_str)], images
-                    )[:max_length]
-                ),
-                len(ids),
-            )
-            if start_idx < end_idx:
-                loss_mask[0, start_idx:end_idx] = 0
+            ignore_spans.append((idx, idx + len(token_str)))
             start = idx + len(token_str)
 
+    expanded = _expand_once(
+        parser,
+        processor,
+        image_paths[0],
+        images,
+        rendered,
+        image_token,
+        n_cache,
+    )
+    if expanded is None:
+        return _encode_via_processor_prefixes(
+            processor,
+            images,
+            rendered,
+            spans,
+            ignore_spans,
+            max_length,
+        )
+
+    ids, expanded_text = expanded
+    ids = ids[:max_length]
+    input_ids = torch.tensor([ids], dtype=torch.long)
+    expanded_spans = _shift_spans(spans, rendered, expanded_text, image_token)
+    expanded_ignore = _shift_spans(ignore_spans, rendered, expanded_text, image_token)
+    loss_mask = _spans_to_mask(expanded_spans, parser.tokenizer, expanded_text, len(ids), max_length)
+    for start_char, end_char in expanded_ignore:
+        start_idx = min(len(_text_ids(parser.tokenizer, expanded_text[:start_char])[:max_length]), len(ids))
+        end_idx = min(len(_text_ids(parser.tokenizer, expanded_text[:end_char])[:max_length]), len(ids))
+        if start_idx < end_idx:
+            loss_mask[0, start_idx:end_idx] = 0
+    return input_ids, loss_mask, rendered
+
+
+def _expand_once(parser, processor, image_path, images, rendered, image_token, n_cache):
+    """Processor-expanded ids for ``rendered``, or None when the string-level
+    expansion assumption does not hold (caller falls back)."""
+    if rendered.count(image_token) != 1:
+        return None
+    if n_cache is not None and image_path in n_cache:
+        n = n_cache[image_path]
+        ids = None
+    else:
+        ids = _image_ids(processor, rendered, images)
+        base_len = len(_text_ids(parser.tokenizer, rendered))
+        # the placeholder contributes c ids to the plain tokenizer and n to
+        # the processor's expansion (n >= c); c is measured, not assumed
+        c = len(_text_ids(parser.tokenizer, image_token))
+        n = len(ids) - base_len + c
+        if n < c:
+            return None
+    expanded_text = rendered.replace(image_token, image_token * n, 1)
+    if ids is None:
+        ids = _text_ids(parser.tokenizer, expanded_text)
+    elif _text_ids(parser.tokenizer, expanded_text) != ids:
+        return None
+    if n_cache is not None and image_path not in n_cache:
+        n_cache[image_path] = n
+    return ids, expanded_text
+
+
+def _shift_spans(spans, rendered, expanded_text, image_token):
+    """Shift char spans past the placeholder by the expansion delta."""
+    rendered_pos = rendered.index(image_token)
+    delta = len(expanded_text) - len(rendered)
+    shifted = []
+    for start_char, end_char in spans:
+        if start_char > rendered_pos:
+            start_char += delta
+            end_char += delta
+        elif end_char > rendered_pos:
+            return None
+        shifted.append((start_char, end_char))
+    return shifted
+
+
+def _encode_via_processor_prefixes(processor, images, rendered, spans, ignore_spans, max_length):
+    """Slow path: anchor every span with full processor prefix calls."""
+    ids = _image_ids(processor, rendered, images)[:max_length]
+    input_ids = torch.tensor([ids], dtype=torch.long)
+    loss_mask = _mask_from_spans_via_processor(
+        spans, processor, images, rendered, len(ids), max_length
+    )
+    for start_char, end_char in ignore_spans:
+        start_idx = min(
+            len(_image_ids(processor, rendered[:start_char], images)[:max_length]),
+            len(ids),
+        )
+        end_idx = min(
+            len(_image_ids(processor, rendered[:end_char], images)[:max_length]),
+            len(ids),
+        )
+        if start_idx < end_idx:
+            loss_mask[0, start_idx:end_idx] = 0
     return input_ids, loss_mask, rendered
 
 
@@ -224,12 +328,15 @@ def build_mm_dataset(
     minimum_valid_tokens: Optional[int] = None,
     loss_mask_filter: Optional[Callable[[object], bool]] = None,
     image_placeholder: str = "<|image_pad|>",
+    image_token: str = "<|image_pad|>",
 ) -> Any:
     """Build the mixed text/image training dataset (mirrors build_eagle3_dataset).
 
     Input columns: ``conversations`` plus ``images`` (list of paths, empty =
     text-only). Output columns: ``input_ids``/``loss_mask``/``attention_mask``
     ([1, seq] tensors), ``image`` (str|None) and ``prompt_text`` (str|None).
+    The processor runs once per unique image path (per map worker); span
+    anchoring is text-tokenizer-only.
     """
     from .parse import GeneralParser
     from .preprocessing import preprocess_conversations
@@ -242,6 +349,7 @@ def build_mm_dataset(
     )
     template: ChatTemplate = TEMPLATE_REGISTRY.get(chat_template)
     parser = GeneralParser(tokenizer, template)
+    n_cache: dict = {}
 
     dataset = dataset.shuffle(seed=shuffle_seed)
     original_cols = dataset.column_names
@@ -278,6 +386,8 @@ def build_mm_dataset(
                     else None
                 ),
                 image_placeholder=image_placeholder,
+                image_token=image_token,
+                n_cache=n_cache,
             )
             results["input_ids"][i] = input_ids
             results["loss_mask"][i] = loss_mask

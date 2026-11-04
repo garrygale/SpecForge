@@ -13,6 +13,7 @@ zero-copy ``MooncakeFeatureStore.get``. The real-server end-to-end lives in
 ``test_server_capture_gate.py`` (opt-in, needs GPU + mooncake master).
 """
 
+import base64
 import ctypes
 import os
 import tempfile
@@ -1051,7 +1052,10 @@ class TestModalityRequestGrouping(unittest.TestCase):
         )
         self.assertNotIn("text", text_body)
         self.assertEqual(["rendered one", "rendered two"], image_body["text"])
-        self.assertEqual([[image_bytes], [image_bytes]], image_body["image_data"])
+        (uri,) = image_body["image_data"][0]
+        self.assertTrue(uri.startswith("data:image/jpeg;base64,"))
+        self.assertEqual(image_bytes, base64.b64decode(uri.split(",", 1)[1]))
+        self.assertEqual(2, len(image_body["image_data"]))
         self.assertNotIn("input_ids", image_body)
         self.assertEqual(2, len(image_body["spec_capture"]))
         self.assertEqual(2, len(image_body["extra_key"]))

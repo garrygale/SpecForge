@@ -12,12 +12,22 @@ feature contract is unchanged).
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 from typing import Any, Callable, Optional
 
 MODALITY = "image"
+
+_MIME = {
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "webp": "image/webp",
+    "gif": "image/gif",
+    "bmp": "image/bmp",
+}
 
 
 def load_processor(config):
@@ -132,8 +142,8 @@ class ImageTextAdapter:
                 "must be expanded by the processor at map time"
             )
         processor = load_processor(config)
-        image_token = getattr(processor, "image_token", None) or "<|image_pad|>"
         tokenizer = input_tools
+        image_token = getattr(processor, "image_token", None) or "<|image_pad|>"
         placeholder = image_token
         vision_start = getattr(processor, "vision_start_token", None) or getattr(
             tokenizer, "vision_start_token", None
@@ -181,6 +191,7 @@ class ImageTextAdapter:
             minimum_valid_tokens=min_loss_tokens,
             loss_mask_filter=self._loss_mask_filter,
             image_placeholder=placeholder,
+            image_token=image_token,
         )
         return MMPromptSequence(
             processed,
@@ -205,9 +216,10 @@ class ImageTextAdapter:
     def build_request_inputs(self, tasks):
         """One homogeneous group -> model-input fields for one server call.
 
-        Image tasks travel as rendered ``text`` + raw ``image_data`` bytes
-        (read from disk here, lazily); the server-side processor expands them
-        exactly like the local expansion that produced ``input_ids``. Text
+        Image tasks travel as rendered ``text`` (placeholder intact; the
+        server-side processor expands it exactly like the local expansion
+        that produced ``input_ids``) plus ``image_data`` base64 data URIs --
+        JSON-safe, since the transport POSTs the whole body as JSON. Text
         tasks keep the exact-token ``input_ids`` transport.
         """
         payload_images = [task.payload.get("image") for task in tasks]
@@ -226,7 +238,12 @@ class ImageTextAdapter:
             rel = task.payload["image"]
             path = rel if os.path.isabs(rel) else os.path.join(self._image_root(), rel)
             with open(path, "rb") as fh:
-                image_data.append([fh.read()])
+                data = fh.read()
+            ext = os.path.splitext(rel)[1].lstrip(".").lower()
+            mime = _MIME.get(ext, "image/jpeg")
+            image_data.append(
+                [f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"]
+            )
         return {"text": texts, "image_data": image_data}
 
     def _image_root(self) -> str:

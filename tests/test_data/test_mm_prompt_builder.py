@@ -1,9 +1,11 @@
 # coding=utf-8
 """Unit tests for the mixed text/image prompt pipeline (no network, fakes only).
 
-The fake tokenizer is char-level (``id = ord(c) % 1000``) so prefix
-re-encoding is exactly consistent; the fake processor expands one ``IMG``
-placeholder into a fixed 4-token grid, mirroring Qwen-VL style expansion.
+The fake tokenizer is char-level (``id = ord(c) % 1000``) with the image
+placeholder as one special token id -- mirroring real VLM tokenizers -- so
+prefix re-encoding is exactly consistent. The fake processor expands one
+``IMG`` placeholder into IMG_GRID copies of that id, mirroring Qwen-VL style
+string-level expansion.
 """
 
 import gc
@@ -24,7 +26,20 @@ from specforge.algorithms.common.image_input import (
     mm_prompt_cache_key,
 )
 
-IMG_TOKENS = [9001, 9002, 9003, 9004]
+IMG_ID = 7331
+IMG_GRID = 4
+
+
+def _char_ids(text):
+    ids, i = [], 0
+    while i < len(text):
+        if text.startswith("IMG", i):
+            ids.append(IMG_ID)
+            i += 3
+        else:
+            ids.append(ord(text[i]) % 1000)
+            i += 1
+    return ids
 
 
 class FakeTokenizer:
@@ -41,7 +56,7 @@ class FakeTokenizer:
         return "".join(parts)
 
     def encode(self, text, add_special_tokens=False, **kwargs):
-        ids = [ord(c) % 1000 for c in text]
+        ids = _char_ids(text)
         max_length = kwargs.get("max_length")
         return ids[:max_length] if max_length else ids
 
@@ -53,7 +68,7 @@ class FakeTokenizer:
         return_tensors=None,
         add_special_tokens=False,
     ):
-        ids = [ord(c) % 1000 for c in text]
+        ids = _char_ids(text)
         if truncation and max_length:
             ids = ids[:max_length]
         return SimpleNamespace(input_ids=torch.tensor([ids]))
@@ -69,7 +84,7 @@ class FakeProcessor:
         i = 0
         while i < len(text):
             if text.startswith(self.image_token, i):
-                ids.extend(IMG_TOKENS)
+                ids.extend([IMG_ID] * IMG_GRID)
                 i += len(self.image_token)
             else:
                 ids.append(ord(text[i]) % 1000)
@@ -169,10 +184,9 @@ class TestMMPromptBuilder(unittest.TestCase):
         self.assertEqual(len(ids), len(mask))
         # the placeholder was expanded into the image token grid, and the
         # grid is prompt-side (masked out)
-        for token in IMG_TOKENS:
-            self.assertIn(token, ids)
+        self.assertEqual(IMG_GRID, ids.count(IMG_ID))
         for token, flagged in zip(ids, mask):
-            if token in IMG_TOKENS:
+            if token == IMG_ID:
                 self.assertEqual(0, flagged)
         # char-level tokenizer: the assistant span plus the end-of-turn
         # token is supervised (the model must learn to emit it)
@@ -319,7 +333,14 @@ class TestBuildRequestInputs(unittest.TestCase):
         image = self._task("t1", image="img.jpg", prompt_text="rendered", ids=[9, 8])
         inputs = self.adapter.build_request_inputs([image])
         self.assertEqual(["rendered"], inputs["text"])
-        self.assertEqual([[b"\xff\xd8jpeg-bytes"]], inputs["image_data"])
+        # JSON-safe data URIs: the transport POSTs the whole body as JSON
+        (uri,) = inputs["image_data"][0]
+        self.assertTrue(uri.startswith("data:image/jpeg;base64,"))
+        import base64
+
+        self.assertEqual(
+            b"\xff\xd8jpeg-bytes", base64.b64decode(uri.split(",", 1)[1])
+        )
         self.assertNotIn("input_ids", inputs)
 
         text = self._task("t0", ids=[1, 2, 3])
@@ -335,6 +356,132 @@ class TestBuildRequestInputs(unittest.TestCase):
                     self._task("t1", image="img.jpg", prompt_text="p"),
                 ]
             )
+
+
+class FileCountingProcessor(FakeProcessor):
+    """FakeProcessor that logs every call to a file (spawn-safe counting)."""
+
+    def __init__(self, counter_path):
+        self.counter_path = counter_path
+
+    def __call__(self, text, images, **kwargs):
+        with open(self.counter_path, "a", encoding="utf-8") as fh:
+            fh.write("1")
+        return super().__call__(text, images, **kwargs)
+
+
+class NonStringLevelProcessor(FakeTokenizer):
+    """Processor whose expansion is NOT the string-level form: the expanded
+    ids disagree with tokenizing the placeholder-repeated text, forcing the
+    per-prefix processor fallback."""
+
+    image_token = "IMG"
+
+    def __call__(self, text, images, **kwargs):
+        t = text if isinstance(text, str) else text[0]
+        ids = [9900] + [ord(c) % 1000 for c in t.replace("IMG", "", 1)]
+        return {"input_ids": [ids]}
+
+
+class TestProcessorCallBudget(unittest.TestCase):
+    """The map must run full image preprocessing once per unique image."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        Image.new("RGB", (4, 4), (0, 0, 255)).save(
+            os.path.join(self.root, "shared.png")
+        )
+        self.counter = os.path.join(self.root, "calls.txt")
+        open(self.counter, "w").close()
+        self.processor = FileCountingProcessor(self.counter)
+        self._patch = patch.object(
+            image_input, "load_processor", lambda config: self.processor
+        )
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        gc.collect()
+        try:
+            self.tmp.cleanup()
+        except PermissionError:
+            pass
+
+    def _config(self):
+        return SimpleNamespace(
+            data=SimpleNamespace(
+                train_data_path=os.path.join(self.root, "rows.jsonl"),
+                prompts_path="",
+                image_root=self.root,
+                chat_template="qwen",
+                max_length=256,
+                is_preformatted=False,
+                train_only_last_turn=False,
+                max_prompts=None,
+                cache_dir=os.path.join(self.root, "cache"),
+                cache_key=None,
+                build_dataset_num_proc=1,
+            ),
+            model=SimpleNamespace(
+                target_model_path="fake/vlm",
+                cache_dir=None,
+                trust_remote_code=False,
+                tokenizer_pad_token_id=0,
+            ),
+        )
+
+    def _calls(self):
+        with open(self.counter, encoding="utf-8") as fh:
+            return len(fh.read())
+
+    def test_one_processor_call_per_unique_image(self):
+        rows = [
+            _mm_row("a", "question one", "answer one", image="shared.png"),
+            _mm_row("b", "question two", "answer two", image="shared.png"),
+            _mm_row("c", "question three", "answer three", image="shared.png"),
+            _mm_row("t", "plain", "words", image=None),
+        ]
+        with open(os.path.join(self.root, "rows.jsonl"), "w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+        prompts = ImageTextAdapter().prepare_prompts(
+            self._config(), FakeTokenizer(), draft_config=None
+        )
+        self.assertEqual(4, len(prompts))
+        eot = len("<|im_end|>\n")
+        for prompt in prompts:
+            payload = prompt["payload"]
+            if payload["image"]:
+                content = (
+                    "answer one"
+                    if "one" in payload["prompt_text"]
+                    else "answer two"
+                    if "two" in payload["prompt_text"]
+                    else "answer three"
+                )
+                self.assertEqual(len(content) + eot, sum(payload["loss_mask"]))
+        # exactly one full-preprocessing call for the single shared image
+        self.assertEqual(1, self._calls())
+
+    def test_non_string_level_expansion_falls_back_to_processor_prefixes(self):
+        fallback = patch.object(
+            image_input, "load_processor", lambda config: NonStringLevelProcessor()
+        )
+        with fallback:
+            rows = [_mm_row("x", "q", "resp", image="shared.png")]
+            with open(
+                os.path.join(self.root, "rows.jsonl"), "w", encoding="utf-8"
+            ) as fh:
+                for row in rows:
+                    fh.write(json.dumps(row) + "\n")
+            prompts = ImageTextAdapter().prepare_prompts(
+                self._config(), FakeTokenizer(), draft_config=None
+            )
+        payload = prompts[0]["payload"]
+        # slow path: full call + one prefix pair per assistant span
+        self.assertEqual(len("resp") + len("<|im_end|>\n"), sum(payload["loss_mask"]))
+        self.assertIn("IMG", payload["prompt_text"])
 
 
 if __name__ == "__main__":
