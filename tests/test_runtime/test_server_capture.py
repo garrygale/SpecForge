@@ -1007,6 +1007,7 @@ class TestModalityRequestGrouping(unittest.TestCase):
         adapter = image_streaming_adapter()(
             SimpleNamespace(data=SimpleNamespace(image_root=image_dir))
         )
+        adapter._image_token_id = 151655  # any id; task ids contain no run
         tasks = [
             _task(0, 4),
             self._image_task(1, 5, image_name, "rendered one"),

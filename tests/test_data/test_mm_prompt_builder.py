@@ -60,6 +60,9 @@ class FakeTokenizer:
         max_length = kwargs.get("max_length")
         return ids[:max_length] if max_length else ids
 
+    def convert_tokens_to_ids(self, token):
+        return IMG_ID if token == "IMG" else None
+
     def __call__(
         self,
         text,
@@ -144,6 +147,8 @@ class TestMMPromptBuilder(unittest.TestCase):
             cache_dir=self.cache_dir,
             cache_key=None,
             build_dataset_num_proc=1,
+            image_min_pixels=None,
+            image_max_pixels=None,
         )
         data.update(overrides)
         return SimpleNamespace(
@@ -305,8 +310,15 @@ class TestBuildRequestInputs(unittest.TestCase):
             fh.write(b"\xff\xd8jpeg-bytes")
         factory = image_streaming_adapter()
         self.adapter = factory(
-            SimpleNamespace(data=SimpleNamespace(image_root=self.root))
+            SimpleNamespace(
+                data=SimpleNamespace(
+                    image_root=self.root,
+                    image_min_pixels=None,
+                    image_max_pixels=None,
+                )
+            )
         )
+        self.adapter._image_token_id = IMG_ID
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -416,6 +428,8 @@ class TestProcessorCallBudget(unittest.TestCase):
                 cache_dir=os.path.join(self.root, "cache"),
                 cache_key=None,
                 build_dataset_num_proc=1,
+                image_min_pixels=None,
+                image_max_pixels=None,
             ),
             model=SimpleNamespace(
                 target_model_path="fake/vlm",
@@ -476,6 +490,129 @@ class TestProcessorCallBudget(unittest.TestCase):
         # slow path: full call + one prefix pair per assistant span
         self.assertEqual(len("resp") + len("<|im_end|>\n"), sum(payload["loss_mask"]))
         self.assertIn("IMG", payload["prompt_text"])
+
+
+class BoundedFakeProcessor(FakeProcessor):
+    """FakeProcessor with a Qwen-style image_processor pixel config."""
+
+    def __init__(self):
+        self.image_processor = SimpleNamespace(
+            min_pixels=4 * 28 * 28, max_pixels=16384 * 28 * 28
+        )
+
+
+class TestPixelBoundsAndPlaceholderForm(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        with open(os.path.join(self.root, "img.png"), "wb") as fh:
+            fh.write(b"\x89PNG-bytes")
+
+    def tearDown(self):
+        gc.collect()
+        try:
+            self.tmp.cleanup()
+        except PermissionError:
+            pass
+
+    def _adapter(self):
+        adapter = image_streaming_adapter()(
+            SimpleNamespace(
+                data=SimpleNamespace(
+                    image_root=self.root,
+                    image_min_pixels=None,
+                    image_max_pixels=None,
+                )
+            )
+        )
+        adapter._image_token_id = IMG_ID
+        return adapter
+
+    def test_pixel_bounds_applied_and_keyed(self):
+        processor = BoundedFakeProcessor()
+        with patch.object(image_input, "load_processor", lambda config: processor):
+            adapter = ImageTextAdapter()
+            config = SimpleNamespace(
+                data=SimpleNamespace(
+                    image_min_pixels=56 * 56,
+                    image_max_pixels=1280 * 28 * 28,
+                )
+            )
+            from specforge.algorithms.common.image_input import _apply_pixel_bounds
+
+            _apply_pixel_bounds(processor, config)
+        self.assertEqual(56 * 56, processor.image_processor.min_pixels)
+        self.assertEqual(1280 * 28 * 28, processor.image_processor.max_pixels)
+
+        # a processor without pixel support fails loud when bounds are set
+        plain = FakeProcessor()
+        with self.assertRaisesRegex(ValueError, "does not expose"):
+            _apply_pixel_bounds(
+                plain,
+                SimpleNamespace(
+                    data=SimpleNamespace(
+                        image_min_pixels=1, image_max_pixels=None
+                    )
+                ),
+            )
+
+    def test_pixel_bounds_change_cache_key(self):
+        self._write_one_row()
+        base = SimpleNamespace(
+            data=SimpleNamespace(
+                train_data_path=os.path.join(self.root, "row.jsonl"),
+                prompts_path="",
+                image_root=self.root,
+                chat_template="qwen",
+                max_length=256,
+                is_preformatted=False,
+                train_only_last_turn=False,
+                max_prompts=None,
+                image_min_pixels=None,
+                image_max_pixels=None,
+            ),
+            model=SimpleNamespace(target_model_path="fake/vlm"),
+        )
+        tok = FakeTokenizer()
+        proc = FakeProcessor()
+        key = mm_prompt_cache_key(base, tokenizer=tok, processor=proc)
+        base.data.image_max_pixels = 1280 * 28 * 28
+        self.assertNotEqual(
+            key, mm_prompt_cache_key(base, tokenizer=tok, processor=proc)
+        )
+
+    def test_request_collapses_grid_to_one_placeholder(self):
+        adapter = self._adapter()
+        image = SimpleNamespace(
+            payload={
+                "input_ids": [1, IMG_ID, IMG_ID, IMG_ID, IMG_ID, 2, 3],
+                "loss_mask": [0, 0, 0, 0, 0, 1, 1],
+                "image": "img.png",
+                "prompt_text": "unused-at-request-time",
+            }
+        )
+        inputs = adapter.build_request_inputs([image])
+        self.assertEqual([[1, IMG_ID, 2, 3]], inputs["input_ids"])
+        (uri,) = inputs["image_data"][0]
+        self.assertTrue(uri.startswith("data:image/png;base64,"))
+
+        text = SimpleNamespace(
+            payload={
+                "input_ids": [1, IMG_ID, 2],
+                "loss_mask": [0, 1, 1],
+                "image": None,
+                "prompt_text": None,
+            }
+        )
+        inputs = adapter.build_request_inputs([text])
+        self.assertNotIn("image_data", inputs)
+
+    def _write_one_row(self):
+        from PIL import Image as PILImage
+
+        PILImage.new("RGB", (4, 4)).save(os.path.join(self.root, "img.png"))
+        with open(os.path.join(self.root, "row.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(_mm_row("a", "q", "a", image="img.png")))
 
 
 if __name__ == "__main__":

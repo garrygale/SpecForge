@@ -82,9 +82,52 @@ def mm_prompt_cache_key(config, *, tokenizer, processor) -> str:
         "target_model": config.model.target_model_path,
         "input_modality": MODALITY,
         "image_root": config.data.image_root,
+        "image_min_pixels": config.data.image_min_pixels,
+        "image_max_pixels": config.data.image_max_pixels,
         "processor": _processor_identity(processor),
     }
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
+def _collapse_image_tokens(ids, image_token_id):
+    """Replace each run of image-token ids with a single occurrence (the
+    server expands one placeholder per image into its grid)."""
+    out = []
+    in_run = False
+    for token in ids:
+        if token == image_token_id:
+            if not in_run:
+                out.append(token)
+                in_run = True
+        else:
+            in_run = False
+            out.append(token)
+    return out
+
+
+def _apply_pixel_bounds(processor, config):
+    min_pixels = config.data.image_min_pixels
+    max_pixels = config.data.image_max_pixels
+    if min_pixels is None and max_pixels is None:
+        return
+    image_processor = getattr(processor, "image_processor", None)
+    supported = {
+        "min_pixels": getattr(image_processor, "min_pixels", None),
+        "max_pixels": getattr(image_processor, "max_pixels", None),
+    }
+    if image_processor is None or (
+        min_pixels is not None and supported["min_pixels"] is None
+    ) or (max_pixels is not None and supported["max_pixels"] is None):
+        raise ValueError(
+            "data.image_min_pixels/image_max_pixels are set but the "
+            f"processor {type(processor).__name__} does not expose them; "
+            "unset the config values or use a processor that supports "
+            "pixel bounds"
+        )
+    if min_pixels is not None:
+        image_processor.min_pixels = min_pixels
+    if max_pixels is not None:
+        image_processor.max_pixels = max_pixels
 
 
 class ImageTextAdapter:
@@ -145,6 +188,14 @@ class ImageTextAdapter:
         processor = load_processor(config)
         tokenizer = input_tools
         image_token = getattr(processor, "image_token", None) or "<|image_pad|>"
+        _apply_pixel_bounds(processor, config)
+        image_token_id = tokenizer.convert_tokens_to_ids(image_token)
+        if image_token_id is None or image_token_id == tokenizer.unk_token_id:
+            raise ValueError(
+                f"target tokenizer has no id for the image token {image_token!r}; "
+                "cannot build multimodal requests"
+            )
+        self._image_token_id = int(image_token_id)
         placeholder = image_token
         vision_start = getattr(processor, "vision_start_token", None) or getattr(
             tokenizer, "vision_start_token", None
@@ -209,15 +260,27 @@ class ImageTextAdapter:
     def build_request_inputs(self, tasks):
         """One request body for any mix of text and image tasks.
 
-        Every task travels as exact-token ``input_ids``. Image tasks carry
-        the processor-EXPANDED ids (image grid tokens included) plus their
-        image as a base64 data URI; the server injects vision embeddings at
-        the image-token positions -- the standard pre-tokenized multimodal
-        request (verl-style), which also works for engines launched with
-        ``--skip-tokenizer-init`` that reject text prompts.
+        Every task travels as ``input_ids`` with exactly ONE image
+        placeholder token per image (the server expands it per its own
+        grid -- the pre-tokenized multimodal contract, which never trips
+        the decode+retokenize fallback). Image tasks add their image as a
+        base64 data URI. The payload keeps the fully expanded ids for the
+        trainer; alignment with the server's expansion is enforced by the
+        capture seq-length guard.
         """
+        image_token_id = getattr(self, "_image_token_id", None)
+        if image_token_id is None:
+            raise RuntimeError(
+                "image token id is unresolved; prepare_prompts must run "
+                "before requests are built"
+            )
         payload_images = [task.payload.get("image") for task in tasks]
-        input_ids = [list(task.payload["input_ids"]) for task in tasks]
+        input_ids = [
+            list(task.payload["input_ids"])
+            if not image
+            else _collapse_image_tokens(task.payload["input_ids"], image_token_id)
+            for task, image in zip(tasks, payload_images)
+        ]
         if not any(payload_images):
             return {"input_ids": input_ids}
         image_data = []

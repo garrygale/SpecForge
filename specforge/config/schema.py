@@ -148,6 +148,12 @@ class DataConfig(StrictConfigModel):
     #: data (model.input_modality="image"). Image bytes are read from disk
     #: lazily and never enter the tokenization cache.
     image_root: str = ""
+    #: Multimodal processor pixel bounds. MUST equal the capture server's
+    #: --mm-min-pixels/--mm-max-pixels: they decide the image token grid, so
+    #: any local/server disagreement shifts the expansion and the captured
+    #: sequence no longer matches the prepared input_ids.
+    image_min_pixels: Optional[int] = Field(default=None, gt=0)
+    image_max_pixels: Optional[int] = Field(default=None, gt=0)
     build_dataset_num_proc: int = Field(default=8, gt=0)
     #: Ordered background feature-loader workers. ``None`` preserves the
     #: former strategy defaults (EAGLE/P-EAGLE=4, DFlash-family=8).
