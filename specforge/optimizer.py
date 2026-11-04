@@ -52,6 +52,123 @@ def split_params_for_muon(named_params, vocab_dims=(), name_hints=()):
     return muon, adamw
 
 
+_NS_A, _NS_B, _NS_C = 3.4445, -4.7750, 2.0315
+
+
+def _ns_orthogonalize(mat, ns_steps, eps):
+    """Newton-Schulz quintic, semantically identical to torch.optim.Muon's
+    (Frobenius-normalized, computed in bf16, transposed to the short side)."""
+    x = mat.bfloat16()
+    transposed = x.size(0) > x.size(1)
+    if transposed:
+        x = x.T
+    x = x / x.norm().clamp(min=eps)
+    for _ in range(ns_steps):
+        gram = x @ x.T
+        gram_update = torch.addmm(gram, gram, gram, beta=_NS_B, alpha=_NS_C)
+        x = torch.addmm(x, gram_update, x, beta=_NS_A)
+    if transposed:
+        x = x.T
+    return x
+
+
+class _VariantMuon(torch.optim.Optimizer):
+    """Muon with a replaceable post-orthogonalization update rule.
+
+    Momentum (damped lerp), nesterov, the NS quintic and decoupled weight
+    decay replicate torch.optim.Muon step-for-step, so an A/B against the
+    vanilla arm isolates exactly one delta. The variant replaces what
+    happens between NS and the final scaled add:
+
+    ``normuon`` (arXiv 2510.05491): divide the orthogonalized update by the
+    sqrt of a per-row EMA of its squared entries, then RMS-align. ``adamuon``
+    (arXiv 2507.11005): same skeleton with an element-wise second moment,
+    plus the paper's Sign transform before NS (its Thm 1 admissible
+    transform). Both papers align the update to RMS 0.2 through the actual
+    Frobenius norm 0.2*sqrt(m*n)/||O||_F rather than a shape formula, so the
+    variant redistributes update mass but never changes its global scale.
+    """
+
+    def __init__(
+        self,
+        params,
+        *,
+        lr,
+        variant,
+        momentum=0.95,
+        nesterov=True,
+        weight_decay=0.0,
+        ns_steps=5,
+        beta2=0.95,
+        eps=1e-8,
+        ns_eps=1e-7,
+    ):
+        if variant not in ("normuon", "adamuon"):
+            raise ValueError(f"unknown muon variant {variant!r}")
+        defaults = dict(
+            lr=lr,
+            variant=variant,
+            momentum=momentum,
+            nesterov=nesterov,
+            weight_decay=weight_decay,
+            ns_steps=ns_steps,
+            beta2=beta2,
+            eps=eps,
+            ns_eps=ns_eps,
+        )
+        super().__init__(params, defaults)
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.ndim != 2:
+                    raise ValueError(
+                        f"_VariantMuon only supports 2D parameters, got "
+                        f"{tuple(p.shape)}"
+                    )
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            beta2 = group["beta2"]
+            eps = group["eps"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if not state:
+                    state["momentum_buffer"] = torch.zeros_like(
+                        p.grad, memory_format=torch.preserve_format
+                    )
+                buf = state["momentum_buffer"]
+                buf.lerp_(p.grad, 1 - momentum)
+                update = p.grad.lerp(buf, momentum) if group["nesterov"] else buf
+                if group["variant"] == "adamuon":
+                    update = update.sign()
+                update = _ns_orthogonalize(update, group["ns_steps"], group["ns_eps"])
+                # the variance statistic both variants divide by
+                squared = update.float().pow(2)
+                if group["variant"] == "normuon":
+                    stat = squared.mean(dim=1, keepdim=True)
+                else:
+                    stat = squared
+                if "second_moment" not in state:
+                    state["second_moment"] = torch.zeros_like(stat)
+                v = state["second_moment"]
+                v.mul_(beta2).add_(stat, alpha=1 - beta2)
+                update = update.float() / (v.sqrt() + eps)
+                # RMS-align through the actual norm (both papers), keeping
+                # update RMS at 0.2 so AdamW-tuned lr transfer is preserved
+                scale = 0.2 * math.sqrt(p.numel()) / update.norm().clamp(min=eps)
+                p.mul_(1 - lr * group["weight_decay"])
+                p.add_(update, alpha=-lr * scale)
+        return loss
+
+
 class BF16Optimizer:
     """AdamW — optionally Muon for the 2D hidden matrices — over fp32 master
     copies of the bf16 trainable params, with grad clipping and configurable
@@ -76,6 +193,8 @@ class BF16Optimizer:
         muon_ns_steps=5,
         muon_adjust_lr="match_rms_adamw",
         muon_adamw_name_hints=(),
+        muon_variant="vanilla",
+        muon_beta2=0.95,
     ):
         # defaults copied from EAGLE traineagle3 ds_config.json
         self.model = model
@@ -89,6 +208,7 @@ class BF16Optimizer:
                 "expected 'adamw' or 'muon'"
             )
         self.optimizer_type = optimizer_type
+        self.muon_variant = "vanilla"
         self.lr = lr
         self.muon_optimizer = None
         self.max_grad_norm = max_grad_norm
@@ -114,6 +234,8 @@ class BF16Optimizer:
                 muon_ns_steps=muon_ns_steps,
                 muon_adjust_lr=muon_adjust_lr,
                 muon_adamw_name_hints=muon_adamw_name_hints,
+                muon_variant=muon_variant,
+                muon_beta2=muon_beta2,
             )
         self.optimizer = torch.optim.AdamW(
             adamw_masters, lr=lr, weight_decay=weight_decay
@@ -159,9 +281,16 @@ class BF16Optimizer:
         muon_ns_steps,
         muon_adjust_lr,
         muon_adamw_name_hints,
+        muon_variant,
+        muon_beta2,
     ):
         """Create the Muon inner optimizer over the 2D-matrix master subset
         and return the remaining masters for the AdamW fallback."""
+        if muon_variant not in ("vanilla", "normuon", "adamuon"):
+            raise ValueError(
+                f"unsupported muon_variant={muon_variant!r}; expected one of "
+                "'vanilla', 'normuon' or 'adamuon'"
+            )
         try:
             from torch.optim import Muon
         except ImportError as exc:
@@ -195,16 +324,38 @@ class BF16Optimizer:
                 "this model cannot be trained in muon mode"
             )
         self._muon_lr_base = lr if muon_lr is None else muon_lr
+        self.muon_variant = muon_variant
         if muon_masters:
-            self.muon_optimizer = Muon(
-                muon_masters,
-                lr=self._muon_lr_base,
-                momentum=muon_momentum,
-                nesterov=muon_nesterov,
-                weight_decay=muon_weight_decay,
-                ns_steps=muon_ns_steps,
-                adjust_lr_fn=muon_adjust_lr,
-            )
+            if muon_variant == "vanilla":
+                self.muon_optimizer = Muon(
+                    muon_masters,
+                    lr=self._muon_lr_base,
+                    momentum=muon_momentum,
+                    nesterov=muon_nesterov,
+                    weight_decay=muon_weight_decay,
+                    ns_steps=muon_ns_steps,
+                    adjust_lr_fn=muon_adjust_lr,
+                )
+            else:
+                # the papers' variants hardcode the match_rms_adamw-style
+                # 0.2 RMS target inside their update rules
+                if muon_adjust_lr != "match_rms_adamw":
+                    raise ValueError(
+                        f"muon_variant={muon_variant!r} bakes the "
+                        "match_rms_adamw 0.2 update-RMS target into its "
+                        "update rule; muon_adjust_lr must stay "
+                        "'match_rms_adamw'"
+                    )
+                self.muon_optimizer = _VariantMuon(
+                    muon_masters,
+                    lr=self._muon_lr_base,
+                    variant=muon_variant,
+                    momentum=muon_momentum,
+                    nesterov=muon_nesterov,
+                    weight_decay=muon_weight_decay,
+                    ns_steps=muon_ns_steps,
+                    beta2=muon_beta2,
+                )
         else:
             breakdown = {
                 "not 2D": 0,
@@ -235,9 +386,10 @@ class BF16Optimizer:
         muon_numel = sum(p.numel() for _, p in muon_named)
         adamw_numel = sum(p.numel() for _, p in adamw_named)
         summary = (
-            f"Muon param split: muon {len(muon_named)} params / "
-            f"{muon_numel / 1e6:.2f}M elements, adamw {len(adamw_named)} "
-            f"params / {adamw_numel / 1e6:.2f}M elements"
+            f"Muon param split (variant={muon_variant}): muon "
+            f"{len(muon_named)} params / {muon_numel / 1e6:.2f}M elements, "
+            f"adamw {len(adamw_named)} params / "
+            f"{adamw_numel / 1e6:.2f}M elements"
         )
         listing = ["Muon param split:"]
         listing += [f"  muon  {name} {tuple(p.shape)}" for name, p in muon_named]
@@ -432,6 +584,14 @@ class BF16Optimizer:
                 "differ between the two, so resuming across optimizer types "
                 "is not supported"
             )
+        saved_variant = state_dict.get("muon_variant", "vanilla")
+        if saved_variant != self.muon_variant:
+            raise ValueError(
+                f"checkpoint muon variant was {saved_variant!r} but this run "
+                f"uses muon_variant={self.muon_variant!r}; the update rules "
+                "carry different optimizer state, so resuming across "
+                "variants is not supported"
+            )
         # offload_master is a pure device-placement choice: restored fp32
         # masters and Adam moments are relocated to the current master device,
         # so toggling it on resume is safe and intentionally not gated here.
@@ -494,6 +654,7 @@ class BF16Optimizer:
             "lr_scheduler_type": self.lr_scheduler_type,
             "warmup_type": self.warmup_type,
             "optimizer_type": self.optimizer_type,
+            "muon_variant": self.muon_variant,
             "max_grad_norm": self.max_grad_norm,
             # rank-local fp32 masters; without them a resume re-quantizes from bf16
             "fp32_params": [t.detach().to("cpu", copy=True) for t in self.fp32_params],

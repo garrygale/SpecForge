@@ -259,6 +259,16 @@ Common fields:
 | `training.warmup_type` | `linear` | Warmup ramp shape: `linear` (`t/T`) or `cosine` (`0.5*(1-cos(pi*t/T))`, joins the decay with zero slope instead of the linear kink). |
 | `training.max_grad_norm` | `0.5` | Positive gradient-clipping norm. |
 | `training.optimizer_cpu_offload` | `false` | Keep the optimizer's FP32 master parameters and Adam state on CPU. |
+| `training.optimizer` | `adamw` | `adamw`, or `muon` to route the 2D hidden matrices through `torch.optim.Muon` (Newton-Schulz orthogonalized momentum) with everything else on AdamW. Requires torch>=2.9 and `fsdp_sharding: NO_SHARD`. |
+| `training.muon_lr` | `null` | Muon-group learning rate; `null` reuses `learning_rate` (the `match_rms_adamw` update scaling makes AdamW-tuned lr transfer). |
+| `training.muon_momentum` | `0.95` | Muon momentum factor in `[0, 1)`. |
+| `training.muon_nesterov` | `true` | Nesterov momentum inside the Muon group. |
+| `training.muon_weight_decay` | `0.0` | Decoupled weight decay inside the Muon group only. Moonlight pairs `0.1` with `match_rms_adamw`. |
+| `training.muon_ns_steps` | `5` | Newton-Schulz iteration count (>= 1). |
+| `training.muon_adjust_lr` | `match_rms_adamw` | Update scaling: `match_rms_adamw` (0.2*sqrt(max(m,n)), Moonlight) or `original` (sqrt(max(1, m/n)), Keller Jordan). |
+| `training.muon_adamw_name_hints` | `[]` | Extra name substrings forcing matching params onto the AdamW group. |
+| `training.muon_variant` | `vanilla` | Muon update-rule variant: `vanilla` (stock `torch.optim.Muon`), `normuon` (per-row RMS statistic EMA on the orthogonalized update, arXiv 2510.05491) or `adamuon` (element-wise second moment plus Sign transform, arXiv 2507.11005). Both variants keep update RMS at 0.2, so lr transfer is unchanged. |
+| `training.muon_beta2` | `0.95` | Second-moment decay for the non-vanilla variants. |
 | `training.attention_backend` | `flex_attention` | `eager`, `sdpa`, `flex_attention`, `fa`, or `usp`; the selected strategy must support it. |
 | `training.tp_size` | `1` | Online disaggregated consumers must keep it at 1; configure target TP on capture servers. Offline non-USP ranks consume disjoint data. |
 | `training.sp_ulysses_size` | `1` | Ulysses sequence-parallel factor for offline EAGLE3 USP. |
