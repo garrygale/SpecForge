@@ -405,6 +405,23 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "warmup_type"):
             Config.model_validate(payload)
 
+    def test_global_loss_denominator_defaults_off(self):
+        payload = _online_payload("domino")
+        payload["training"]["global_loss_denominator"] = True
+
+        config = Config.model_validate(payload)
+
+        self.assertTrue(config.training.global_loss_denominator)
+        self.assertFalse(
+            Config.model_validate(
+                _online_payload("domino")
+            ).training.global_loss_denominator
+        )
+        # non-domino strategies accept the knob too (it is a shared training
+        # field) but no provider consumes it there
+        payload["training"]["strategy"] = "dflash"
+        self.assertTrue(Config.model_validate(payload).training.global_loss_denominator)
+
     def test_tv_is_a_supported_acceptance_loss_type(self):
         payload = _online_payload("dflash")
         payload["training"]["lk_loss_type"] = "tv"

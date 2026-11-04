@@ -669,10 +669,12 @@ class DominoTrainStrategy(DraftTrainStrategy):
         *,
         lambda_start: float = 1.0,
         decay_ratio: float = 0.5,
+        global_loss_denominator: bool = False,
     ) -> None:
         self.domino_model = domino_model
         self.lambda_start = lambda_start
         self.decay_ratio = decay_ratio
+        self.global_loss_denominator = bool(global_loss_denominator)
 
     def trainable_module(self) -> nn.Module:
         return self.domino_model
@@ -716,10 +718,25 @@ class DominoTrainStrategy(DraftTrainStrategy):
             float(lambda_base),
         )
         ratio_metrics = metrics.pop("ratio_metrics", {})
+        loss_terms = None
+        if self.global_loss_denominator:
+            try:
+                denominator = metrics["loss_denominator"].detach().reshape(())
+            except KeyError as exc:
+                raise ValueError(
+                    "global_loss_denominator=True needs the model's "
+                    "'loss_denominator' metric to weight ranks by token count"
+                ) from exc
+            # (loss * local_den, local_den): the trainer backprops the
+            # numerators and rescales by the all-reduced denominator, so each
+            # rank contributes its token-weighted share instead of an equal
+            # share of its local mean (the default rank-mean weighting).
+            loss_terms = (loss.reshape(()) * denominator, denominator)
         return StepOutput(
             loss=loss,
             metrics=metrics,
             ratio_metrics=ratio_metrics,
+            loss_terms=loss_terms,
         )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:

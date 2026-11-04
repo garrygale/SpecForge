@@ -1962,6 +1962,12 @@ class OnlineDominoModel(OnlineDFlashModel):
             # the whole forward stream once per micro-step.
             "lambda_base": float(lambda_base),
             "accuracy_denom": accuracy_denom.detach(),
+            # The denominator every loss branch above divided by; under
+            # ``training.global_loss_denominator`` the strategy pairs it with
+            # the loss so the trainer can weight ranks by token count. Under
+            # opd this equals the accepted-stream denominator (both are the
+            # gated weight_mask sum).
+            "loss_denominator": valid_token_count.detach(),
         }
         if self._mining_stats is not None:
             metrics["ratio_metrics"] = {

@@ -674,6 +674,14 @@ class TrainingConfig(StrictConfigModel):
     dflash2_selector_stop_gradient: bool = False
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
+    #: Normalize the Domino gradient by the all-reduced token denominator
+    #: instead of averaging the per-rank mean losses. Data-parallel ranks
+    #: carry different valid-token counts, so the default rank-mean weighting
+    #: over-weights the small ranks; with this on, the trainer backpropagates
+    #: the local numerator and rescales by ``world_size / global_denominator``
+    #: (exact global token mean, identical to the dflash/mtp loss_terms path).
+    #: Domino only; off by default so pre-existing runs keep their weighting.
+    global_loss_denominator: bool = False
     #: Domino objective: CE/L1(TV) mixing for the base and the corrected
     #: (GRU-suffix) logits. Each toggle selects the objective for that path:
     #: with the toggle on the path minimizes ``ce_alpha * CE + l1_alpha * L1``

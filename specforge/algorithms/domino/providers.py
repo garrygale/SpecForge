@@ -43,6 +43,7 @@ def build_step(
     target_head=None,
     lambda_start=1.0,
     decay_ratio=0.5,
+    global_loss_denominator=False,
 ):
     del target_head
     from specforge.training.strategies.base import DominoTrainStrategy
@@ -51,6 +52,7 @@ def build_step(
         wrapped_model,
         lambda_start=lambda_start,
         decay_ratio=decay_ratio,
+        global_loss_denominator=global_loss_denominator,
     )
 
 
@@ -130,6 +132,15 @@ def resume_contract(config, draft_model, training_model):
             getattr(draft_model.config, "dflash_config", {}).get(
                 "heterogeneous_kv", False
             )
+        ),
+        # Like the warm-up key: recorded only when the global token-mean
+        # weighting is active — every pre-existing checkpoint is rank-mean and
+        # must stay resumable, and flipping the weighting mid-run changes the
+        # gradient semantics, so the resume checker should reject it.
+        **(
+            {"domino_global_loss_denominator": True}
+            if bool(config.training.global_loss_denominator)
+            else {}
         ),
         "domino_lambda_base_start": float(config.training.lambda_base_start),
         "domino_lambda_base_decay_ratio": float(

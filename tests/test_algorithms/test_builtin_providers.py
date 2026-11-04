@@ -179,6 +179,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             compact_teacher_chunk_size=1024,
             lambda_base_start=0.75,
             lambda_base_decay_ratio=0.25,
+            global_loss_denominator=False,
         )
         config = SimpleNamespace(training=training)
         draft = SimpleNamespace(
@@ -286,6 +287,20 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 contract = step.resume_contract(config, draft, models[name])
                 self.assertTrue(expected_keys[name] <= contract.keys())
                 self.assertTrue(all(key.startswith(f"{name}_") for key in contract))
+        # the domino rank->global loss normalization key appears only when the
+        # toggle is on, so every rank-mean checkpoint stays resumable
+        domino_step = self.registry.resolve("domino").providers.step
+        self.assertNotIn(
+            "domino_global_loss_denominator",
+            domino_step.resume_contract(config, draft, models["domino"]),
+        )
+        enabled = SimpleNamespace(**{**vars(config.training), "global_loss_denominator": True})
+        self.assertIn(
+            "domino_global_loss_denominator",
+            domino_step.resume_contract(
+                SimpleNamespace(training=enabled), draft, models["domino"]
+            ),
+        )
 
     def test_step_runtime_config_binds_options_contract_and_missing_key_policy(self):
         step = self.registry.resolve("eagle3").providers.step

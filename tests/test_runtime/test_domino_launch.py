@@ -97,6 +97,58 @@ class TestDominoLambdaSchedule(unittest.TestCase):
             batch.tensors["target_last_hidden_states"],
         )
 
+    def test_global_loss_denominator_toggle_controls_loss_terms(self):
+        from specforge.runtime.contracts import TrainBatch
+        from specforge.training.strategies.base import DominoTrainStrategy, StepContext
+
+        class DiagnosticModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(1.0))
+                self.model_metrics = {
+                    "loss_denominator": torch.tensor(6.0),
+                }
+
+            def forward(self, **kwargs):
+                return self.weight.square(), torch.tensor(0.5), self.model_metrics
+
+        batch = TrainBatch(
+            sample_ids=["sample-0"],
+            strategy="domino",
+            tensors={
+                "input_ids": torch.ones(1, 2, dtype=torch.long),
+                "hidden_states": torch.ones(1, 2, 2),
+                "loss_mask": torch.ones(1, 2),
+            },
+        )
+        model = DiagnosticModel()
+
+        off = DominoTrainStrategy(model)
+        self.assertIsNone(
+            off.forward_loss(batch, StepContext(global_step=1, total_steps=4)).loss_terms
+        )
+
+        on = DominoTrainStrategy(model, global_loss_denominator=True)
+        output = on.forward_loss(
+            batch,
+            StepContext(global_step=1, total_steps=4),
+        )
+        numerator, denominator = output.loss_terms
+        torch.testing.assert_close(denominator, torch.tensor(6.0))
+        torch.testing.assert_close(numerator, model.weight.square() * 6.0)
+        # the metric stays visible as telemetry alongside the loss_terms pair
+        self.assertIn("loss_denominator", output.metrics)
+
+        class DenominatorFreeModel(DiagnosticModel):
+            def forward(self, **kwargs):
+                loss, accuracy, _ = DiagnosticModel.forward(self, **kwargs)
+                return loss, accuracy, {}
+
+        with self.assertRaisesRegex(ValueError, "loss_denominator"):
+            DominoTrainStrategy(
+                DenominatorFreeModel(), global_loss_denominator=True
+            ).forward_loss(batch, StepContext(global_step=1, total_steps=4))
+
 
 @unittest.skipUnless(CUDA, "Domino offline launcher path requires CUDA")
 class TestDominoOfflineLaunch(unittest.TestCase):
