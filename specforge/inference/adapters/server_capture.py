@@ -69,7 +69,13 @@ def _default_post(url: str, json_body: Dict[str, Any], timeout: float):
     import requests
 
     resp = requests.post(url, json=json_body, timeout=timeout)
-    resp.raise_for_status()
+    if not resp.ok:
+        # surface the server's error body -- a batched capture request dies
+        # as a whole when one sample fails server-side, and the body says why
+        raise RuntimeError(
+            f"capture server returned HTTP {resp.status_code} for {url}: "
+            f"{resp.text[:2000]}"
+        )
     return resp.json()
 
 
