@@ -411,9 +411,16 @@ class ManagedLocalStackConfig(StrictConfigModel):
 class DisaggregatedDeploymentConfig(StrictConfigModel):
     """Shared, non-secret topology for producer/consumer launch planning."""
 
-    #: Attempt-scoped shared directory. The launcher derives refs, manifest,
+    #: Attempt-scoped shared directory.  The launcher derives refs, manifest,
     #: and lifecycle markers beneath it.
     control_dir: str
+    #: Per-request HTTP timeout for the producer's batched capture POSTs.
+    #: The server holds the response until the Mooncake sink has durably
+    #: written the whole batch's tensors, which for multimodal captures can
+    #: hold the connection for the full transfer -- raise this (and keep
+    #: proxies out of the path) instead of letting the connection drop and
+    #: the lease retry from scratch. None keeps the adapter default (300 s).
+    capture_timeout_s: Optional[float] = Field(default=None, gt=0)
     #: Optional node-local root for the online consumer SQLite/WAL. When
     #: omitted, the historical control_dir-derived path remains in use.
     consumer_state_dir: Optional[str] = None

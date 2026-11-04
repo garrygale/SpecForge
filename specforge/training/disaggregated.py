@@ -654,6 +654,11 @@ def _build_online(
                 schema=capture_schema,
                 request_input_adapter=input_adapter,
                 target_model_version=cfg.model.target_model_path,
+                timeout_s=(
+                    cfg.deployment.disaggregated.capture_timeout_s
+                    if cfg.deployment.disaggregated.capture_timeout_s is not None
+                    else 300.0
+                ),
             )
             for url in _server_urls(cfg)
         ]
