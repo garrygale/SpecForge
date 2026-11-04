@@ -30,18 +30,15 @@ Online capture needs two patches on top of the installed SGLang, applied **in
 this order**:
 
 ```bash
-# Base capture patch: --enable-spec-capture server flags + the capture sink
+# Capture patch: --enable-spec-capture server flags + the capture sink
+# (Ascend hosts additionally skip the wildcard segment mount that Ascend
+# Mooncake rejects and mount the feature segment with location="cpu"; this
+# keys off ASCEND_RT_VISIBLE_DEVICES at runtime, so one patch stays
+# CUDA-safe)
 bash scripts/apply_sglang_spec_capture_patch.sh
-
-# Ascend companion patch: skip the wildcard segment mount that Ascend
-# Mooncake rejects, and mount the feature segment with location="cpu"
-SGLANG_DIR=$(python -c "import sglang, os; print(os.path.dirname(os.path.dirname(sglang.__file__)))")
-cd "$SGLANG_DIR" && git apply /path/to/SpecForge/patches/sglang/v0.5.18/spec-capture-ascend-mount.patch
 ```
 
-Skip both for offline training, which reads features from disk. The companion
-patch is a no-op on non-Ascend hosts (it keys off `ASCEND_RT_VISIBLE_DEVICES`),
-so a shared installation stays CUDA-safe.
+Skip it for offline training, which reads features from disk.
 
 ### Device visibility on Ascend
 
