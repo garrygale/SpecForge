@@ -318,6 +318,20 @@ class BuiltinProviderContractTest(unittest.TestCase):
             "cosine",
         )
 
+    def test_step_options_keys_are_accepted_by_build(self):
+        # The trainer splats options(config) into build() at strategy
+        # construction; a provider enumerating its build signature must list
+        # every options key or every launch TypeErrors (the f4f44462
+        # decay_type regression). Construct through the real seam on CPU.
+        from specforge.config.schema import TrainingConfig
+
+        for name in BUILTINS:
+            with self.subTest(algorithm=name):
+                step = self.registry.resolve(name).providers.step
+                cfg = SimpleNamespace(training=TrainingConfig(strategy=name))
+                options = dict(step.options(cfg))
+                self.assertIsInstance(step.build(object(), target_head=None, **options), object)
+
     def test_step_runtime_config_binds_options_contract_and_missing_key_policy(self):
         step = self.registry.resolve("eagle3").providers.step
         draft = SimpleNamespace(

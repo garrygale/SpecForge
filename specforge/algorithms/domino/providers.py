@@ -43,6 +43,7 @@ def build_step(
     target_head=None,
     lambda_start=1.0,
     decay_ratio=0.5,
+    decay_type="linear",
     global_loss_denominator=False,
 ):
     del target_head
@@ -52,6 +53,7 @@ def build_step(
         wrapped_model,
         lambda_start=lambda_start,
         decay_ratio=decay_ratio,
+        decay_type=decay_type,
         global_loss_denominator=global_loss_denominator,
     )
 
