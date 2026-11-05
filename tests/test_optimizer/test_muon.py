@@ -748,6 +748,44 @@ class TestAdamwBeta2(unittest.TestCase):
         same.load_state_dict(state)  # matching betas must resume cleanly
 
 
+class TestTypedConfigWiring(unittest.TestCase):
+    """The factory must consume the real pydantic TrainingConfig, not only
+    SimpleNamespace stubs: a schema field that was never wired into the
+    factory stays invisible to the stubs (the warmup_type incident)."""
+
+    def test_unknown_training_field_rejected(self):
+        from pydantic import ValidationError
+
+        from specforge.config.schema import TrainingConfig
+
+        with self.assertRaises(ValidationError):
+            TrainingConfig(adamw_beta2=0.95, not_a_real_field=1)
+
+    @unittest.skipUnless(TORCH_HAS_MUON, "torch>=2.9 required for torch.optim.Muon")
+    def test_optimizer_fields_survive_the_typed_entry(self):
+        from specforge.config.schema import TrainingConfig
+        from specforge.training.assembly import _ConfiguredOptimizerFactory
+
+        training = TrainingConfig(
+            learning_rate=1e-3,
+            fsdp_sharding="NO_SHARD",
+            optimizer="muon",
+            muon_variant="adamuon",
+            adamw_beta2=0.95,
+            warmup_type="cosine",
+            total_steps=100,
+        )
+        optimizer = _ConfiguredOptimizerFactory(SimpleNamespace(training=training))(
+            _TinyTrainable()
+        )
+        self.assertEqual(
+            tuple(optimizer.optimizer.param_groups[0]["betas"]), (0.9, 0.95)
+        )
+        self.assertIsInstance(optimizer.muon_optimizer, _VariantMuon)
+        self.assertEqual(optimizer.muon_variant, "adamuon")
+        self.assertEqual(optimizer.warmup_type, "cosine")
+
+
 def _training_cfg(**overrides):
     base = dict(
         learning_rate=1e-3,
