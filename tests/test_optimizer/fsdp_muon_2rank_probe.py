@@ -81,6 +81,7 @@ def _training_cfg(**overrides):
         muon_adamw_name_hints=[],
         muon_variant="vanilla",
         muon_beta2=0.95,
+        adamw_beta2=0.999,
     )
     base.update(overrides)
     return SimpleNamespace(**base)

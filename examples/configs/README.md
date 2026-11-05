@@ -269,6 +269,7 @@ Common fields:
 | `training.muon_adamw_name_hints` | `[]` | Extra name substrings forcing matching params onto the AdamW group. |
 | `training.muon_variant` | `vanilla` | Muon update-rule variant: `vanilla` (stock `torch.optim.Muon`), `normuon` (per-row RMS statistic EMA on the orthogonalized update, arXiv 2510.05491) or `adamuon` (element-wise second moment plus Sign transform, arXiv 2507.11005). Both variants keep update RMS at 0.2, so lr transfer is unchanged. |
 | `training.muon_beta2` | `0.95` | Second-moment decay for the non-vanilla variants. |
+| `training.adamw_beta2` | `0.999` | AdamW second-moment decay: the fallback group under `optimizer: muon`, the whole optimizer otherwise. `(0.9, 0.95)` is the LLM-era convention used by NorMuon and SpecOPD draft recipes. Resuming across values is rejected. |
 | `training.attention_backend` | `flex_attention` | `eager`, `sdpa`, `flex_attention`, `fa`, or `usp`; the selected strategy must support it. |
 | `training.tp_size` | `1` | Online disaggregated consumers must keep it at 1; configure target TP on capture servers. Offline non-USP ranks consume disjoint data. |
 | `training.sp_ulysses_size` | `1` | Ulysses sequence-parallel factor for offline EAGLE3 USP. |

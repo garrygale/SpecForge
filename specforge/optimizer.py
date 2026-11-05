@@ -195,6 +195,7 @@ class BF16Optimizer:
         muon_adamw_name_hints=(),
         muon_variant="vanilla",
         muon_beta2=0.95,
+        adamw_beta2=0.999,
     ):
         # defaults copied from EAGLE traineagle3 ds_config.json
         self.model = model
@@ -209,6 +210,7 @@ class BF16Optimizer:
             )
         self.optimizer_type = optimizer_type
         self.muon_variant = "vanilla"
+        self.adamw_beta2 = adamw_beta2
         self.lr = lr
         self.muon_optimizer = None
         self.max_grad_norm = max_grad_norm
@@ -238,7 +240,10 @@ class BF16Optimizer:
                 muon_beta2=muon_beta2,
             )
         self.optimizer = torch.optim.AdamW(
-            adamw_masters, lr=lr, weight_decay=weight_decay
+            adamw_masters,
+            lr=lr,
+            weight_decay=weight_decay,
+            betas=(0.9, adamw_beta2),
         )
         self.last_grad_norm = None
         self._grad_norm_process_group = None
@@ -596,6 +601,15 @@ class BF16Optimizer:
         # masters and Adam moments are relocated to the current master device,
         # so toggling it on resume is safe and intentionally not gated here.
         self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
+        # torch restores the checkpoint's param_groups over ours, so a
+        # changed adamw_beta2 would be silently ignored — fail closed
+        saved_betas = tuple(self.optimizer.param_groups[0]["betas"])
+        if saved_betas != (0.9, self.adamw_beta2):
+            raise ValueError(
+                f"checkpoint AdamW betas {saved_betas} but this run "
+                f"configures (0.9, {self.adamw_beta2}); resuming across "
+                "adamw_beta2 values is not supported"
+            )
         print_on_rank0("Successfully loaded optimizer state_dict.")
         self.scheduler.load_state_dict(state_dict["scheduler_state_dict"])
         print_on_rank0("Successfully loaded scheduler state_dict.")

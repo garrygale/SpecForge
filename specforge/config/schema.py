@@ -594,6 +594,11 @@ class TrainingConfig(StrictConfigModel):
     #: Second-moment decay for the non-vanilla variants (both papers use
     #: 0.95, matching the Muon momentum).
     muon_beta2: float = Field(default=0.95, ge=0.0, lt=1.0)
+    #: AdamW second-moment decay. Applies to the fallback group under
+    #: ``optimizer: muon`` and to the whole optimizer in pure AdamW runs.
+    #: 0.999 is the historical default; (0.9, 0.95) is the LLM-era
+    #: convention used by NorMuon and SpecOPD draft-training recipes.
+    adamw_beta2: float = Field(default=0.999, ge=0.0, lt=1.0)
     ttt_length: int = Field(default=7, gt=0)
     attention_backend: Literal["eager", "sdpa", "flex_attention", "fa", "usp"] = (
         "flex_attention"

@@ -297,6 +297,7 @@ class _ConfiguredOptimizerFactory:
             total_steps=self.total_steps,
             offload_master=t.optimizer_cpu_offload,
             optimizer_type=t.optimizer,
+            adamw_beta2=t.adamw_beta2,
             **muon_kwargs,
         )
 

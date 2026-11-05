@@ -663,6 +663,62 @@ class TestMuonVariants(unittest.TestCase):
         self.assertIsInstance(optimizer.muon_optimizer, TorchMuon)
 
 
+class TestAdamwBeta2(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # load_state_dict logs through print_on_rank0, which needs a
+        # process group even on a single rank.
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+            os.environ.setdefault("MASTER_PORT", "29523")
+            dist.init_process_group(backend="gloo", rank=0, world_size=1)
+            cls._owns_group = True
+        else:
+            cls._owns_group = False
+
+    @classmethod
+    def tearDownClass(cls):
+        import torch.distributed as dist
+
+        if cls._owns_group and dist.is_initialized():
+            dist.destroy_process_group()
+
+    def _make(self, **kwargs):
+        torch.manual_seed(0)
+        model = _TinyTrainable()
+        defaults = dict(
+            lr=1e-2,
+            total_steps=100,
+            warmup_ratio=0.0,
+            lr_scheduler="constant",
+        )
+        defaults.update(kwargs)
+        return BF16Optimizer(model, **defaults), model
+
+    def test_beta2_flows_to_param_group(self):
+        optimizer, _ = self._make(adamw_beta2=0.95)
+        self.assertEqual(
+            tuple(optimizer.optimizer.param_groups[0]["betas"]), (0.9, 0.95)
+        )
+        optimizer, _ = self._make()
+        self.assertEqual(
+            tuple(optimizer.optimizer.param_groups[0]["betas"]), (0.9, 0.999)
+        )
+
+    def test_resume_across_beta2_raises(self):
+        saved, model = self._make()
+        _set_grads(model, seed=0)
+        saved.step()
+        state = saved.state_dict()
+        fresh, _ = self._make(adamw_beta2=0.95)
+        with self.assertRaisesRegex(ValueError, "adamw_beta2"):
+            fresh.load_state_dict(state)
+        same, _ = self._make(adamw_beta2=0.999)
+        same.load_state_dict(state)  # matching betas must resume cleanly
+
+
 def _training_cfg(**overrides):
     base = dict(
         learning_rate=1e-3,
@@ -684,6 +740,7 @@ def _training_cfg(**overrides):
         muon_adamw_name_hints=[],
         muon_variant="vanilla",
         muon_beta2=0.95,
+        adamw_beta2=0.999,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
