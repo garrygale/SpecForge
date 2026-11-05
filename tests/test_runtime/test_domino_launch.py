@@ -212,6 +212,143 @@ class TestDominoLambdaSchedule(unittest.TestCase):
             ).forward_loss(batch, StepContext(global_step=1, total_steps=4))
 
 
+class _MockFSDPBackend:
+    """FSDP stand-in: the boundary backward leaves every rank holding the
+    across-rank mean of the accumulated gradients (what FSDP's predivide/
+    postdivide factors and DDP's all-reduce both reduce to). The other rank's
+    pre-reduce gradient and denominator enter as constants, so one rank runs
+    the real controller while the pair is emulated deterministically."""
+
+    name = "mock-fsdp"
+
+    def __init__(self, model, world_size, remote_grad):
+        self.model = model
+        self.world_size = world_size
+        self.remote_grad = remote_grad
+        self.scales = []
+
+    def prepare_model(self, model):
+        return model
+
+    def backward(self, loss, *, is_boundary=True):
+        loss.backward()
+        if is_boundary:
+            for p, remote in zip(self.model.parameters(), self.remote_grad):
+                p.grad.copy_((p.grad + remote) / self.world_size)
+
+    def scale_gradients(self, factor):
+        self.scales.append(float(factor))
+        for p in self.model.parameters():
+            if p.grad is not None:
+                p.grad.mul_(factor)
+
+    def step(self):
+        return torch.tensor(1.0)
+
+    def state_dict(self):
+        return {"model": {}, "optimizer": None, "rng": {}}
+
+    def load_state_dict(self, state):
+        pass
+
+
+class TestDominoGlobalLossDenominatorRankAveraging(unittest.TestCase):
+    """End-to-end (strategy -> controller -> mock FSDP) token-mean check.
+
+    Rank 1 supervises 100 tokens, rank 2 only 20; the two ranks chase
+    different targets so their local means disagree. With the toggle on the
+    final gradient must equal autograd of the single global objective
+    (den1*loss1 + den2*loss2)/(den1+den2); with it off it stays the rank-mean
+    (dloss1 + dloss2)/2, which the imbalance biases.
+    """
+
+    DEN1, DEN2 = 100.0, 20.0
+    TARGET1, TARGET2 = 2.0, 4.0
+
+    class _RankModel(torch.nn.Module):
+        def __init__(self, target, den):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.tensor(1.0))
+            self.target = float(target)
+            self.den = float(den)
+
+        def forward(self, **kwargs):
+            loss = 0.5 * (self.w - self.target).square()
+            return loss, torch.tensor(0.5), {
+                "loss_denominator": torch.tensor(self.den)
+            }
+
+    def _run_rank(self, *, toggle):
+        from unittest import mock
+
+        from specforge.runtime.contracts import TrainBatch
+        from specforge.training.controller import TrainerCore
+        from specforge.training.strategies.base import (
+            DominoTrainStrategy,
+            StepContext,
+        )
+
+        # the remote rank backwarded its own contribution before the boundary
+        remote = torch.nn.Parameter(torch.tensor(1.0))
+        remote_loss = 0.5 * (remote - self.TARGET2).square()
+        remote_loss.backward(
+            torch.tensor(self.DEN2 if toggle else 1.0)
+        )
+
+        model = self._RankModel(self.TARGET1, self.DEN1)
+        strategy = DominoTrainStrategy(model, global_loss_denominator=toggle)
+        backend = _MockFSDPBackend(
+            strategy.trainable_module(), 2, (remote.grad.detach(),)
+        )
+        core = TrainerCore(strategy, backend)
+
+        batch = TrainBatch(
+            sample_ids=["rank-1"],
+            strategy="domino",
+            tensors={
+                "input_ids": torch.ones(1, 2, dtype=torch.long),
+                "hidden_states": torch.ones(1, 2, 2),
+                "loss_mask": torch.ones(1, 2),
+            },
+        )
+
+        def add_remote_denominator(tensor, *args, **kwargs):
+            tensor.add_(self.DEN2)
+
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch(
+                "torch.distributed.all_reduce",
+                side_effect=add_remote_denominator,
+            ),
+        ):
+            core.train_step(batch, StepContext(global_step=1, total_steps=4))
+        return model.w.grad.detach(), backend.scales
+
+    def test_toggle_reproduces_the_global_token_mean(self):
+        reference = torch.nn.Parameter(torch.tensor(1.0))
+        global_mean = (
+            0.5 * (reference - self.TARGET1).square() * self.DEN1
+            + 0.5 * (reference - self.TARGET2).square() * self.DEN2
+        ) / (self.DEN1 + self.DEN2)
+        global_mean.backward()
+
+        grad, scales = self._run_rank(toggle=True)
+
+        torch.testing.assert_close(grad, reference.grad)
+        # world_size * accumulation_steps / global_denominator
+        torch.testing.assert_close(scales, [2.0 / (self.DEN1 + self.DEN2)])
+
+    def test_default_stays_the_biased_rank_mean(self):
+        grad, scales = self._run_rank(toggle=False)
+
+        # (dloss1 + dloss2)/2 with dloss = w - target: (-1 - 3)/2
+        torch.testing.assert_close(grad, torch.tensor(-2.0))
+        self.assertEqual(scales, [])
+
+
 @unittest.skipUnless(CUDA, "Domino offline launcher path requires CUDA")
 class TestDominoOfflineLaunch(unittest.TestCase):
     def test_domino_trains_from_precomputed_dflash_features(self):
