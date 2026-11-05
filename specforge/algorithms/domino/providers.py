@@ -146,6 +146,15 @@ def resume_contract(config, draft_model, training_model):
         "domino_lambda_base_decay_ratio": float(
             config.training.lambda_base_decay_ratio
         ),
+        # Like the warm-up key: recorded only when the fade-out shape is
+        # cosine — every pre-existing checkpoint decayed linearly and must stay
+        # resumable, and switching the shape mid-run re-times the curriculum,
+        # so the resume checker should reject it.
+        **(
+            {"domino_lambda_base_decay_type": "cosine"}
+            if str(config.training.lambda_base_decay_type) == "cosine"
+            else {}
+        ),
         "domino_ce_loss_alpha": float(training_model.domino_ce_loss_alpha),
         "domino_l1_loss_alpha": float(training_model.domino_l1_loss_alpha),
         "domino_base_tv_loss": bool(training_model.domino_base_tv_loss),

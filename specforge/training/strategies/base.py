@@ -17,6 +17,7 @@ code, so it is imported by training entry points, not at package load.
 from __future__ import annotations
 
 import abc
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
@@ -52,18 +53,32 @@ class StepContext:
     total_steps: Optional[int] = None
 
 
-def linear_lambda_base(
+def lambda_base_schedule(
     global_step: int,
     total_steps: int,
     lambda_start: float = 1.0,
     decay_ratio: float = 0.5,
+    decay_type: str = "linear",
 ) -> float:
-    """Domino base-loss weight: linear decay from ``lambda_start`` to 0 over the
+    """Domino base-loss weight: fades from ``lambda_start`` to 0 over the
     first ``total_steps * decay_ratio`` steps, then 0, clamped to ``[0, 1]``.
-    Requires a real ``total_steps`` (> 0)."""
+    Requires a real ``total_steps`` (> 0). ``decay_type`` picks the shape:
+    ``linear`` decays at a constant rate, ``cosine`` follows
+    ``0.5*(1+cos(pi*p))`` — same endpoints and the same ``lambda_start/2``
+    area, base loss held longer early and a zero-slope exit instead of the
+    linear kink where the scaffold switches off."""
+    if decay_type not in ("linear", "cosine"):
+        raise ValueError(
+            f"unsupported lambda_base decay_type={decay_type!r}; "
+            "expected 'linear' or 'cosine'"
+        )
     decay_steps = max(1, int(total_steps * decay_ratio))
     progress = min(global_step / decay_steps, 1.0)
-    return max(0.0, min(1.0, lambda_start * (1.0 - progress)))
+    if decay_type == "cosine":
+        weight = 0.5 * (1.0 + math.cos(math.pi * progress))
+    else:
+        weight = 1.0 - progress
+    return max(0.0, min(1.0, lambda_start * weight))
 
 
 def _cpu_max_valid_anchors(loss_mask: torch.Tensor) -> Optional[int]:
@@ -669,11 +684,13 @@ class DominoTrainStrategy(DraftTrainStrategy):
         *,
         lambda_start: float = 1.0,
         decay_ratio: float = 0.5,
+        decay_type: str = "linear",
         global_loss_denominator: bool = False,
     ) -> None:
         self.domino_model = domino_model
         self.lambda_start = lambda_start
         self.decay_ratio = decay_ratio
+        self.decay_type = decay_type
         self.global_loss_denominator = bool(global_loss_denominator)
 
     def trainable_module(self) -> nn.Module:
@@ -686,8 +703,12 @@ class DominoTrainStrategy(DraftTrainStrategy):
         # No schedule horizon -> pure final loss (lambda_base = 0).
         if ctx is None or not ctx.total_steps:
             return 0.0
-        return linear_lambda_base(
-            ctx.global_step, ctx.total_steps, self.lambda_start, self.decay_ratio
+        return lambda_base_schedule(
+            ctx.global_step,
+            ctx.total_steps,
+            self.lambda_start,
+            self.decay_ratio,
+            self.decay_type,
         )
 
     def forward_loss(
@@ -758,5 +779,5 @@ __all__ = [
     "DominoTrainStrategy",
     "StepOutput",
     "StepContext",
-    "linear_lambda_base",
+    "lambda_base_schedule",
 ]

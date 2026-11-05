@@ -44,6 +44,68 @@ class TestDominoLambdaSchedule(unittest.TestCase):
             s._lambda_base(StepContext(global_step=3, total_steps=None)), 0.0
         )
 
+    def test_lambda_base_cosine_shape(self):
+        from specforge.training.strategies.base import (
+            DominoTrainStrategy,
+            StepContext,
+            lambda_base_schedule,
+        )
+
+        # 0.5*(1+cos(pi*p)) over the same decay window (decay_steps=5): same
+        # endpoints, base loss held above linear in the first half and below
+        # in the second, equal area underneath.
+        total, ratio = 10, 0.5
+        s = DominoTrainStrategy(
+            None, lambda_start=1.0, decay_ratio=ratio, decay_type="cosine"
+        )
+        self.assertAlmostEqual(
+            s._lambda_base(StepContext(global_step=0, total_steps=total)), 1.0
+        )
+        # step 1 (p=0.2) and step 2 (p=0.4): cosine above linear
+        for step in (1, 2):
+            self.assertGreater(
+                s._lambda_base(StepContext(global_step=step, total_steps=total)),
+                lambda_base_schedule(step, total, 1.0, ratio),
+            )
+        # symmetric second half: cosine below linear
+        for step in (3, 4):
+            self.assertLess(
+                s._lambda_base(StepContext(global_step=step, total_steps=total)),
+                lambda_base_schedule(step, total, 1.0, ratio),
+            )
+        self.assertEqual(
+            s._lambda_base(StepContext(global_step=5, total_steps=total)), 0.0
+        )
+        # dose-matched: equal area under both shapes over the window
+        linear_dose = sum(
+            lambda_base_schedule(g, total, 1.0, ratio) for g in range(total + 1)
+        )
+        cosine_dose = sum(
+            lambda_base_schedule(g, total, 1.0, ratio, "cosine")
+            for g in range(total + 1)
+        )
+        self.assertAlmostEqual(linear_dose, cosine_dose, places=1)
+
+    def test_lambda_base_schedule_rejects_unknown_decay_type(self):
+        from specforge.training.strategies.base import lambda_base_schedule
+
+        with self.assertRaisesRegex(ValueError, "decay_type"):
+            lambda_base_schedule(0, 10, 1.0, 0.5, "sqrt")
+
+    def test_lambda_base_default_matches_legacy_linear_values(self):
+        from specforge.training.strategies.base import (
+            DominoTrainStrategy,
+            StepContext,
+        )
+
+        default = DominoTrainStrategy(None, lambda_start=1.0, decay_ratio=0.5)
+        for step in (0, 1, 2, 3, 5, 9):
+            ctx = StepContext(global_step=step, total_steps=10)
+            self.assertEqual(
+                default._lambda_base(ctx),
+                max(0.0, 1.0 - step / 5.0) if step < 5 else 0.0,
+            )
+
     def test_strategy_preserves_every_model_diagnostic(self):
         from specforge.runtime.contracts import TrainBatch
         from specforge.training.strategies.base import DominoTrainStrategy, StepContext

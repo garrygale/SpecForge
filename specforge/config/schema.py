@@ -674,6 +674,12 @@ class TrainingConfig(StrictConfigModel):
     dflash2_selector_stop_gradient: bool = False
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
+    #: Shape of the lambda_base fade-out over the decay window. ``linear``
+    #: decays at a constant rate; ``cosine`` is 0.5*(1+cos(pi*p)) — same
+    #: endpoints and the same lambda_base_start/2 area, so the total base-loss
+    #: dose is unchanged and only its timing moves: held longer early, then a
+    #: zero-slope hand-off to the pure final objective instead of a kink.
+    lambda_base_decay_type: Literal["linear", "cosine"] = "linear"
     #: Normalize the Domino gradient by the all-reduced token denominator
     #: instead of averaging the per-rank mean losses. Data-parallel ranks
     #: carry different valid-token counts, so the default rank-mean weighting

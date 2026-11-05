@@ -670,6 +670,7 @@ def domino_strategy_kwargs(cfg: Config) -> Dict[str, Any]:
     return {
         "lambda_start": cfg.training.lambda_base_start,
         "decay_ratio": cfg.training.lambda_base_decay_ratio,
+        "decay_type": cfg.training.lambda_base_decay_type,
         "global_loss_denominator": cfg.training.global_loss_denominator,
     }
 

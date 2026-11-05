@@ -179,6 +179,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             compact_teacher_chunk_size=1024,
             lambda_base_start=0.75,
             lambda_base_decay_ratio=0.25,
+            lambda_base_decay_type="linear",
             global_loss_denominator=False,
         )
         config = SimpleNamespace(training=training)
@@ -300,6 +301,21 @@ class BuiltinProviderContractTest(unittest.TestCase):
             domino_step.resume_contract(
                 SimpleNamespace(training=enabled), draft, models["domino"]
             ),
+        )
+        # the cosine fade-out shape key appears only when selected, so every
+        # linear-decay checkpoint (including pre-existing ones) stays resumable
+        self.assertNotIn(
+            "domino_lambda_base_decay_type",
+            domino_step.resume_contract(config, draft, models["domino"]),
+        )
+        cosine = SimpleNamespace(
+            **{**vars(config.training), "lambda_base_decay_type": "cosine"}
+        )
+        self.assertEqual(
+            domino_step.resume_contract(
+                SimpleNamespace(training=cosine), draft, models["domino"]
+            ).get("domino_lambda_base_decay_type"),
+            "cosine",
         )
 
     def test_step_runtime_config_binds_options_contract_and_missing_key_policy(self):
