@@ -707,6 +707,35 @@ class TestAdamwBeta2(unittest.TestCase):
             tuple(optimizer.optimizer.param_groups[0]["betas"]), (0.9, 0.999)
         )
 
+    @unittest.skipUnless(TORCH_HAS_MUON, "torch>=2.9 required for torch.optim.Muon")
+    def test_beta2_covers_muon_and_variant_modes(self):
+        # the AdamW fallback under muon mode is built from the same
+        # constructor call as the pure-adamw optimizer, so the knob must
+        # reach it identically in every mode
+        for variant in ("vanilla", "normuon", "adamuon"):
+            with self.subTest(variant=variant):
+                optimizer, _ = self._make(
+                    optimizer_type="muon",
+                    muon_variant=variant,
+                    adamw_beta2=0.95,
+                )
+                self.assertIsNotNone(optimizer.muon_optimizer)
+                self.assertEqual(
+                    tuple(optimizer.optimizer.param_groups[0]["betas"]),
+                    (0.9, 0.95),
+                )
+
+    @unittest.skipUnless(TORCH_HAS_MUON, "torch>=2.9 required for torch.optim.Muon")
+    def test_factory_passes_beta2_in_adamw_mode(self):
+        from specforge.training.assembly import _ConfiguredOptimizerFactory
+
+        cfg = SimpleNamespace(training=_training_cfg(adamw_beta2=0.95))
+        optimizer = _ConfiguredOptimizerFactory(cfg)(_TinyTrainable())
+        self.assertIsNone(optimizer.muon_optimizer)
+        self.assertEqual(
+            tuple(optimizer.optimizer.param_groups[0]["betas"]), (0.9, 0.95)
+        )
+
     def test_resume_across_beta2_raises(self):
         saved, model = self._make()
         _set_grads(model, seed=0)
